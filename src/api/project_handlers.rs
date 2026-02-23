@@ -79,18 +79,18 @@ pub async fn list_projects(
 
     let mut responses = Vec::new();
     for project in &projects {
-        let files = state
+        let file_count = state
             .orchestrator
             .neo4j()
-            .list_project_files(project.id)
+            .count_project_files(project.id)
             .await
-            .unwrap_or_default();
-        let plans = state
+            .unwrap_or(0);
+        let plan_count = state
             .orchestrator
             .neo4j()
-            .list_project_plans(project.id)
+            .count_project_plans(project.id)
             .await
-            .unwrap_or_default();
+            .unwrap_or(0);
 
         responses.push(ProjectResponse {
             id: project.id.to_string(),
@@ -100,8 +100,8 @@ pub async fn list_projects(
             description: project.description.clone(),
             created_at: project.created_at.to_rfc3339(),
             last_synced: project.last_synced.map(|dt| dt.to_rfc3339()),
-            file_count: files.len(),
-            plan_count: plans.len(),
+            file_count: file_count as usize,
+            plan_count: plan_count as usize,
         });
     }
 
@@ -175,18 +175,18 @@ pub async fn get_project(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
-    let files = state
+    let file_count = state
         .orchestrator
         .neo4j()
-        .list_project_files(project.id)
+        .count_project_files(project.id)
         .await
-        .unwrap_or_default();
-    let plans = state
+        .unwrap_or(0);
+    let plan_count = state
         .orchestrator
         .neo4j()
-        .list_project_plans(project.id)
+        .count_project_plans(project.id)
         .await
-        .unwrap_or_default();
+        .unwrap_or(0);
 
     Ok(Json(ProjectResponse {
         id: project.id.to_string(),
@@ -196,8 +196,8 @@ pub async fn get_project(
         description: project.description,
         created_at: project.created_at.to_rfc3339(),
         last_synced: project.last_synced.map(|dt| dt.to_rfc3339()),
-        file_count: files.len(),
-        plan_count: plans.len(),
+        file_count: file_count as usize,
+        plan_count: plan_count as usize,
     }))
 }
 
@@ -428,5 +428,254 @@ mod tests {
         assert_eq!(req.name, Some("Renamed".to_string()));
         assert_eq!(req.description, None);
         assert_eq!(req.root_path, None);
+    }
+
+    // ====================================================================
+    // Handler integration tests (axum + mock backends)
+    // ====================================================================
+
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode as AxumStatus},
+    };
+    use tower::ServiceExt;
+
+    use crate::api::handlers::ServerState;
+    use crate::api::routes::create_router;
+    use crate::neo4j::models::FileNode;
+    use crate::orchestrator::watcher::FileWatcher;
+    use crate::orchestrator::Orchestrator;
+    use crate::test_helpers::{
+        mock_app_state, test_auth_config, test_bearer_token, test_project_named,
+    };
+
+    /// Build a mock OrchestratorState for project handler tests
+    async fn mock_server_state() -> super::OrchestratorState {
+        let app_state = mock_app_state();
+        let orchestrator = std::sync::Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = std::sync::Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        std::sync::Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: std::sync::Arc::new(crate::events::HybridEmitter::new(std::sync::Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        })
+    }
+
+    fn authed_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn authed_post(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", test_bearer_token())
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_list_projects_empty() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+
+        let resp = app.oneshot(authed_get("/api/projects")).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 0);
+        assert_eq!(json["items"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_list_projects_with_counts() {
+        let app_state = mock_app_state();
+
+        // Seed a project with files and plans
+        let project = test_project_named("my-proj");
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        // Add 2 files
+        for i in 0..2 {
+            let path = format!("/tmp/my-proj/file_{}.rs", i);
+            let file = FileNode {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: format!("h{}", i),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            app_state.neo4j.upsert_file(&file).await.unwrap();
+            app_state
+                .neo4j
+                .link_file_to_project(&path, project.id)
+                .await
+                .unwrap();
+        }
+
+        // Add 1 plan (Draft)
+        let plan = crate::test_helpers::test_plan_for_project(project.id);
+        app_state.neo4j.create_plan(&plan).await.unwrap();
+        app_state
+            .neo4j
+            .link_plan_to_project(plan.id, project.id)
+            .await
+            .unwrap();
+
+        let orchestrator = std::sync::Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = std::sync::Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = std::sync::Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: std::sync::Arc::new(crate::events::HybridEmitter::new(std::sync::Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app.oneshot(authed_get("/api/projects")).await.unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["total"], 1);
+        let proj = &json["items"][0];
+        assert_eq!(proj["file_count"], 2);
+        assert_eq!(proj["plan_count"], 1);
+    }
+
+    #[tokio::test]
+    async fn test_get_project_with_counts() {
+        let app_state = mock_app_state();
+
+        let project = test_project_named("detail-proj");
+        app_state.neo4j.create_project(&project).await.unwrap();
+
+        // Add 3 files
+        for i in 0..3 {
+            let path = format!("/tmp/detail-proj/f{}.rs", i);
+            let file = FileNode {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: format!("d{}", i),
+                last_parsed: chrono::Utc::now(),
+                project_id: Some(project.id),
+            };
+            app_state.neo4j.upsert_file(&file).await.unwrap();
+            app_state
+                .neo4j
+                .link_file_to_project(&path, project.id)
+                .await
+                .unwrap();
+        }
+
+        let orchestrator = std::sync::Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = std::sync::Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = std::sync::Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: std::sync::Arc::new(crate::events::HybridEmitter::new(std::sync::Arc::new(
+                crate::events::EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: std::sync::Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get(&format!("/api/projects/{}", project.slug)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["file_count"], 3);
+        assert_eq!(json["plan_count"], 0);
+        assert_eq!(json["slug"], "detail-proj");
+    }
+
+    #[tokio::test]
+    async fn test_get_project_not_found() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_get("/api/projects/nonexistent"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn test_create_project_handler() {
+        let state = mock_server_state().await;
+        let app = create_router(state);
+
+        let resp = app
+            .oneshot(authed_post(
+                "/api/projects",
+                serde_json::json!({
+                    "name": "New Project",
+                    "root_path": "/tmp/new-proj"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), AxumStatus::OK);
+
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["name"], "New Project");
+        assert_eq!(json["slug"], "new-project");
+        assert_eq!(json["file_count"], 0);
+        assert_eq!(json["plan_count"], 0);
     }
 }

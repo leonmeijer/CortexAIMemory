@@ -1208,6 +1208,11 @@ impl GraphStore for MockGraphStore {
         Ok(paths.iter().filter_map(|p| files.get(p).cloned()).collect())
     }
 
+    async fn count_project_files(&self, project_id: Uuid) -> Result<i64> {
+        let pf = self.project_files.read().await;
+        Ok(pf.get(&project_id).map(|p| p.len() as i64).unwrap_or(0))
+    }
+
     // ========================================================================
     // Symbol operations
     // ========================================================================
@@ -2603,6 +2608,23 @@ impl GraphStore for MockGraphStore {
                 )
             })
             .collect())
+    }
+
+    async fn count_project_plans(&self, project_id: Uuid) -> Result<i64> {
+        let pp = self.project_plans.read().await;
+        let plans = self.plans.read().await;
+        let ids = pp.get(&project_id).cloned().unwrap_or_default();
+        let count = ids
+            .iter()
+            .filter_map(|id| plans.get(id))
+            .filter(|p| {
+                matches!(
+                    p.status,
+                    PlanStatus::Draft | PlanStatus::Approved | PlanStatus::InProgress
+                )
+            })
+            .count();
+        Ok(count as i64)
     }
 
     async fn list_plans_for_project(
@@ -8737,5 +8759,126 @@ mod tests {
             .unwrap();
 
         // Verify no error — mock delegates to individual create_imports_symbol_relationship
+    }
+
+    // ====================================================================
+    // count_project_files / count_project_plans tests
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_count_project_files_empty() {
+        let store = MockGraphStore::new();
+        let pid = Uuid::new_v4();
+        let count = store.count_project_files(pid).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_project_files_with_files() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        // Add 3 files to the project
+        for i in 0..3 {
+            let path = format!("/tmp/test/src/file_{}.rs", i);
+            let file = FileNode {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: format!("hash{}", i),
+                last_parsed: Utc::now(),
+                project_id: Some(project.id),
+            };
+            store.upsert_file(&file).await.unwrap();
+            store.link_file_to_project(&path, project.id).await.unwrap();
+        }
+
+        let count = store.count_project_files(project.id).await.unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[tokio::test]
+    async fn test_count_project_files_multiple_projects() {
+        let store = MockGraphStore::new();
+        let p1 = test_project_named("proj-a");
+        let p2 = test_project_named("proj-b");
+        store.create_project(&p1).await.unwrap();
+        store.create_project(&p2).await.unwrap();
+
+        // 2 files in p1, 5 files in p2
+        for i in 0..2 {
+            let path = format!("/tmp/a/file_{}.rs", i);
+            let file = FileNode {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: format!("a{}", i),
+                last_parsed: Utc::now(),
+                project_id: Some(p1.id),
+            };
+            store.upsert_file(&file).await.unwrap();
+            store.link_file_to_project(&path, p1.id).await.unwrap();
+        }
+        for i in 0..5 {
+            let path = format!("/tmp/b/file_{}.rs", i);
+            let file = FileNode {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: format!("b{}", i),
+                last_parsed: Utc::now(),
+                project_id: Some(p2.id),
+            };
+            store.upsert_file(&file).await.unwrap();
+            store.link_file_to_project(&path, p2.id).await.unwrap();
+        }
+
+        assert_eq!(store.count_project_files(p1.id).await.unwrap(), 2);
+        assert_eq!(store.count_project_files(p2.id).await.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn test_count_project_plans_empty() {
+        let store = MockGraphStore::new();
+        let pid = Uuid::new_v4();
+        let count = store.count_project_plans(pid).await.unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_project_plans_filters_by_status() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        // Create 3 plans: Draft, InProgress, Completed
+        let mut plan_draft = crate::test_helpers::test_plan_for_project(project.id);
+        plan_draft.status = PlanStatus::Draft;
+        store.create_plan(&plan_draft).await.unwrap();
+        store
+            .link_plan_to_project(plan_draft.id, project.id)
+            .await
+            .unwrap();
+
+        let mut plan_in_progress = crate::test_helpers::test_plan_for_project(project.id);
+        plan_in_progress.status = PlanStatus::InProgress;
+        store.create_plan(&plan_in_progress).await.unwrap();
+        store
+            .link_plan_to_project(plan_in_progress.id, project.id)
+            .await
+            .unwrap();
+
+        let mut plan_completed = crate::test_helpers::test_plan_for_project(project.id);
+        plan_completed.status = PlanStatus::Completed;
+        store.create_plan(&plan_completed).await.unwrap();
+        store
+            .link_plan_to_project(plan_completed.id, project.id)
+            .await
+            .unwrap();
+
+        // count_project_plans should only include Draft, Approved, InProgress
+        let count = store.count_project_plans(project.id).await.unwrap();
+        assert_eq!(
+            count, 2,
+            "Should count Draft + InProgress, exclude Completed"
+        );
     }
 }

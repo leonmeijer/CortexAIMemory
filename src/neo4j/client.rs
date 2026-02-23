@@ -219,9 +219,18 @@ impl Neo4jClient {
             "CREATE INDEX file_language IF NOT EXISTS FOR (f:File) ON (f.language)",
             "CREATE INDEX file_project IF NOT EXISTS FOR (f:File) ON (f.project_id)",
             "CREATE INDEX function_name IF NOT EXISTS FOR (f:Function) ON (f.name)",
+            // Function.file_path — enables index seek in batch_create_call_relationships Phase 1
+            "CREATE INDEX function_file_path IF NOT EXISTS FOR (f:Function) ON (f.file_path)",
+            // Composite (name, file_path) — enables direct seek for same-file call resolution
+            "CREATE INDEX function_name_file_path IF NOT EXISTS FOR (f:Function) ON (f.name, f.file_path)",
             "CREATE INDEX struct_name IF NOT EXISTS FOR (s:Struct) ON (s.name)",
             "CREATE INDEX trait_name IF NOT EXISTS FOR (t:Trait) ON (t.name)",
             "CREATE INDEX enum_name IF NOT EXISTS FOR (e:Enum) ON (e.name)",
+            // Denormalized project_id on symbols — enables direct seek without graph traversal
+            "CREATE INDEX function_project_id IF NOT EXISTS FOR (f:Function) ON (f.project_id)",
+            "CREATE INDEX struct_project_id IF NOT EXISTS FOR (s:Struct) ON (s.project_id)",
+            "CREATE INDEX trait_project_id IF NOT EXISTS FOR (t:Trait) ON (t.project_id)",
+            "CREATE INDEX enum_project_id IF NOT EXISTS FOR (e:Enum) ON (e.project_id)",
             "CREATE INDEX impl_for_type IF NOT EXISTS FOR (i:Impl) ON (i.for_type)",
             "CREATE INDEX task_status IF NOT EXISTS FOR (t:Task) ON (t.status)",
             "CREATE INDEX task_priority IF NOT EXISTS FOR (t:Task) ON (t.priority)",
@@ -2325,6 +2334,43 @@ impl Neo4jClient {
         Ok(files)
     }
 
+    /// Count files for a project (lightweight COUNT query, no data transfer).
+    pub async fn count_project_files(&self, project_id: Uuid) -> Result<i64> {
+        let q = query(
+            "MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File) RETURN count(f) AS cnt",
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("cnt")?)
+        } else {
+            Ok(0)
+        }
+    }
+
+    /// Backfill project_id on existing symbol nodes (Function, Struct, Enum, Trait)
+    /// that were created before the denormalization was added.
+    /// Inherits project_id from the parent File node via CONTAINS relationships.
+    pub async fn backfill_symbol_project_ids(&self) -> Result<i64> {
+        let mut total = 0i64;
+        for label in &["Function", "Struct", "Enum", "Trait"] {
+            let cypher = format!(
+                "MATCH (p:Project)-[:CONTAINS]->(f:File)-[:CONTAINS]->(n:{}) \
+                 WHERE n.project_id IS NULL \
+                 SET n.project_id = p.id \
+                 RETURN count(n) AS cnt",
+                label
+            );
+            let q = query(&cypher);
+            let mut result = self.graph.execute(q).await?;
+            if let Some(row) = result.next().await? {
+                total += row.get::<i64>("cnt").unwrap_or(0);
+            }
+        }
+        Ok(total)
+    }
+
     // ========================================================================
     // Function operations
     // ========================================================================
@@ -3015,6 +3061,7 @@ impl Neo4jClient {
             WITH f, func
             MATCH (file:File {path: func.file_path})
             MERGE (file)-[:CONTAINS]->(f)
+            SET f.project_id = file.project_id
             "#,
         )
         .param("items", items);
@@ -3062,6 +3109,7 @@ impl Neo4jClient {
             WITH st, s
             MATCH (file:File {path: s.file_path})
             MERGE (file)-[:CONTAINS]->(st)
+            SET st.project_id = file.project_id
             "#,
         )
         .param("items", items);
@@ -3109,6 +3157,7 @@ impl Neo4jClient {
             WITH tr, t
             MATCH (file:File {path: t.file_path})
             MERGE (file)-[:CONTAINS]->(tr)
+            SET tr.project_id = file.project_id
             "#,
         )
         .param("items", items);
@@ -3156,6 +3205,7 @@ impl Neo4jClient {
             WITH en, e
             MATCH (file:File {path: e.file_path})
             MERGE (file)-[:CONTAINS]->(en)
+            SET en.project_id = file.project_id
             "#,
         )
         .param("items", items);
@@ -3498,14 +3548,10 @@ impl Neo4jClient {
                     CALL {
                         WITH rel
                         MATCH (i:Import {id: rel.import_id})
-                        MATCH (i)<-[:HAS_IMPORT]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
-                        OPTIONAL MATCH (s:Struct {name: rel.symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
-                        OPTIONAL MATCH (e:Enum {name: rel.symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
-                        OPTIONAL MATCH (t:Trait {name: rel.symbol_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p)
-                        WITH i, COALESCE(s, e, t) AS target
-                        WHERE target IS NOT NULL
-                        WITH i, target LIMIT 1
-                        MERGE (i)-[:IMPORTS_SYMBOL]->(target)
+                        MATCH (symbol {name: rel.symbol_name, project_id: $project_id})
+                        WHERE symbol:Struct OR symbol:Enum OR symbol:Trait
+                        WITH i, symbol LIMIT 1
+                        MERGE (i)-[:IMPORTS_SYMBOL]->(symbol)
                     }
                     "#,
                 )
@@ -3533,13 +3579,11 @@ impl Neo4jClient {
                 CALL {
                     WITH rel
                     MATCH (i:Import {id: rel.import_id})
-                    OPTIONAL MATCH (s:Struct {name: rel.symbol_name})
-                    OPTIONAL MATCH (e:Enum {name: rel.symbol_name})
-                    OPTIONAL MATCH (t:Trait {name: rel.symbol_name})
-                    WITH i, COALESCE(s, e, t) AS target
-                    WHERE target IS NOT NULL
-                    WITH i, target LIMIT 1
-                    MERGE (i)-[:IMPORTS_SYMBOL]->(target)
+                    MATCH (symbol)
+                    WHERE symbol.name = rel.symbol_name
+                      AND (symbol:Struct OR symbol:Enum OR symbol:Trait)
+                    WITH i, symbol LIMIT 1
+                    MERGE (i)-[:IMPORTS_SYMBOL]->(symbol)
                 }
                 "#,
             )
@@ -3636,7 +3680,7 @@ impl Neo4jClient {
                     CALL {
                         WITH call
                         MATCH (caller:Function {id: call.caller_id})
-                        MATCH (callee:Function {name: call.callee_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                        MATCH (callee:Function {name: call.callee_name, project_id: $project_id})
                         WHERE callee.id <> call.caller_id
                         WITH caller, callee LIMIT 1
                         MERGE (caller)-[:CALLS]->(callee)
@@ -5270,6 +5314,21 @@ impl Neo4jClient {
         }
 
         Ok(plans)
+    }
+
+    /// Count plans for a project (lightweight COUNT query, no data transfer).
+    pub async fn count_project_plans(&self, project_id: Uuid) -> Result<i64> {
+        let q = query(
+            "MATCH (project:Project {id: $project_id})-[:HAS_PLAN]->(p:Plan) WHERE p.status IN ['Draft', 'Approved', 'InProgress'] RETURN count(p) AS cnt",
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            Ok(row.get::<i64>("cnt")?)
+        } else {
+            Ok(0)
+        }
     }
 
     /// List plans for a project with filters
@@ -11714,43 +11773,54 @@ impl Neo4jClient {
             return Ok(());
         }
 
-        // Build UNWIND list directly in Cypher (internal computed data, no injection risk)
-        let entries: Vec<String> = updates
-            .iter()
-            .map(|u| {
-                format!(
-                    "{{path: '{}', pagerank: {}, betweenness: {}, community_id: {}, community_label: '{}', clustering_coefficient: {}, component_id: {}}}",
-                    u.path.replace('\'', "\\'"),
-                    u.pagerank,
-                    u.betweenness,
-                    u.community_id,
-                    u.community_label.replace('\'', "\\'"),
-                    u.clustering_coefficient,
-                    u.component_id
-                )
-            })
-            .collect();
+        // Chunk to avoid overloading Neo4j heap (tx_state = ON_HEAP)
+        const CHUNK_SIZE: usize = 1000;
 
-        let cypher = format!(
-            r#"
-            UNWIND [{}] AS u
-            MATCH (f:File {{path: u.path}})
-            SET f.pagerank = u.pagerank,
-                f.betweenness = u.betweenness,
-                f.community_id = u.community_id,
-                f.community_label = u.community_label,
-                f.clustering_coefficient = u.clustering_coefficient,
-                f.component_id = u.component_id,
-                f.analytics_updated_at = datetime()
-            "#,
-            entries.join(", ")
-        );
+        for chunk in updates.chunks(CHUNK_SIZE) {
+            let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = chunk
+                .iter()
+                .map(|u| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("path".into(), u.path.clone().into());
+                    m.insert("pagerank".into(), u.pagerank.into());
+                    m.insert("betweenness".into(), u.betweenness.into());
+                    m.insert("community_id".into(), (u.community_id as i64).into());
+                    m.insert("community_label".into(), u.community_label.clone().into());
+                    m.insert(
+                        "clustering_coefficient".into(),
+                        u.clustering_coefficient.into(),
+                    );
+                    m.insert("component_id".into(), (u.component_id as i64).into());
+                    m
+                })
+                .collect();
 
-        self.execute(&cypher).await?;
+            let q = query(
+                r#"
+                UNWIND $items AS u
+                MATCH (f:File {path: u.path})
+                SET f.pagerank = u.pagerank,
+                    f.betweenness = u.betweenness,
+                    f.community_id = u.community_id,
+                    f.community_label = u.community_label,
+                    f.clustering_coefficient = u.clustering_coefficient,
+                    f.component_id = u.component_id,
+                    f.analytics_updated_at = datetime()
+                "#,
+            )
+            .param("items", items);
+
+            self.graph.run(q).await?;
+        }
+
         Ok(())
     }
 
-    /// Batch-update analytics scores on Function nodes via UNWIND.
+    /// Batch-update analytics scores on Function nodes via parameterized UNWIND.
+    ///
+    /// Uses chunking (1000 items max per transaction) to avoid heap pressure
+    /// and GC death spirals. The query plan is cached by Neo4j since the
+    /// Cypher string is constant (parameterized via $items).
     pub async fn batch_update_function_analytics(
         &self,
         updates: &[crate::graph::models::FunctionAnalyticsUpdate],
@@ -11759,36 +11829,43 @@ impl Neo4jClient {
             return Ok(());
         }
 
-        let entries: Vec<String> = updates
-            .iter()
-            .map(|u| {
-                format!(
-                    "{{id: '{}', pagerank: {}, betweenness: {}, community_id: {}, clustering_coefficient: {}, component_id: {}}}",
-                    u.id.replace('\'', "\\'"),
-                    u.pagerank,
-                    u.betweenness,
-                    u.community_id,
-                    u.clustering_coefficient,
-                    u.component_id
-                )
-            })
-            .collect();
+        const CHUNK_SIZE: usize = 1000;
 
-        let cypher = format!(
-            r#"
-            UNWIND [{}] AS u
-            MATCH (f:Function {{id: u.id}})
-            SET f.pagerank = u.pagerank,
-                f.betweenness = u.betweenness,
-                f.community_id = u.community_id,
-                f.clustering_coefficient = u.clustering_coefficient,
-                f.component_id = u.component_id,
-                f.analytics_updated_at = datetime()
-            "#,
-            entries.join(", ")
-        );
+        for chunk in updates.chunks(CHUNK_SIZE) {
+            let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = chunk
+                .iter()
+                .map(|u| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("id".into(), u.id.clone().into());
+                    m.insert("pagerank".into(), u.pagerank.into());
+                    m.insert("betweenness".into(), u.betweenness.into());
+                    m.insert("community_id".into(), (u.community_id as i64).into());
+                    m.insert(
+                        "clustering_coefficient".into(),
+                        u.clustering_coefficient.into(),
+                    );
+                    m.insert("component_id".into(), (u.component_id as i64).into());
+                    m
+                })
+                .collect();
 
-        self.execute(&cypher).await?;
+            let q = query(
+                r#"
+                UNWIND $items AS u
+                MATCH (f:Function {id: u.id})
+                SET f.pagerank = u.pagerank,
+                    f.betweenness = u.betweenness,
+                    f.community_id = u.community_id,
+                    f.clustering_coefficient = u.clustering_coefficient,
+                    f.component_id = u.component_id,
+                    f.analytics_updated_at = datetime()
+                "#,
+            )
+            .param("items", items);
+
+            self.graph.run(q).await?;
+        }
+
         Ok(())
     }
 
