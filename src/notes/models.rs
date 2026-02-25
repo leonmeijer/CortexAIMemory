@@ -181,8 +181,12 @@ pub enum EntityType {
     Impl,
     Task,
     Plan,
+    Step,
     Commit,
     Decision,
+    Constraint,
+    Milestone,
+    Release,
     // Workspace-related entities
     Workspace,
     WorkspaceMilestone,
@@ -203,8 +207,12 @@ impl fmt::Display for EntityType {
             Self::Impl => write!(f, "impl"),
             Self::Task => write!(f, "task"),
             Self::Plan => write!(f, "plan"),
+            Self::Step => write!(f, "step"),
             Self::Commit => write!(f, "commit"),
             Self::Decision => write!(f, "decision"),
+            Self::Constraint => write!(f, "constraint"),
+            Self::Milestone => write!(f, "milestone"),
+            Self::Release => write!(f, "release"),
             Self::Workspace => write!(f, "workspace"),
             Self::WorkspaceMilestone => write!(f, "workspace_milestone"),
             Self::Resource => write!(f, "resource"),
@@ -228,8 +236,12 @@ impl FromStr for EntityType {
             "impl" => Ok(Self::Impl),
             "task" => Ok(Self::Task),
             "plan" => Ok(Self::Plan),
+            "step" => Ok(Self::Step),
             "commit" => Ok(Self::Commit),
             "decision" => Ok(Self::Decision),
+            "constraint" => Ok(Self::Constraint),
+            "milestone" => Ok(Self::Milestone),
+            "release" => Ok(Self::Release),
             "workspace" => Ok(Self::Workspace),
             "workspacemilestone" => Ok(Self::WorkspaceMilestone),
             "resource" => Ok(Self::Resource),
@@ -1012,6 +1024,32 @@ mod tests {
             EntityType::from_str("component").unwrap(),
             EntityType::Component
         );
+    }
+
+    #[test]
+    fn test_entity_type_plan_era_variants() {
+        // Display
+        let variants = vec![
+            (EntityType::Step, "step"),
+            (EntityType::Constraint, "constraint"),
+            (EntityType::Milestone, "milestone"),
+            (EntityType::Release, "release"),
+        ];
+        for (variant, expected) in &variants {
+            assert_eq!(variant.to_string(), *expected);
+        }
+
+        // FromStr
+        for (variant, s) in &variants {
+            assert_eq!(&EntityType::from_str(s).unwrap(), variant);
+        }
+
+        // Serde roundtrip
+        for (variant, _) in &variants {
+            let json = serde_json::to_string(variant).unwrap();
+            let deserialized: EntityType = serde_json::from_str(&json).unwrap();
+            assert_eq!(&deserialized, variant);
+        }
     }
 
     #[test]

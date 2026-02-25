@@ -2,15 +2,14 @@
 //!
 //! Implements the MCP server that communicates over stdio using JSON-RPC 2.0.
 
+use super::formatter::json_to_compact;
 use super::handlers::ToolHandler;
+use super::http_client::McpHttpClient;
 use super::protocol::*;
 use super::tools::all_tools;
-use crate::chat::ChatManager;
-use crate::orchestrator::Orchestrator;
 use anyhow::Result;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -19,32 +18,15 @@ const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// MCP Server that handles JSON-RPC 2.0 requests over stdio
 pub struct McpServer {
-    #[allow(dead_code)]
-    orchestrator: Arc<Orchestrator>,
     tool_handler: ToolHandler,
     initialized: bool,
 }
 
 impl McpServer {
-    /// Create a new MCP server with the given orchestrator
-    pub fn new(orchestrator: Arc<Orchestrator>) -> Self {
-        let tool_handler = ToolHandler::new(orchestrator.clone());
+    /// Create a new MCP server that proxies all tool calls to the REST API.
+    pub fn new(http_client: McpHttpClient) -> Self {
+        let tool_handler = ToolHandler::new(http_client);
         Self {
-            orchestrator,
-            tool_handler,
-            initialized: false,
-        }
-    }
-
-    /// Create a new MCP server with chat support
-    pub fn with_chat_manager(
-        orchestrator: Arc<Orchestrator>,
-        chat_manager: Arc<ChatManager>,
-    ) -> Self {
-        let tool_handler =
-            ToolHandler::new(orchestrator.clone()).with_chat_manager(Some(chat_manager));
-        Self {
-            orchestrator,
             tool_handler,
             initialized: false,
         }
@@ -227,9 +209,7 @@ impl McpServer {
             .await;
 
         let tool_result = match result {
-            Ok(value) => {
-                ToolCallResult::success(serde_json::to_string_pretty(&value).unwrap_or_default())
-            }
+            Ok(value) => ToolCallResult::success(json_to_compact(&value)),
             Err(e) => {
                 error!("Tool error: {}", e);
                 ToolCallResult::error(e.to_string())

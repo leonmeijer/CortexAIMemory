@@ -12,19 +12,29 @@ pub const BASE_SYSTEM_PROMPT: &str = r#"# Agent de développement — Project Or
 ## 1. Identité & rôle
 
 Tu es un agent de développement autonome intégré au **Project Orchestrator**.
-Tu disposes de **130+ outils MCP** couvrant le cycle de vie complet d'un projet : planification, exécution, suivi, exploration de code, gestion des connaissances.
+Tu disposes de **18 mega-tools MCP** couvrant le cycle de vie complet d'un projet : planification, exécution, suivi, exploration de code, gestion des connaissances.
 
 **IMPORTANT — Directive MCP-first :**
 Tu utilises **EXCLUSIVEMENT les outils MCP du Project Orchestrator** pour organiser ton travail.
 Tu ne dois **PAS** utiliser les features internes de Claude Code pour la gestion de projet :
-- ❌ Plan mode (EnterPlanMode / ExitPlanMode) — utilise `create_plan`, `create_task`, `create_step`
-- ❌ TodoWrite — utilise `update_task`, `update_step` pour suivre la progression
+- ❌ Plan mode (EnterPlanMode / ExitPlanMode) — utilise `plan(action: "create")`, `task(action: "create")`, `step(action: "create")`
+- ❌ TodoWrite — utilise `task(action: "update")`, `step(action: "update")` pour suivre la progression
 - ❌ Tout autre outil interne de planification
 
 Quand on te demande de "planifier", tu crées un **Plan MCP** avec des Tasks et des Steps.
 Quand on te demande de "suivre la progression", tu mets à jour les **statuts via les outils MCP**.
 
-## 2. Modèle de données
+## 2. Mega-tools — Syntaxe d'appel
+
+Chaque outil a un paramètre `action` qui détermine l'opération :
+
+```
+tool_name(action: "<action>", param1: value1, param2: value2, ...)
+```
+
+Les 18 mega-tools : `project`, `plan`, `task`, `step`, `decision`, `constraint`, `release`, `milestone`, `commit`, `note`, `workspace`, `workspace_milestone`, `resource`, `component`, `chat`, `feature_graph`, `code`, `admin`
+
+## 3. Modèle de données
 
 ### Hiérarchie des entités
 
@@ -44,13 +54,13 @@ Workspace
 
 ### Relations clés (avec outils MCP)
 
-- Plan → Project : `link_plan_to_project(plan_id, project_id)`
-- Task → Task : `add_task_dependencies(task_id, [dep_ids])`
-- Task → Milestone : `add_task_to_milestone(milestone_id, task_id)`
-- Task → Release : `add_task_to_release(release_id, task_id)`
-- Commit → Task : `link_commit_to_task(task_id, commit_sha)`
-- Commit → Plan : `link_commit_to_plan(plan_id, commit_sha)`
-- Note → Entité : `link_note_to_entity(note_id, entity_type, entity_id)`
+- Plan → Project : `plan(action: "link_to_project", plan_id, project_id)`
+- Task → Task : `task(action: "add_dependencies", task_id, dependency_ids)`
+- Task → Milestone : `milestone(action: "add_task", milestone_id, task_id)`
+- Task → Release : `release(action: "add_task", release_id, task_id)`
+- Commit → Task : `commit(action: "link_to_task", task_id, commit_sha)`
+- Commit → Plan : `commit(action: "link_to_plan", plan_id, commit_sha)`
+- Note → Entité : `note(action: "link_to_entity", note_id, entity_type, entity_id)`
 
 ### Notes (base de connaissances)
 
@@ -58,29 +68,29 @@ Workspace
 - **Importance** : critical, high, medium, low
 - **Statuts** : active, needs_review, stale, obsolete, archived
 - Attachables à : project, file, function, struct, trait, task, plan, workspace...
-- Consulter avant de travailler : `get_context_notes(entity_type, entity_id)`
+- Consulter avant de travailler : `note(action: "get_context", entity_type, entity_id)`
 
 ### Tree-sitter & synchronisation du code
 
-- `sync_project(slug)` / `sync_directory(path)` parse le code source avec Tree-sitter
+- `project(action: "sync", slug)` / `admin(action: "sync_directory", path)` parse le code source avec Tree-sitter
 - Construit le **graphe de connaissances** : fichiers, fonctions, structs, traits, enums, imports, appels entre fonctions
-- `start_watch(path)` active la synchronisation automatique sur changements fichiers
-- **Sync incrémentale au commit** : `create_commit` avec `files_changed` + `project_id` déclenche automatiquement la re-sync des fichiers modifiés en arrière-plan. Pas besoin de `sync_project` après chaque commit.
-- **Requis avant toute exploration de code** : si `last_synced` est absent, lancer `sync_project` en premier ; sinon, le sync au commit maintient la fraîcheur automatiquement
+- `admin(action: "start_watch", path)` active la synchronisation automatique sur changements fichiers
+- **Sync incrémentale au commit** : `commit(action: "create")` avec `files_changed` + `project_id` déclenche automatiquement la re-sync des fichiers modifiés en arrière-plan. Pas besoin de `project(action: "sync")` après chaque commit.
+- **Requis avant toute exploration de code** : si `last_synced` est absent, lancer `project(action: "sync")` en premier ; sinon, le sync au commit maintient la fraîcheur automatiquement
 - Outils d'exploration disponibles après sync :
-  - `search_code(query)` / `search_project_code(slug, query)` — recherche sémantique
-  - `get_file_symbols(file_path)` — fonctions, structs, traits d'un fichier
-  - `find_references(symbol)` — tous les usages d'un symbole
-  - `get_file_dependencies(file_path)` — imports et dépendants
-  - `get_call_graph(function)` — graphe d'appels
-  - `analyze_impact(target)` — impact d'une modification
-  - `get_architecture()` — vue d'ensemble (fichiers les plus connectés)
-  - `find_trait_implementations(trait_name)` — implémentations d'un trait
-  - `find_type_traits(type_name)` — traits implémentés par un type
-  - `get_impl_blocks(type_name)` — blocs impl d'un type
-  - `find_similar_code(code_snippet)` — code similaire
+  - `code(action: "search", query)` / `code(action: "search_project", slug, query)` — recherche sémantique
+  - `code(action: "get_file_symbols", file_path)` — fonctions, structs, traits d'un fichier
+  - `code(action: "find_references", symbol)` — tous les usages d'un symbole
+  - `code(action: "get_file_dependencies", file_path)` — imports et dépendants
+  - `code(action: "get_call_graph", function)` — graphe d'appels
+  - `code(action: "analyze_impact", target)` — impact d'une modification
+  - `code(action: "get_architecture")` — vue d'ensemble (fichiers les plus connectés)
+  - `code(action: "find_trait_implementations", trait_name)` — implémentations d'un trait
+  - `code(action: "find_type_traits", type_name)` — traits implémentés par un type
+  - `code(action: "get_impl_blocks", type_name)` — blocs impl d'un type
+  - `code(action: "find_similar_code", code_snippet)` — code similaire
 
-## 3. Workflow Git
+## 4. Workflow Git
 
 ### Avant de commencer une tâche
 
@@ -99,79 +109,79 @@ Workspace
 
 ### Après chaque commit
 
-1. `create_commit(sha, message, author, files_changed)` — enregistrer dans le graphe
-2. `link_commit_to_task(task_id, sha)` — lier au task en cours
-3. `link_commit_to_plan(plan_id, sha)` — lier au plan (au moins le dernier commit)
+1. `commit(action: "create", sha, message, author, files_changed)` — enregistrer dans le graphe
+2. `commit(action: "link_to_task", task_id, commit_sha)` — lier au task en cours
+3. `commit(action: "link_to_plan", plan_id, commit_sha)` — lier au plan (au moins le dernier commit)
 
-## 4. Protocole d'exécution de tâche
+## 5. Protocole d'exécution de tâche
 
 ### Phase 0 — Warm-up (OBLIGATOIRE au début de chaque conversation)
 
 Avant tout travail, charger les connaissances pertinentes :
-1. `search_notes_semantic(query)` — recherche vectorielle de notes (cosine similarity, trouve les notes sémantiquement proches même sans correspondance de mots-clés)
-2. `get_context_notes(entity_type, entity_id)` — notes contextuelles pour les fichiers/fonctions concernés
-3. `search_decisions(query)` — décisions architecturales passées sur le sujet
-4. `search_notes(query)` — recherche BM25 complémentaire si besoin de correspondance exacte de mots-clés
+1. `note(action: "search_semantic", query)` — recherche vectorielle de notes (cosine similarity, trouve les notes sémantiquement proches même sans correspondance de mots-clés)
+2. `note(action: "get_context", entity_type, entity_id)` — notes contextuelles pour les fichiers/fonctions concernés
+3. `decision(action: "search", query)` — décisions architecturales passées sur le sujet
+4. `note(action: "search", query)` — recherche BM25 complémentaire si besoin de correspondance exacte de mots-clés
 
 Cela évite de refaire un travail déjà documenté ou de violer une convention déjà établie.
 
 ### Phase 1 — Préparation
 
-1. `get_next_task(plan_id)` — récupérer la prochaine tâche non bloquée (priorité la plus haute)
-2. `get_task_context(plan_id, task_id)` — charger le contexte complet (steps, constraints, decisions, notes, code)
-3. `get_task_blockers(task_id)` — vérifier qu'il n'y a pas de bloqueurs non résolus
-4. `search_decisions(<sujet>)` — consulter les décisions architecturales passées
-5. `analyze_impact(<fichier>)` — évaluer l'impact avant modification
-6. `update_task(task_id, status: "in_progress")` — passer la tâche en cours
+1. `task(action: "get_next", plan_id)` — récupérer la prochaine tâche non bloquée (priorité la plus haute)
+2. `task(action: "get_context", plan_id, task_id)` — charger le contexte complet (steps, constraints, decisions, notes, code)
+3. `task(action: "get_blockers", task_id)` — vérifier qu'il n'y a pas de bloqueurs non résolus
+4. `decision(action: "search", query)` — consulter les décisions architecturales passées
+5. `code(action: "analyze_impact", target)` — évaluer l'impact avant modification
+6. `task(action: "update", task_id, status: "in_progress")` — passer la tâche en cours
 7. Préparer git (branche dédiée si pas encore fait)
 
 ### Phase 2 — Exécution (pour chaque step)
 
-1. `update_step(step_id, status: "in_progress")`
+1. `step(action: "update", step_id, status: "in_progress")`
 2. Effectuer le travail (coder, modifier, tester)
 3. Vérifier selon le critère du step (champ `verification`)
-4. `update_step(step_id, status: "completed")`
-5. Si le step est devenu irrelevant : `update_step(step_id, status: "skipped")`
+4. `step(action: "update", step_id, status: "completed")`
+5. Si le step est devenu irrelevant : `step(action: "update", step_id, status: "skipped")`
 
 Si une décision architecturale est prise :
-`add_decision(task_id, description, rationale, alternatives, chosen_option)`
+`decision(action: "add", task_id, description, rationale, alternatives, chosen_option)`
 
 ### Phase 3 — Clôture
 
-1. Commit final + `link_commit_to_task(task_id, sha)`
+1. Commit final + `commit(action: "link_to_task", task_id, sha)`
 2. Vérifier les `acceptance_criteria` du task
-3. `update_task(task_id, status: "completed")`
-4. Vérifier la progression du plan → si toutes les tâches sont complétées : `update_plan_status(plan_id, "completed")`
+3. `task(action: "update", task_id, status: "completed")`
+4. Vérifier la progression du plan → si toutes les tâches sont complétées : `plan(action: "update_status", plan_id, "completed")`
 5. Mettre à jour milestones/releases si applicable
 
-## 5. Protocole de planification
+## 6. Protocole de planification
 
 Quand l'utilisateur demande de planifier un travail :
 
 ### Étape 1 — Analyser et créer le plan
 
-1. Explorer le code existant : `search_code`, `get_architecture`, `analyze_impact`
-2. `create_plan(title, description, priority, project_id)`
-3. `link_plan_to_project(plan_id, project_id)`
+1. Explorer le code existant : `code(action: "search")`, `code(action: "get_architecture")`, `code(action: "analyze_impact")`
+2. `plan(action: "create", title, description, priority, project_id)`
+3. `plan(action: "link_to_project", plan_id, project_id)`
 
 ### Étape 2 — Ajouter les contraintes
 
-- `add_constraint(plan_id, type, description, severity)`
+- `constraint(action: "add", plan_id, type, description, severity)`
 - Types : performance, security, style, compatibility, other
 
 ### Étape 3 — Décomposer en tâches avec steps
 
 Pour chaque tâche :
-1. `create_task(plan_id, title, description, priority, tags, acceptance_criteria, affected_files)`
-2. **TOUJOURS ajouter des steps** : `create_step(task_id, description, verification)`
+1. `task(action: "create", plan_id, title, description, priority, tags, acceptance_criteria, affected_files)`
+2. **TOUJOURS ajouter des steps** : `step(action: "create", task_id, description, verification)`
    - Minimum 2-3 steps par tâche
    - Chaque step doit être **actionnable** et **vérifiable**
-3. `add_task_dependencies(task_id, [dep_ids])` — définir l'ordre d'exécution
+3. `task(action: "add_dependencies", task_id, dependency_ids)` — définir l'ordre d'exécution
 
 ### Étape 4 — Organiser le suivi
 
-- `create_milestone(project_id, title, target_date)` + `add_task_to_milestone`
-- `create_release(project_id, version, title, target_date)` + `add_task_to_release`
+- `milestone(action: "create", project_id, title, target_date)` + `milestone(action: "add_task")`
+- `release(action: "create", project_id, version, title, target_date)` + `release(action: "add_task")`
 
 ### Granularité attendue
 
@@ -182,17 +192,15 @@ Exemple de décomposition correcte :
   - Step 1: "Ajouter la méthode get_release dans neo4j/client.rs" → vérif: "cargo check"
   - Step 2: "Ajouter le handler dans api/handlers.rs" → vérif: "cargo check"
   - Step 3: "Enregistrer la route dans api/routes.rs" → vérif: "curl test"
-  - Step 4: "Ajouter le tool MCP dans mcp/tools.rs" → vérif: "test_all_tools_count passe"
-  - Step 5: "Ajouter le handler MCP dans mcp/handlers.rs" → vérif: "cargo test"
 
-## 6. Gestion des statuts
+## 7. Gestion des statuts
 
 ### Règles fondamentales
 
 - Mettre à jour **EN TEMPS RÉEL**, pas en batch à la fin
 - Un seul task `in_progress` à la fois par plan
 - Ne **JAMAIS** marquer `completed` sans vérification
-- En cas de blocage → `update_task(task_id, status: "blocked")` + note expliquant pourquoi
+- En cas de blocage → `task(action: "update", task_id, status: "blocked")` + note expliquant pourquoi
 
 ### Transitions valides
 
@@ -212,33 +220,33 @@ Exemple de décomposition correcte :
 | Milestone | planned     | in_progress | Première tâche démarre         |
 | Milestone | in_progress | completed   | Toutes tâches complétées       |
 
-## 7. Bonnes pratiques
+## 8. Bonnes pratiques
 
 ### Liaison systématique
 
 - **TOUJOURS** lier plans aux projets, commits aux tasks, tasks aux milestones/releases
-- Vérifier `get_dependency_graph(plan_id)` et `get_critical_path(plan_id)` avant de démarrer l'exécution
+- Vérifier `plan(action: "get_dependency_graph", plan_id)` et `plan(action: "get_critical_path", plan_id)` avant de démarrer l'exécution
 
 ### Analyse d'impact avant modification
 
-- `analyze_impact(cible)` → fichiers et symboles affectés
-- `get_file_dependencies(file_path)` → imports et dépendants
-- `get_context_notes(entity_type, entity_id)` → notes pertinentes (guidelines, gotchas...)
+- `code(action: "analyze_impact", target)` → fichiers et symboles affectés
+- `code(action: "get_file_dependencies", file_path)` → imports et dépendants
+- `note(action: "get_context", entity_type, entity_id)` → notes pertinentes (guidelines, gotchas...)
 
 ### Analyse structurelle (GDS)
 
 Quand les données GDS (Graph Data Science) sont disponibles sur le projet :
 
-1. **Comprendre la structure modulaire** → `get_code_communities(project_slug)`
+1. **Comprendre la structure modulaire** → `code(action: "get_communities", project_slug)`
    - Clusters Louvain de fichiers/fonctions fortement couplés
    - Chaque communauté a ses fichiers clés et métriques de cohésion
    - **Utilise ceci** : avant un refactoring, pour comprendre les frontières modulaires
 
-2. **Évaluer la santé du codebase** → `get_code_health(project_slug)`
+2. **Évaluer la santé du codebase** → `code(action: "get_health", project_slug)`
    - God functions (trop de connexions), fichiers orphelins (0 connexions), couplage moyen, dépendances circulaires
    - **Utilise ceci** : en début de projet, revue de code, ou priorisation de dette technique
 
-3. **Évaluer l'importance d'un nœud** → `get_node_importance(project_slug, node_path, node_type)`
+3. **Évaluer l'importance d'un nœud** → `code(action: "get_node_importance", project_slug, node_path, node_type)`
    - PageRank, betweenness centrality, bridge detection, risk level
    - Retourne un summary interprétatif (critical/high/medium/low)
    - **Utilise ceci** : avant de modifier un fichier/fonction, pour évaluer le risque de régression
@@ -252,38 +260,38 @@ N'utiliser Grep/Read/Glob qu'en dernier recours pour des chaînes littérales ex
 
 Hiérarchie de recherche (du plus recommandé au moins recommandé) :
 
-1. **Recherche exploratoire** → `search_code(query)` / `search_project_code(slug, query)`
+1. **Recherche exploratoire** → `code(action: "search", query)` / `code(action: "search_project", slug, query)`
    - Recherche sémantique MeiliSearch, cross-fichier, ranking par pertinence
    - Supporte `path_prefix` pour filtrer un sous-répertoire
    - **Utilise ceci au lieu de** : Grep pour chercher un concept, Task(Explore) pour explorer
 
-2. **Usages d'un symbole** → `find_references(symbol)`
+2. **Usages d'un symbole** → `code(action: "find_references", symbol)`
    - Résolution via le graphe Neo4j (imports, exports, appels)
    - Plus fiable que grep car comprend la structure du code
    - **Utilise ceci au lieu de** : Grep pour "où est utilisé X"
 
-3. **Comprendre un flux** → `get_call_graph(function)`
+3. **Comprendre un flux** → `code(action: "get_call_graph", function)`
    - Qui appelle cette fonction ? Qui elle appelle ?
    - **Utilise ceci au lieu de** : lire manuellement chaque fichier
 
-4. **Avant de modifier** → `analyze_impact(target)`
+4. **Avant de modifier** → `code(action: "analyze_impact", target)`
    - Fichiers et symboles affectés par un changement
    - **Utilise ceci au lieu de** : deviner quels fichiers sont impactés
 
-5. **Vue d'ensemble** → `get_architecture(project_slug?)`
+5. **Vue d'ensemble** → `code(action: "get_architecture", project_slug?)`
    - Fichiers les plus connectés, stats langages, structure du projet
    - **Utilise ceci au lieu de** : parcourir manuellement l'arborescence
 
-6. **Symboles d'un fichier** → `get_file_symbols(file_path)`
+6. **Symboles d'un fichier** → `code(action: "get_file_symbols", file_path)`
    - Toutes les fonctions, structs, traits, enums d'un fichier
    - **Utilise ceci au lieu de** : lire tout le fichier pour trouver les définitions
 
-7. **Types et traits** → `find_trait_implementations(trait)` / `find_type_traits(type)` / `get_impl_blocks(type)`
+7. **Types et traits** → `code(action: "find_trait_implementations", trait)` / `code(action: "find_type_traits", type)` / `code(action: "get_impl_blocks", type)`
    - Naviguer le système de types via le graphe
 
-8. **Recherche de notes** → `search_notes_semantic(query)` (vectorielle) / `search_notes(query)` (BM25)
-   - `search_notes_semantic` : recherche par similarité cosine via embeddings — trouve les notes conceptuellement proches même sans correspondance de mots-clés. Préférer pour les questions en langage naturel.
-   - `search_notes` : recherche BM25 classique — meilleure pour les mots-clés exacts, noms de fonctions, identifiants.
+8. **Recherche de notes** → `note(action: "search_semantic", query)` (vectorielle) / `note(action: "search", query)` (BM25)
+   - `search_semantic` : recherche par similarité cosine via embeddings — trouve les notes conceptuellement proches même sans correspondance de mots-clés. Préférer pour les questions en langage naturel.
+   - `search` : recherche BM25 classique — meilleure pour les mots-clés exacts, noms de fonctions, identifiants.
    - **Utilise ceci au lieu de** : parcourir manuellement les notes ou deviner leur existence
 
 9. **Dernier recours** → Grep/Read de Claude Code
@@ -296,30 +304,29 @@ Hiérarchie de recherche (du plus recommandé au moins recommandé) :
 Ne JAMAIS terminer une session sans avoir capturé les apprentissages importants.
 
 **Quand créer une note :**
-- Après avoir résolu un bug → `create_note(type: "gotcha", importance: "high")` avec la cause racine et la solution
-- Après avoir découvert un pattern architectural → `create_note(type: "pattern")` avec l'explication
-- Après avoir identifié une convention → `create_note(type: "guideline")` avec la règle
-- Après avoir trouvé un piège/subtilité → `create_note(type: "gotcha")` avec l'avertissement
-- Après avoir trouvé une astuce utile → `create_note(type: "tip")` avec l'explication
+- Après avoir résolu un bug → `note(action: "create", type: "gotcha", importance: "high")` avec la cause racine et la solution
+- Après avoir découvert un pattern architectural → `note(action: "create", type: "pattern")` avec l'explication
+- Après avoir identifié une convention → `note(action: "create", type: "guideline")` avec la règle
+- Après avoir trouvé un piège/subtilité → `note(action: "create", type: "gotcha")` avec l'avertissement
+- Après avoir trouvé une astuce utile → `note(action: "create", type: "tip")` avec l'explication
 
 **TOUJOURS** lier la note à l'entité concernée :
 ```
-create_note(project_id, type, content, importance, tags)
-→ note_id
-link_note_to_entity(note_id, "file", "src/chat/manager.rs")
-link_note_to_entity(note_id, "function", "build_system_prompt")
+note(action: "create", project_id, type, content, importance, tags) → note_id
+note(action: "link_to_entity", note_id, "file", "src/chat/manager.rs")
+note(action: "link_to_entity", note_id, "function", "build_system_prompt")
 ```
 
 **Décisions architecturales** : à chaque choix non trivial
 - Documenter les alternatives considérées + la raison du choix
-- `add_decision(task_id, description, rationale, alternatives, chosen_option)`
+- `decision(action: "add", task_id, description, rationale, alternatives, chosen_option)`
 
 ### Workspace (multi-projets)
 
-- `get_workspace_overview(slug)` — vue d'ensemble workspace
-- `create_workspace_milestone(slug, title)` — milestones cross-projets
-- `get_workspace_topology(slug)` — composants et dépendances entre services
-- `list_resources(slug)` — contrats API, schémas partagés
+- `workspace(action: "get_overview", slug)` — vue d'ensemble workspace
+- `workspace_milestone(action: "create", slug, title)` — milestones cross-projets
+- `workspace(action: "get_topology", slug)` — composants et dépendances entre services
+- `resource(action: "list", workspace_slug)` — contrats API, schémas partagés
 "#;
 
 use anyhow::Result;
@@ -347,875 +354,173 @@ pub struct ToolGroup {
     pub tools: &'static [ToolRef],
 }
 
-/// Static catalog of all 137 MCP tools organized into 12 semantic groups.
+/// Static catalog of all 18 MCP mega-tools organized into semantic groups.
 /// Used by the oneshot Opus refinement to select relevant tools per request,
 /// and by the keyword fallback when the oneshot fails.
 pub static TOOL_GROUPS: &[ToolGroup] = &[
-    // ── Planning (21 tools) ──────────────────────────────────────────
-    ToolGroup {
-        name: "planning",
-        description: "Créer et gérer plans, tâches, étapes",
-        keywords: &[
-            "plan",
-            "tâche",
-            "task",
-            "step",
-            "étape",
-            "planifier",
-            "organiser",
-            "dépendance",
-            "priorité",
-            "chemin critique",
-            "bloquer",
-        ],
-        tools: &[
-            ToolRef {
-                name: "create_plan",
-                description: "Créer un plan de développement",
-            },
-            ToolRef {
-                name: "get_plan",
-                description: "Détails d'un plan avec tâches",
-            },
-            ToolRef {
-                name: "list_plans",
-                description: "Lister les plans avec filtres",
-            },
-            ToolRef {
-                name: "update_plan_status",
-                description: "Changer le statut d'un plan",
-            },
-            ToolRef {
-                name: "delete_plan",
-                description: "Supprimer un plan",
-            },
-            ToolRef {
-                name: "link_plan_to_project",
-                description: "Lier un plan à un projet",
-            },
-            ToolRef {
-                name: "unlink_plan_from_project",
-                description: "Délier un plan d'un projet",
-            },
-            ToolRef {
-                name: "create_task",
-                description: "Ajouter une tâche à un plan",
-            },
-            ToolRef {
-                name: "get_task",
-                description: "Détails d'une tâche avec steps",
-            },
-            ToolRef {
-                name: "list_tasks",
-                description: "Lister les tâches avec filtres",
-            },
-            ToolRef {
-                name: "update_task",
-                description: "Mettre à jour statut/assignee",
-            },
-            ToolRef {
-                name: "delete_task",
-                description: "Supprimer une tâche",
-            },
-            ToolRef {
-                name: "get_next_task",
-                description: "Prochaine tâche non bloquée",
-            },
-            ToolRef {
-                name: "add_task_dependencies",
-                description: "Ajouter des dépendances",
-            },
-            ToolRef {
-                name: "remove_task_dependency",
-                description: "Retirer une dépendance",
-            },
-            ToolRef {
-                name: "get_task_blockers",
-                description: "Tâches bloquant celle-ci",
-            },
-            ToolRef {
-                name: "get_tasks_blocked_by",
-                description: "Tâches bloquées par celle-ci",
-            },
-            ToolRef {
-                name: "get_dependency_graph",
-                description: "Graphe de dépendances du plan",
-            },
-            ToolRef {
-                name: "get_critical_path",
-                description: "Chemin critique du plan",
-            },
-            ToolRef {
-                name: "get_task_context",
-                description: "Contexte complet pour exécution",
-            },
-            ToolRef {
-                name: "get_task_prompt",
-                description: "Prompt généré pour une tâche",
-            },
-        ],
-    },
-    // ── Steps (6 tools) ──────────────────────────────────────────────
-    ToolGroup {
-        name: "steps",
-        description: "Sous-étapes atomiques des tâches",
-        keywords: &["step", "étape", "sous-étape", "vérification", "progression"],
-        tools: &[
-            ToolRef {
-                name: "create_step",
-                description: "Ajouter un step à une tâche",
-            },
-            ToolRef {
-                name: "list_steps",
-                description: "Lister les steps d'une tâche",
-            },
-            ToolRef {
-                name: "get_step",
-                description: "Détails d'un step",
-            },
-            ToolRef {
-                name: "update_step",
-                description: "Changer le statut d'un step",
-            },
-            ToolRef {
-                name: "delete_step",
-                description: "Supprimer un step",
-            },
-            ToolRef {
-                name: "get_step_progress",
-                description: "Progression des steps",
-            },
-        ],
-    },
-    // ── Code exploration (12 tools) ──────────────────────────────────
-    ToolGroup {
-        name: "code_exploration",
-        description: "Recherche sémantique, graphe d'appels, impact",
-        keywords: &[
-            "code",
-            "fonction",
-            "struct",
-            "fichier",
-            "import",
-            "appel",
-            "architecture",
-            "symbole",
-            "trait",
-            "impl",
-            "référence",
-            "dépendance",
-            "impact",
-            "chercher",
-            "explorer",
-        ],
-        tools: &[
-            ToolRef {
-                name: "search_code",
-                description: "Recherche sémantique cross-projet",
-            },
-            ToolRef {
-                name: "search_project_code",
-                description: "Recherche scopée à un projet",
-            },
-            ToolRef {
-                name: "get_file_symbols",
-                description: "Fonctions/structs d'un fichier",
-            },
-            ToolRef {
-                name: "find_references",
-                description: "Tous les usages d'un symbole",
-            },
-            ToolRef {
-                name: "get_file_dependencies",
-                description: "Imports et dépendants",
-            },
-            ToolRef {
-                name: "get_call_graph",
-                description: "Graphe d'appels d'une fonction",
-            },
-            ToolRef {
-                name: "analyze_impact",
-                description: "Impact d'une modification",
-            },
-            ToolRef {
-                name: "get_architecture",
-                description: "Vue d'ensemble du codebase",
-            },
-            ToolRef {
-                name: "find_similar_code",
-                description: "Code similaire à un snippet",
-            },
-            ToolRef {
-                name: "find_trait_implementations",
-                description: "Types implémentant un trait",
-            },
-            ToolRef {
-                name: "find_type_traits",
-                description: "Traits implémentés par un type",
-            },
-            ToolRef {
-                name: "get_impl_blocks",
-                description: "Blocs impl d'un type",
-            },
-        ],
-    },
-    // ── Structural Analytics (3 tools) ────────────────────────────────
-    ToolGroup {
-        name: "structural_analytics",
-        description: "Analyse structurelle GDS : communautés, santé du code, importance des nœuds",
-        keywords: &[
-            "communauté",
-            "community",
-            "louvain",
-            "cluster",
-            "santé",
-            "health",
-            "god function",
-            "orphelin",
-            "couplage",
-            "circulaire",
-            "importance",
-            "pagerank",
-            "betweenness",
-            "centralité",
-            "bridge",
-            "risque",
-            "analytique",
-            "GDS",
-        ],
-        tools: &[
-            ToolRef {
-                name: "get_code_communities",
-                description: "Communautés de code (clusters Louvain) avec fichiers clés et métriques de cohésion",
-            },
-            ToolRef {
-                name: "get_code_health",
-                description: "Rapport santé du codebase : god functions, fichiers orphelins, couplage, dépendances circulaires",
-            },
-            ToolRef {
-                name: "get_node_importance",
-                description: "Importance structurelle d'un fichier/fonction : PageRank, betweenness, bridge detection, risk level, summary interprétatif",
-            },
-        ],
-    },
-    // ── Knowledge / Notes (17 tools) ─────────────────────────────────
-    ToolGroup {
-        name: "knowledge",
-        description: "Notes, guidelines, gotchas, patterns",
-        keywords: &[
-            "note",
-            "guideline",
-            "gotcha",
-            "pattern",
-            "connaissance",
-            "tip",
-            "observation",
-            "assertion",
-            "savoir",
-            "contexte",
-            "mémoire",
-        ],
-        tools: &[
-            ToolRef {
-                name: "create_note",
-                description: "Créer une note de connaissance",
-            },
-            ToolRef {
-                name: "get_note",
-                description: "Détails d'une note",
-            },
-            ToolRef {
-                name: "update_note",
-                description: "Modifier contenu/importance/tags",
-            },
-            ToolRef {
-                name: "delete_note",
-                description: "Supprimer une note",
-            },
-            ToolRef {
-                name: "search_notes_semantic",
-                description: "Recherche vectorielle de notes (cosine similarity)",
-            },
-            ToolRef {
-                name: "search_notes",
-                description: "Recherche BM25 de notes (mots-clés)",
-            },
-            ToolRef {
-                name: "list_notes",
-                description: "Lister avec filtres type/importance",
-            },
-            ToolRef {
-                name: "list_project_notes",
-                description: "Notes d'un projet",
-            },
-            ToolRef {
-                name: "get_context_notes",
-                description: "Notes contextuelles d'une entité",
-            },
-            ToolRef {
-                name: "get_entity_notes",
-                description: "Notes directement attachées",
-            },
-            ToolRef {
-                name: "get_propagated_notes",
-                description: "Notes propagées via le graphe",
-            },
-            ToolRef {
-                name: "link_note_to_entity",
-                description: "Lier note à fichier/fonction/…",
-            },
-            ToolRef {
-                name: "unlink_note_from_entity",
-                description: "Délier une note",
-            },
-            ToolRef {
-                name: "confirm_note",
-                description: "Confirmer validité (reset staleness)",
-            },
-            ToolRef {
-                name: "invalidate_note",
-                description: "Marquer comme obsolète",
-            },
-            ToolRef {
-                name: "supersede_note",
-                description: "Remplacer par une nouvelle note",
-            },
-            ToolRef {
-                name: "get_notes_needing_review",
-                description: "Notes à vérifier",
-            },
-            ToolRef {
-                name: "update_staleness_scores",
-                description: "Recalculer la fraîcheur",
-            },
-            ToolRef {
-                name: "update_energy_scores",
-                description: "Recalculer l'énergie neuronale (decay)",
-            },
-            ToolRef {
-                name: "search_neurons",
-                description: "Recherche neuronale (spreading activation via synapses)",
-            },
-            ToolRef {
-                name: "reinforce_neurons",
-                description: "Renforcement hebbien (boost énergie + synapses)",
-            },
-            ToolRef {
-                name: "decay_synapses",
-                description: "Decay et pruning des synapses faibles",
-            },
-            ToolRef {
-                name: "backfill_synapses",
-                description: "Backfill synapses pour notes avec embedding sans synapse",
-            },
-        ],
-    },
-    // ── Git tracking (5 tools) ───────────────────────────────────────
-    ToolGroup {
-        name: "git_tracking",
-        description: "Enregistrer et lier les commits",
-        keywords: &["commit", "git", "branche", "sha", "push"],
-        tools: &[
-            ToolRef {
-                name: "create_commit",
-                description: "Enregistrer un commit",
-            },
-            ToolRef {
-                name: "link_commit_to_task",
-                description: "Lier commit → tâche",
-            },
-            ToolRef {
-                name: "link_commit_to_plan",
-                description: "Lier commit → plan",
-            },
-            ToolRef {
-                name: "get_task_commits",
-                description: "Commits d'une tâche",
-            },
-            ToolRef {
-                name: "get_plan_commits",
-                description: "Commits d'un plan",
-            },
-        ],
-    },
-    // ── Decisions (5 tools) ──────────────────────────────────────────
-    ToolGroup {
-        name: "decisions",
-        description: "Choix architecturaux et alternatives",
-        keywords: &["décision", "choix", "alternative", "rationale", "arbitrage"],
-        tools: &[
-            ToolRef {
-                name: "add_decision",
-                description: "Enregistrer une décision",
-            },
-            ToolRef {
-                name: "get_decision",
-                description: "Détails d'une décision",
-            },
-            ToolRef {
-                name: "update_decision",
-                description: "Modifier une décision",
-            },
-            ToolRef {
-                name: "delete_decision",
-                description: "Supprimer une décision",
-            },
-            ToolRef {
-                name: "search_decisions",
-                description: "Rechercher les décisions passées",
-            },
-        ],
-    },
-    // ── Constraints (5 tools) ────────────────────────────────────────
-    ToolGroup {
-        name: "constraints",
-        description: "Règles et contraintes des plans",
-        keywords: &[
-            "contrainte",
-            "règle",
-            "sécurité",
-            "performance",
-            "compatibilité",
-        ],
-        tools: &[
-            ToolRef {
-                name: "add_constraint",
-                description: "Ajouter une contrainte",
-            },
-            ToolRef {
-                name: "get_constraint",
-                description: "Détails d'une contrainte",
-            },
-            ToolRef {
-                name: "update_constraint",
-                description: "Modifier une contrainte",
-            },
-            ToolRef {
-                name: "delete_constraint",
-                description: "Supprimer une contrainte",
-            },
-            ToolRef {
-                name: "list_constraints",
-                description: "Contraintes d'un plan",
-            },
-        ],
-    },
-    // ── Project management (8 tools) ─────────────────────────────────
+    // ── Project ─────────────────────────────────────────────────────
     ToolGroup {
         name: "project_management",
         description: "CRUD projets, sync, roadmap",
         keywords: &["projet", "codebase", "sync", "roadmap", "créer projet"],
+        tools: &[ToolRef {
+            name: "project",
+            description: "Manage projects (list/create/get/update/delete/sync/get_roadmap/list_plans)",
+        }],
+    },
+    // ── Planning ────────────────────────────────────────────────────
+    ToolGroup {
+        name: "planning",
+        description: "Créer et gérer plans, tâches, étapes",
+        keywords: &[
+            "plan", "tâche", "task", "step", "étape", "planifier",
+            "organiser", "dépendance", "priorité", "chemin critique", "bloquer",
+        ],
         tools: &[
             ToolRef {
-                name: "list_projects",
-                description: "Lister tous les projets",
+                name: "plan",
+                description: "Manage plans (list/create/get/update_status/delete/link/get_dependency_graph/get_critical_path)",
             },
             ToolRef {
-                name: "create_project",
-                description: "Créer un nouveau projet",
+                name: "task",
+                description: "Manage tasks (list/create/get/update/delete/get_next/add_dependencies/get_blockers/get_context)",
             },
             ToolRef {
-                name: "get_project",
-                description: "Détails d'un projet par slug",
-            },
-            ToolRef {
-                name: "update_project",
-                description: "Modifier nom/description/path",
-            },
-            ToolRef {
-                name: "delete_project",
-                description: "Supprimer un projet",
-            },
-            ToolRef {
-                name: "sync_project",
-                description: "Synchroniser le codebase",
-            },
-            ToolRef {
-                name: "get_project_roadmap",
-                description: "Roadmap avec milestones",
-            },
-            ToolRef {
-                name: "list_project_plans",
-                description: "Plans d'un projet",
+                name: "step",
+                description: "Manage steps (list/create/update/get/delete/get_progress)",
             },
         ],
     },
-    // ── Releases & Milestones (14 tools) ─────────────────────────────
+    // ── Decisions & Constraints ─────────────────────────────────────
+    ToolGroup {
+        name: "decisions_constraints",
+        description: "Choix architecturaux et contraintes des plans",
+        keywords: &["décision", "choix", "alternative", "contrainte", "règle", "sécurité"],
+        tools: &[
+            ToolRef {
+                name: "decision",
+                description: "Manage decisions (add/get/update/delete/search)",
+            },
+            ToolRef {
+                name: "constraint",
+                description: "Manage constraints (list/add/get/update/delete)",
+            },
+        ],
+    },
+    // ── Code Exploration & Analytics ────────────────────────────────
+    ToolGroup {
+        name: "code_exploration",
+        description: "Recherche sémantique, graphe d'appels, impact, analytics GDS",
+        keywords: &[
+            "code", "fonction", "struct", "fichier", "import", "appel",
+            "architecture", "symbole", "trait", "impl", "référence",
+            "impact", "chercher", "explorer", "communauté", "santé",
+            "pagerank", "GDS", "plan_implementation",
+        ],
+        tools: &[ToolRef {
+            name: "code",
+            description: "Explore code (search/find_references/get_call_graph/analyze_impact/get_architecture/get_communities/get_health/get_node_importance/plan_implementation)",
+        }],
+    },
+    // ── Knowledge / Notes ───────────────────────────────────────────
+    ToolGroup {
+        name: "knowledge",
+        description: "Notes, guidelines, gotchas, patterns",
+        keywords: &[
+            "note", "guideline", "gotcha", "pattern", "connaissance",
+            "tip", "observation", "assertion", "savoir", "contexte", "mémoire",
+        ],
+        tools: &[ToolRef {
+            name: "note",
+            description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/get_context/get_entity)",
+        }],
+    },
+    // ── Git Tracking ────────────────────────────────────────────────
+    ToolGroup {
+        name: "git_tracking",
+        description: "Enregistrer et lier les commits",
+        keywords: &["commit", "git", "branche", "sha", "push"],
+        tools: &[ToolRef {
+            name: "commit",
+            description: "Register and link commits (create/link_to_task/link_to_plan/get_task_commits/get_plan_commits)",
+        }],
+    },
+    // ── Releases & Milestones ───────────────────────────────────────
     ToolGroup {
         name: "releases_milestones",
         description: "Versions livrables et jalons",
-        keywords: &[
-            "release",
-            "milestone",
-            "version",
-            "livrable",
-            "jalon",
-            "livraison",
-            "déploiement",
-            "cible",
-        ],
+        keywords: &["release", "milestone", "version", "livrable", "jalon", "livraison"],
         tools: &[
             ToolRef {
-                name: "create_release",
-                description: "Créer une release",
+                name: "release",
+                description: "Manage releases (list/create/get/update/delete/add_task/add_commit/remove_commit)",
             },
             ToolRef {
-                name: "get_release",
-                description: "Détails d'une release",
-            },
-            ToolRef {
-                name: "update_release",
-                description: "Modifier une release",
-            },
-            ToolRef {
-                name: "delete_release",
-                description: "Supprimer une release",
-            },
-            ToolRef {
-                name: "list_releases",
-                description: "Releases d'un projet",
-            },
-            ToolRef {
-                name: "add_task_to_release",
-                description: "Lier tâche → release",
-            },
-            ToolRef {
-                name: "add_commit_to_release",
-                description: "Lier commit → release",
-            },
-            ToolRef {
-                name: "remove_commit_from_release",
-                description: "Délier commit d'une release",
-            },
-            ToolRef {
-                name: "create_milestone",
-                description: "Créer un milestone",
-            },
-            ToolRef {
-                name: "get_milestone",
-                description: "Détails d'un milestone",
-            },
-            ToolRef {
-                name: "update_milestone",
-                description: "Modifier un milestone",
-            },
-            ToolRef {
-                name: "delete_milestone",
-                description: "Supprimer un milestone",
-            },
-            ToolRef {
-                name: "list_milestones",
-                description: "Milestones d'un projet",
-            },
-            ToolRef {
-                name: "get_milestone_progress",
-                description: "Progression d'un milestone",
-            },
-            ToolRef {
-                name: "add_task_to_milestone",
-                description: "Lier tâche → milestone",
-            },
-            ToolRef {
-                name: "link_plan_to_milestone",
-                description: "Lier plan → milestone (relation directe TARGETS_MILESTONE)",
-            },
-            ToolRef {
-                name: "unlink_plan_from_milestone",
-                description: "Délier plan d'un milestone",
+                name: "milestone",
+                description: "Manage milestones (list/create/get/update/delete/get_progress/add_task/link_plan)",
             },
         ],
     },
-    // ── Workspace (35 tools) ─────────────────────────────────────────
+    // ── Workspace ───────────────────────────────────────────────────
     ToolGroup {
         name: "workspace",
         description: "Multi-projets, topologie, ressources partagées",
         keywords: &[
-            "workspace",
-            "composant",
-            "ressource",
-            "topologie",
-            "service",
-            "multi-projet",
-            "cross-projet",
-            "contrat",
-            "API contract",
+            "workspace", "composant", "ressource", "topologie", "service",
+            "multi-projet", "cross-projet", "contrat", "API contract",
         ],
         tools: &[
             ToolRef {
-                name: "list_workspaces",
-                description: "Lister les workspaces",
+                name: "workspace",
+                description: "Manage workspaces (list/create/get/update/delete/get_overview/list_projects/add_project/get_topology)",
             },
             ToolRef {
-                name: "create_workspace",
-                description: "Créer un workspace",
+                name: "workspace_milestone",
+                description: "Manage workspace milestones (list_all/list/create/get/update/delete/add_task/link_plan/get_progress)",
             },
             ToolRef {
-                name: "get_workspace",
-                description: "Détails d'un workspace",
+                name: "resource",
+                description: "Manage resources (list/create/get/update/delete/link_to_project)",
             },
             ToolRef {
-                name: "update_workspace",
-                description: "Modifier un workspace",
-            },
-            ToolRef {
-                name: "delete_workspace",
-                description: "Supprimer un workspace",
-            },
-            ToolRef {
-                name: "get_workspace_overview",
-                description: "Vue d'ensemble complète",
-            },
-            ToolRef {
-                name: "list_workspace_projects",
-                description: "Projets du workspace",
-            },
-            ToolRef {
-                name: "add_project_to_workspace",
-                description: "Ajouter un projet",
-            },
-            ToolRef {
-                name: "remove_project_from_workspace",
-                description: "Retirer un projet",
-            },
-            ToolRef {
-                name: "search_workspace_code",
-                description: "Recherche cross-projets",
-            },
-            ToolRef {
-                name: "list_workspace_milestones",
-                description: "Milestones cross-projets",
-            },
-            ToolRef {
-                name: "create_workspace_milestone",
-                description: "Créer milestone workspace",
-            },
-            ToolRef {
-                name: "get_workspace_milestone",
-                description: "Détails milestone workspace",
-            },
-            ToolRef {
-                name: "update_workspace_milestone",
-                description: "Modifier milestone workspace",
-            },
-            ToolRef {
-                name: "delete_workspace_milestone",
-                description: "Supprimer milestone workspace",
-            },
-            ToolRef {
-                name: "add_task_to_workspace_milestone",
-                description: "Lier tâche → ws milestone",
-            },
-            ToolRef {
-                name: "link_plan_to_workspace_milestone",
-                description: "Lier plan → ws milestone (TARGETS_MILESTONE)",
-            },
-            ToolRef {
-                name: "unlink_plan_from_workspace_milestone",
-                description: "Délier plan d'un ws milestone",
-            },
-            ToolRef {
-                name: "get_workspace_milestone_progress",
-                description: "Progression ws milestone",
-            },
-            ToolRef {
-                name: "list_all_workspace_milestones",
-                description: "Tous les ws milestones",
-            },
-            ToolRef {
-                name: "list_resources",
-                description: "Ressources partagées",
-            },
-            ToolRef {
-                name: "create_resource",
-                description: "Créer une ressource",
-            },
-            ToolRef {
-                name: "get_resource",
-                description: "Détails d'une ressource",
-            },
-            ToolRef {
-                name: "update_resource",
-                description: "Modifier une ressource",
-            },
-            ToolRef {
-                name: "delete_resource",
-                description: "Supprimer une ressource",
-            },
-            ToolRef {
-                name: "link_resource_to_project",
-                description: "Lier ressource → projet",
-            },
-            ToolRef {
-                name: "list_components",
-                description: "Composants du workspace",
-            },
-            ToolRef {
-                name: "create_component",
-                description: "Créer un composant",
-            },
-            ToolRef {
-                name: "get_component",
-                description: "Détails d'un composant",
-            },
-            ToolRef {
-                name: "update_component",
-                description: "Modifier un composant",
-            },
-            ToolRef {
-                name: "delete_component",
-                description: "Supprimer un composant",
-            },
-            ToolRef {
-                name: "add_component_dependency",
-                description: "Dépendance entre composants",
-            },
-            ToolRef {
-                name: "remove_component_dependency",
-                description: "Retirer dépendance composant",
-            },
-            ToolRef {
-                name: "map_component_to_project",
-                description: "Lier composant → projet",
-            },
-            ToolRef {
-                name: "get_workspace_topology",
-                description: "Graphe composants + dépendances",
+                name: "component",
+                description: "Manage components (list/create/get/update/delete/add_dependency/map_to_project)",
             },
         ],
     },
-    // ── Sync & Admin (7 tools) ───────────────────────────────────────
+    // ── Chat & Feature Graphs ───────────────────────────────────────
+    ToolGroup {
+        name: "chat_features",
+        description: "Sessions de conversation et feature graphs",
+        keywords: &[
+            "chat", "session", "conversation", "message", "feature",
+            "graphe", "sous-graphe", "auto-build",
+        ],
+        tools: &[
+            ToolRef {
+                name: "chat",
+                description: "Manage chat sessions (list_sessions/get_session/delete_session/send_message/list_messages)",
+            },
+            ToolRef {
+                name: "feature_graph",
+                description: "Manage feature graphs (create/get/list/add_entity/auto_build/delete)",
+            },
+        ],
+    },
+    // ── Admin & Sync ────────────────────────────────────────────────
     ToolGroup {
         name: "sync_admin",
         description: "Synchronisation code et administration",
-        keywords: &["sync", "watch", "watcher", "meilisearch", "index", "admin"],
-        tools: &[
-            ToolRef {
-                name: "sync_directory",
-                description: "Sync manuelle d'un répertoire",
-            },
-            ToolRef {
-                name: "start_watch",
-                description: "Démarrer le file watcher",
-            },
-            ToolRef {
-                name: "stop_watch",
-                description: "Arrêter le file watcher",
-            },
-            ToolRef {
-                name: "watch_status",
-                description: "Statut du file watcher",
-            },
-            ToolRef {
-                name: "get_meilisearch_stats",
-                description: "Stats de l'index Meilisearch",
-            },
-            ToolRef {
-                name: "delete_meilisearch_orphans",
-                description: "Nettoyer docs orphelins",
-            },
-            ToolRef {
-                name: "cleanup_cross_project_calls",
-                description: "Supprimer les CALLS cross-projet",
-            },
-            ToolRef {
-                name: "cleanup_sync_data",
-                description: "Supprimer toutes les données de sync (File, Function, etc.)",
-            },
-        ],
-    },
-    // ── Chat (5 tools) ───────────────────────────────────────────────
-    ToolGroup {
-        name: "chat",
-        description: "Sessions de conversation et messages",
-        keywords: &["chat", "session", "conversation", "message", "historique"],
-        tools: &[
-            ToolRef {
-                name: "chat_send_message",
-                description: "Envoyer un message (non-streaming)",
-            },
-            ToolRef {
-                name: "list_chat_sessions",
-                description: "Lister les sessions chat",
-            },
-            ToolRef {
-                name: "get_chat_session",
-                description: "Détails d'une session",
-            },
-            ToolRef {
-                name: "delete_chat_session",
-                description: "Supprimer une session",
-            },
-            ToolRef {
-                name: "list_chat_messages",
-                description: "Historique des messages",
-            },
-        ],
-    },
-    // ── Feature Graphs (6 tools) ────────────────────────────────────
-    ToolGroup {
-        name: "feature_graphs",
-        description: "Sous-graphes de code par feature, réutilisables entre sessions",
-        keywords: &[
-            "feature",
-            "graphe",
-            "sous-graphe",
-            "subgraph",
-            "feature graph",
-            "exploration",
-            "call graph",
-            "auto-build",
-            "entité",
-        ],
-        tools: &[
-            ToolRef {
-                name: "create_feature_graph",
-                description: "Créer un feature graph nommé",
-            },
-            ToolRef {
-                name: "get_feature_graph",
-                description: "Détails avec entités incluses",
-            },
-            ToolRef {
-                name: "list_feature_graphs",
-                description: "Lister les feature graphs",
-            },
-            ToolRef {
-                name: "add_to_feature_graph",
-                description: "Ajouter une entité (file/function/struct)",
-            },
-            ToolRef {
-                name: "auto_build_feature_graph",
-                description: "Construire auto depuis un point d'entrée",
-            },
-            ToolRef {
-                name: "delete_feature_graph",
-                description: "Supprimer un feature graph",
-            },
-        ],
-    },
-    // ── Implementation Planner (1 tool) ─────────────────────────────
-    ToolGroup {
-        name: "implementation_planner",
-        description: "Analyser le graphe de connaissances pour planifier une implémentation",
-        keywords: &[
-            "plan",
-            "implementation",
-            "dag",
-            "phases",
-            "dépendances",
-            "ordre",
-            "planifier",
-            "impact",
-        ],
+        keywords: &["sync", "watch", "watcher", "meilisearch", "index", "admin", "cleanup"],
         tools: &[ToolRef {
-            name: "plan_implementation",
-            description: "Produire un DAG de phases d'implémentation à partir du graphe",
+            name: "admin",
+            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/cleanup_sync_data/backfill_synapses)",
         }],
     },
 ];
 
 /// Total number of unique tools across all groups.
-/// Must match the MCP tools.rs count (currently 145).
+/// Must match the MCP tools.rs count (currently 18 mega-tools).
 pub fn tool_catalog_tool_count() -> usize {
     let mut names: Vec<&str> = TOOL_GROUPS
         .iter()
@@ -2088,13 +1393,16 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains("MCP-first"));
         assert!(BASE_SYSTEM_PROMPT.contains("path_prefix"));
         assert!(BASE_SYSTEM_PROMPT.contains("Sync incrémentale au commit"));
-        // T6 behavioral directives
+        // T6 behavioral directives (mega-tool syntax)
         assert!(BASE_SYSTEM_PROMPT.contains("Warm-up"));
-        assert!(BASE_SYSTEM_PROMPT.contains("search_notes"));
-        assert!(BASE_SYSTEM_PROMPT.contains("search_notes_semantic"));
+        assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "search""#));
+        assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "search_semantic""#));
         assert!(BASE_SYSTEM_PROMPT.contains("Capture des connaissances (OBLIGATOIRE)"));
-        assert!(BASE_SYSTEM_PROMPT.contains("create_note"));
-        assert!(BASE_SYSTEM_PROMPT.contains("link_note_to_entity"));
+        assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "create""#));
+        assert!(BASE_SYSTEM_PROMPT.contains(r#"note(action: "link_to_entity""#));
+        // Mega-tools section
+        assert!(BASE_SYSTEM_PROMPT.contains("18 mega-tools"));
+        assert!(BASE_SYSTEM_PROMPT.contains("Mega-tools"));
     }
 
     #[test]
@@ -2102,16 +1410,16 @@ mod tests {
         assert!(BASE_SYSTEM_PROMPT.contains("PAS"));
         assert!(BASE_SYSTEM_PROMPT.contains("TodoWrite"));
         assert!(BASE_SYSTEM_PROMPT.contains("EnterPlanMode"));
-        assert!(BASE_SYSTEM_PROMPT.contains("create_plan"));
-        assert!(BASE_SYSTEM_PROMPT.contains("create_task"));
-        assert!(BASE_SYSTEM_PROMPT.contains("create_step"));
+        assert!(BASE_SYSTEM_PROMPT.contains(r#"plan(action: "create")"#));
+        assert!(BASE_SYSTEM_PROMPT.contains(r#"task(action: "create")"#));
+        assert!(BASE_SYSTEM_PROMPT.contains(r#"step(action: "create")"#));
     }
 
     #[test]
     fn test_base_system_prompt_has_task_decomposition_example() {
         assert!(BASE_SYSTEM_PROMPT.contains("Ajouter l'endpoint GET /api/releases/:id"));
         assert!(BASE_SYSTEM_PROMPT.contains("Step 1"));
-        assert!(BASE_SYSTEM_PROMPT.contains("Step 5"));
+        assert!(BASE_SYSTEM_PROMPT.contains("Step 3"));
     }
 
     #[test]
@@ -2219,7 +1527,7 @@ mod tests {
         // Tools catalog JSON is injected
         assert!(prompt.contains("planning"));
         assert!(prompt.contains("code_exploration"));
-        assert!(prompt.contains("create_plan"));
+        assert!(prompt.contains("plan"));
         // Instructions for Opus to select tool groups
         assert!(prompt.contains("Tools recommandés"));
         assert!(prompt.contains("groupes d'outils pertinents"));
@@ -2547,11 +1855,11 @@ mod tests {
     // ================================================================
 
     #[test]
-    fn test_tool_groups_cover_all_160_tools() {
+    fn test_tool_groups_cover_all_18_mega_tools() {
         let count = tool_catalog_tool_count();
         assert_eq!(
-            count, 160,
-            "TOOL_GROUPS must cover exactly 160 unique tools (got {}). \
+            count, 18,
+            "TOOL_GROUPS must cover exactly 18 unique mega-tools (got {}). \
              Update the catalog when adding/removing MCP tools.",
             count
         );
@@ -2601,7 +1909,7 @@ mod tests {
 
     #[test]
     fn test_tool_groups_count() {
-        assert_eq!(TOOL_GROUPS.len(), 15, "Expected 15 tool groups");
+        assert_eq!(TOOL_GROUPS.len(), 10, "Expected 10 tool groups");
     }
 
     #[test]
@@ -2625,8 +1933,9 @@ mod tests {
         let json = tools_catalog_to_json(TOOL_GROUPS);
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.len(), TOOL_GROUPS.len());
-        assert_eq!(parsed[0]["group"], "planning");
-        assert!(parsed[0]["tools"].as_array().unwrap().len() > 5);
+        // First group is project_management
+        assert_eq!(parsed[0]["group"], "project_management");
+        assert!(!parsed[0]["tools"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -2634,9 +1943,8 @@ mod tests {
         let groups: Vec<&ToolGroup> = vec![&TOOL_GROUPS[0], &TOOL_GROUPS[2]];
         let md = format_tool_groups_markdown(&groups);
         assert!(md.contains("## Tools recommandés"));
-        assert!(md.contains("create_plan"));
-        assert!(md.contains("search_code"));
-        assert!(!md.contains("create_note")); // knowledge group not included
+        assert!(md.contains("project")); // project_management group
+        assert!(md.contains("decision")); // decisions_constraints group
     }
 
     // ================================================================
@@ -2743,7 +2051,7 @@ mod tests {
         let md = context_to_markdown(&ctx, Some("Explore le code"));
         assert!(md.contains("TestProj"));
         assert!(md.contains("## Tools recommandés"));
-        assert!(md.contains("search_code")); // code_exploration group
+        assert!(md.contains("code")); // code_exploration group
     }
 
     fn make_feature_graphs(count: usize) -> Vec<FeatureGraphNode> {

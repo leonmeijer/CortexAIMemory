@@ -400,14 +400,14 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route("/api/code/search", get(code_handlers::search_code))
         // Get symbols in a file (Neo4j)
         .route(
-            "/api/code/symbols/{file_path}",
+            "/api/code/symbols/{*file_path}",
             get(code_handlers::get_file_symbols),
         )
         // Find all references to a symbol
         .route("/api/code/references", get(code_handlers::find_references))
         // Get file dependencies (imports + dependents)
         .route(
-            "/api/code/dependencies/{file_path}",
+            "/api/code/dependencies/{*file_path}",
             get(code_handlers::get_file_dependencies),
         )
         // Get call graph for a function
@@ -458,6 +458,10 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(code_handlers::get_code_communities),
         )
         .route("/api/code/health", get(code_handlers::get_code_health))
+        .route(
+            "/api/code/node-importance",
+            get(code_handlers::get_node_importance),
+        )
         // ================================================================
         // Implementation Planner
         // ================================================================
@@ -482,8 +486,20 @@ fn protected_routes() -> Router<OrchestratorState> {
         // Notes search
         .route("/api/notes/search", get(note_handlers::search_notes))
         .route(
+            "/api/notes/search-semantic",
+            get(note_handlers::search_notes_semantic),
+        )
+        .route(
             "/api/notes/neurons/search",
             get(note_handlers::search_neurons),
+        )
+        .route(
+            "/api/notes/neurons/reinforce",
+            post(note_handlers::reinforce_neurons),
+        )
+        .route(
+            "/api/notes/neurons/decay",
+            post(note_handlers::decay_synapses),
         )
         // Notes needing review
         .route(
@@ -494,6 +510,11 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/notes/update-staleness",
             post(note_handlers::update_staleness_scores),
+        )
+        // Update energy scores (Hebbian decay)
+        .route(
+            "/api/notes/update-energy",
+            post(note_handlers::update_energy_scores),
         )
         // Notes for a project
         .route(
@@ -567,6 +588,17 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/meilisearch/orphans",
             axum::routing::delete(handlers::delete_meilisearch_orphans),
+        )
+        // ================================================================
+        // Admin Cleanup
+        // ================================================================
+        .route(
+            "/api/admin/cleanup-cross-project-calls",
+            post(handlers::cleanup_cross_project_calls),
+        )
+        .route(
+            "/api/admin/cleanup-sync-data",
+            post(handlers::cleanup_sync_data),
         )
         // ================================================================
         // Workspaces

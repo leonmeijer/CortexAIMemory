@@ -923,3 +923,496 @@ pub async fn cancel_backfill_synapses(
         "message": "Cancellation requested. The job will stop after the current note."
     })))
 }
+
+// ============================================================================
+// Additional endpoints for MCP HTTP proxy parity
+// ============================================================================
+
+/// Query params for semantic note search
+#[derive(Debug, Deserialize)]
+pub struct SemanticSearchQuery {
+    pub query: String,
+    pub project_slug: Option<String>,
+    pub workspace_slug: Option<String>,
+    pub limit: Option<usize>,
+}
+
+/// GET /api/notes/search-semantic — Vector-based semantic search
+pub async fn search_notes_semantic(
+    State(state): State<OrchestratorState>,
+    Query(query): Query<SemanticSearchQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project_id = if let Some(ref slug) = query.project_slug {
+        let project = state
+            .orchestrator
+            .neo4j()
+            .get_project_by_slug(slug)
+            .await
+            .map_err(AppError::Internal)?
+            .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
+        Some(project.id)
+    } else {
+        None
+    };
+
+    let hits = state
+        .orchestrator
+        .note_manager()
+        .semantic_search_notes(
+            &query.query,
+            project_id,
+            query.workspace_slug.as_deref(),
+            query.limit,
+        )
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::to_value(hits).unwrap_or_default()))
+}
+
+/// Request body for update_energy_scores
+#[derive(Debug, Deserialize)]
+pub struct UpdateEnergyBody {
+    pub half_life: Option<f64>,
+}
+
+/// POST /api/notes/update-energy — Decay energy scores based on half-life
+pub async fn update_energy_scores(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<UpdateEnergyBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let half_life = body.half_life.unwrap_or(90.0);
+    let count = state
+        .orchestrator
+        .note_manager()
+        .update_energy_scores(half_life)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "notes_updated": count,
+        "half_life_days": half_life
+    })))
+}
+
+/// Request body for reinforce_neurons
+#[derive(Debug, Deserialize)]
+pub struct ReinforceNeuronsBody {
+    pub note_ids: Vec<Uuid>,
+    pub energy_boost: Option<f64>,
+    pub synapse_boost: Option<f64>,
+}
+
+/// POST /api/notes/neurons/reinforce — Boost energy + reinforce synapses
+pub async fn reinforce_neurons(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<ReinforceNeuronsBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if body.note_ids.len() < 2 {
+        return Err(AppError::BadRequest(format!(
+            "note_ids must contain at least 2 UUIDs (got {})",
+            body.note_ids.len()
+        )));
+    }
+
+    let energy_boost = body.energy_boost.unwrap_or(0.2);
+    let synapse_boost = body.synapse_boost.unwrap_or(0.05);
+
+    let neo4j = state.orchestrator.neo4j();
+    let mut neurons_boosted = 0u64;
+    for note_id in &body.note_ids {
+        neo4j
+            .boost_energy(*note_id, energy_boost)
+            .await
+            .map_err(AppError::Internal)?;
+        neurons_boosted += 1;
+    }
+
+    let synapses_reinforced = neo4j
+        .reinforce_synapses(&body.note_ids, synapse_boost)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "neurons_boosted": neurons_boosted,
+        "synapses_reinforced": synapses_reinforced,
+        "energy_boost": energy_boost,
+        "synapse_boost": synapse_boost,
+    })))
+}
+
+/// Request body for decay_synapses
+#[derive(Debug, Deserialize)]
+pub struct DecaySynapsesBody {
+    pub decay_amount: Option<f64>,
+    pub prune_threshold: Option<f64>,
+}
+
+/// POST /api/notes/neurons/decay — Decay synapses and prune weak ones
+pub async fn decay_synapses(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<DecaySynapsesBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let decay_amount = body.decay_amount.unwrap_or(0.01);
+    let prune_threshold = body.prune_threshold.unwrap_or(0.1);
+
+    let (decayed, pruned) = state
+        .orchestrator
+        .neo4j()
+        .decay_synapses(decay_amount, prune_threshold)
+        .await
+        .map_err(AppError::Internal)?;
+
+    Ok(Json(serde_json::json!({
+        "synapses_decayed": decayed,
+        "synapses_pruned": pruned,
+        "decay_amount": decay_amount,
+        "prune_threshold": prune_threshold,
+    })))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use crate::api::handlers::ServerState;
+    use crate::api::routes::create_router;
+    use crate::events::EventBus;
+    use crate::orchestrator::{FileWatcher, Orchestrator};
+    use crate::test_helpers::{mock_app_state, test_bearer_token};
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// Build a test router with mock backends
+    async fn test_app() -> axum::Router {
+        let app_state = mock_app_state();
+        let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
+        let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
+            orchestrator.clone(),
+        )));
+        let state = Arc::new(ServerState {
+            orchestrator,
+            watcher,
+            chat_manager: None,
+            event_bus: Arc::new(crate::events::HybridEmitter::new(Arc::new(
+                EventBus::default(),
+            ))),
+            nats_emitter: None,
+            auth_config: Some(crate::test_helpers::test_auth_config()),
+            serve_frontend: false,
+            frontend_path: "./dist".to_string(),
+            setup_completed: true,
+            server_port: 6600,
+            public_url: None,
+            ws_ticket_store: Arc::new(crate::api::ws_auth::WsTicketStore::new()),
+        });
+        create_router(state)
+    }
+
+    /// Create an authenticated GET request
+    fn auth_get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// Create an authenticated POST request with JSON body
+    fn auth_post(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_string(&body).unwrap()))
+            .unwrap()
+    }
+
+    /// Parse response body as JSON
+    async fn body_json(resp: axum::http::Response<Body>) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // ====================================================================
+    // GET /api/notes — list notes (empty)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_list_notes_empty() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/notes")).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["items"].as_array().unwrap().len(), 0);
+        assert_eq!(json["total"], 0);
+    }
+
+    // ====================================================================
+    // POST /api/notes + GET /api/notes/{id} — create and get
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_create_and_get_note() {
+        let app = test_app().await;
+
+        // Create a note
+        let create_body = serde_json::json!({
+            "note_type": "guideline",
+            "content": "Always use parameterized queries to prevent SQL injection.",
+            "importance": "high",
+            "tags": ["security", "sql"]
+        });
+        let resp = app
+            .clone()
+            .oneshot(auth_post("/api/notes", create_body))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = body_json(resp).await;
+        let note_id = created["id"].as_str().unwrap();
+        assert_eq!(
+            created["content"],
+            "Always use parameterized queries to prevent SQL injection."
+        );
+        assert_eq!(created["note_type"], "guideline");
+        assert_eq!(created["importance"], "high");
+
+        // Retrieve the note by ID
+        let get_uri = format!("/api/notes/{}", note_id);
+        let resp = app.oneshot(auth_get(&get_uri)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let fetched = body_json(resp).await;
+        assert_eq!(fetched["id"], note_id);
+        assert_eq!(
+            fetched["content"],
+            "Always use parameterized queries to prevent SQL injection."
+        );
+    }
+
+    // ====================================================================
+    // GET /api/notes/{id} — not found
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_note_not_found() {
+        let app = test_app().await;
+        let fake_id = uuid::Uuid::new_v4();
+        let uri = format!("/api/notes/{}", fake_id);
+        let resp = app.oneshot(auth_get(&uri)).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ====================================================================
+    // GET /api/entities/{entity_type}/{entity_id}/notes — invalid type
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_entity_notes_invalid_type() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/entities/invalid_type/some-id/notes"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/entities/{entity_type}/{entity_id}/notes — valid type
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_entity_notes_valid_type() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/entities/file/src%2Fmain.rs/notes"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    // ====================================================================
+    // GET /api/notes/context — missing required params
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_context_notes_missing_params() {
+        let app = test_app().await;
+        // entity_type and entity_id are required query params
+        let resp = app.oneshot(auth_get("/api/notes/context")).await.unwrap();
+
+        // Missing required query parameters should result in 400
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/notes/context — invalid entity type
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_context_notes_invalid_entity_type() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/context?entity_type=bogus&entity_id=abc",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/notes/context — valid params (empty result)
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_context_notes_valid() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/context?entity_type=file&entity_id=src/main.rs",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        // NoteContextResponse has direct_notes and propagated_notes
+        assert!(json["direct_notes"].is_array());
+        assert!(json["propagated_notes"].is_array());
+    }
+
+    // ====================================================================
+    // GET /api/notes/propagated — missing params
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_propagated_notes_missing_params() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/notes/propagated"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/notes/search — empty results
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_search_notes_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get("/api/notes/search?q=nonexistent"))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert!(json.is_array());
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    // ====================================================================
+    // GET /api/notes/search — missing q param
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_search_notes_missing_query() {
+        let app = test_app().await;
+        let resp = app.oneshot(auth_get("/api/notes/search")).await.unwrap();
+
+        // 'q' is a required field in NotesSearchQuery
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ====================================================================
+    // GET /api/notes/search-semantic — empty results
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_search_notes_semantic_empty() {
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/notes/search-semantic?query=something+unusual",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        // semantic_search_notes falls back to BM25 when no embedding provider;
+        // either way, result should be an array
+        assert!(json.is_array());
+    }
+
+    // ====================================================================
+    // POST /api/notes/{id}/links — link a note to an entity
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_link_note_to_entity() {
+        let app = test_app().await;
+
+        // First create a note
+        let create_body = serde_json::json!({
+            "note_type": "gotcha",
+            "content": "Watch out for race conditions in this module."
+        });
+        let resp = app
+            .clone()
+            .oneshot(auth_post("/api/notes", create_body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let created = body_json(resp).await;
+        let note_id = created["id"].as_str().unwrap();
+
+        // Link the note to a file entity
+        let link_body = serde_json::json!({
+            "entity_type": "file",
+            "entity_id": "src/lib.rs"
+        });
+        let link_uri = format!("/api/notes/{}/links", note_id);
+        let resp = app
+            .clone()
+            .oneshot(auth_post(&link_uri, link_body))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Verify the note appears when querying entity notes
+        let resp = app
+            .oneshot(auth_get("/api/entities/file/src%2Flib.rs/notes"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        let notes = json.as_array().unwrap();
+        assert!(
+            notes.iter().any(|n| n["id"].as_str() == Some(note_id)),
+            "Linked note should appear in entity notes"
+        );
+    }
+}
