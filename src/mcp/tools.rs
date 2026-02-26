@@ -474,7 +474,8 @@ fn milestone_tool() -> ToolDefinition {
                 "status": {"type": "string", "description": "Status (update)"},
                 "target_date": {"type": "string", "description": "Target date ISO (create/update)"},
                 "task_id": {"type": "string", "description": "Task UUID (add_task)"},
-                "plan_id": {"type": "string", "description": "Plan UUID (link_plan/unlink_plan)"}
+                "plan_id": {"type": "string", "description": "Plan UUID (link_plan/unlink_plan)"},
+                "include_tasks": {"type": "boolean", "description": "Include flat top-level tasks list in get response (default false). Plans with their tasks/steps are always returned."}
             })),
             required: Some(vec!["action".to_string()]),
         },

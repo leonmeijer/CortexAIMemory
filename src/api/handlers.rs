@@ -2268,23 +2268,41 @@ pub struct MilestoneDetailsResponse {
     pub progress: MilestoneProgressResponse,
 }
 
+/// Query parameters for GET /api/milestones/:id
+#[derive(Deserialize)]
+pub struct MilestoneGetQuery {
+    /// Include the flat top-level tasks list in the response (default: true for backward compat).
+    /// The hierarchical plans → tasks → steps are always returned regardless.
+    pub include_tasks: Option<bool>,
+}
+
 /// Get milestone details
 pub async fn get_milestone(
     State(state): State<OrchestratorState>,
     Path(milestone_id): Path<Uuid>,
+    Query(query): Query<MilestoneGetQuery>,
 ) -> Result<Json<MilestoneDetailsResponse>, AppError> {
     let neo4j = state.orchestrator.neo4j();
+    let include_tasks = query.include_tasks.unwrap_or(true);
 
-    // 1. Get milestone + flat tasks (for backward compat tasks field)
-    let (milestone, flat_tasks) = neo4j
-        .get_milestone_details(milestone_id)
-        .await?
-        .ok_or(AppError::NotFound("Milestone not found".into()))?;
+    // Fetch milestone node — use lightweight query when flat tasks are not needed
+    let (milestone, flat_tasks) = if include_tasks {
+        let (m, tasks) = neo4j
+            .get_milestone_details(milestone_id)
+            .await?
+            .ok_or(AppError::NotFound("Milestone not found".into()))?;
+        (m, tasks)
+    } else {
+        let m = neo4j
+            .get_milestone(milestone_id)
+            .await?
+            .ok_or(AppError::NotFound("Milestone not found".into()))?;
+        (m, vec![])
+    };
 
-    // 2. Get tasks with plan info
+    // Always load plans → tasks → steps hierarchy
     let tasks_with_plan = neo4j.get_milestone_tasks_with_plans(milestone_id).await?;
 
-    // 3. Get progress stats
     let (total, completed, in_progress, pending) =
         neo4j.get_milestone_progress(milestone_id).await?;
 
@@ -2294,10 +2312,8 @@ pub async fn get_milestone(
         0.0
     };
 
-    // 4. Get all steps in one batch query
     let mut steps_map = neo4j.get_milestone_steps_batch(milestone_id).await?;
 
-    // 5. Group tasks by plan and build hierarchical response
     let mut plan_order: Vec<Uuid> = Vec::new();
     let mut plan_map: std::collections::HashMap<
         Uuid,
