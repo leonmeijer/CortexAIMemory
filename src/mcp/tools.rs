@@ -228,6 +228,17 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "get_code_health" => Some(("code", "get_health")),
         "get_node_importance" => Some(("code", "get_node_importance")),
         "plan_implementation" => Some(("code", "plan_implementation")),
+        "detect_processes" => Some(("code", "detect_processes")),
+        "get_class_hierarchy" => Some(("code", "get_class_hierarchy")),
+        "find_subclasses" => Some(("code", "find_subclasses")),
+        "find_interface_implementors" => Some(("code", "find_interface_implementors")),
+        "list_processes" => Some(("code", "list_processes")),
+        "get_process" => Some(("code", "get_process")),
+        "get_entry_points" => Some(("code", "get_entry_points")),
+        "enrich_communities" => Some(("code", "enrich_communities")),
+        "get_hotspots" => Some(("code", "get_hotspots")),
+        "get_knowledge_gaps" => Some(("code", "get_knowledge_gaps")),
+        "get_risk_assessment" => Some(("code", "get_risk_assessment")),
 
         // Admin
         "sync_directory" => Some(("admin", "sync_directory")),
@@ -237,6 +248,8 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "get_meilisearch_stats" => Some(("admin", "meilisearch_stats")),
         "delete_meilisearch_orphans" => Some(("admin", "delete_meilisearch_orphans")),
         "cleanup_cross_project_calls" => Some(("admin", "cleanup_cross_project_calls")),
+        "cleanup_builtin_calls" => Some(("admin", "cleanup_builtin_calls")),
+        "migrate_calls_confidence" => Some(("admin", "migrate_calls_confidence")),
         "cleanup_sync_data" => Some(("admin", "cleanup_sync_data")),
         "update_staleness_scores" => Some(("admin", "update_staleness_scores")),
         "update_energy_scores" => Some(("admin", "update_energy_scores")),
@@ -721,13 +734,13 @@ fn feature_graph_tool() -> ToolDefinition {
 fn code_tool() -> ToolDefinition {
     ToolDefinition {
         name: "code".to_string(),
-        description: "Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers".to_string(),
+        description: "Explore and analyze code. Actions: search, search_project, search_workspace, get_file_symbols, find_references, get_file_dependencies, get_call_graph, analyze_impact, get_architecture, find_similar, find_trait_implementations, find_type_traits, get_impl_blocks, get_communities, get_health, get_node_importance, plan_implementation, get_co_change_graph, get_file_co_changers, detect_processes, get_class_hierarchy, find_subclasses, find_interface_implementors, list_processes, get_process, get_entry_points, enrich_communities, get_hotspots, get_knowledge_gaps, get_risk_assessment".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers"],
+                    "enum": ["search", "search_project", "search_workspace", "get_file_symbols", "find_references", "get_file_dependencies", "get_call_graph", "analyze_impact", "get_architecture", "find_similar", "find_trait_implementations", "find_type_traits", "get_impl_blocks", "get_communities", "get_health", "get_node_importance", "plan_implementation", "get_co_change_graph", "get_file_co_changers", "detect_processes", "get_class_hierarchy", "find_subclasses", "find_interface_implementors", "list_processes", "get_process", "get_entry_points", "enrich_communities", "get_hotspots", "get_knowledge_gaps", "get_risk_assessment"],
                     "description": "Operation to perform"
                 },
                 "query": {"type": "string", "description": "Search query (search/search_project/search_workspace)"},
@@ -740,7 +753,11 @@ fn code_tool() -> ToolDefinition {
                 "target": {"type": "string", "description": "Target for impact analysis (analyze_impact)"},
                 "code_snippet": {"type": "string", "description": "Code to find similar (find_similar)"},
                 "trait_name": {"type": "string", "description": "Trait name (find_trait_implementations)"},
-                "type_name": {"type": "string", "description": "Type name (find_type_traits/get_impl_blocks)"},
+                "type_name": {"type": "string", "description": "Type name (find_type_traits/get_impl_blocks/get_class_hierarchy)"},
+                "class_name": {"type": "string", "description": "Class name (find_subclasses)"},
+                "interface_name": {"type": "string", "description": "Interface name (find_interface_implementors)"},
+                "process_id": {"type": "string", "description": "Process ID (get_process)"},
+                "max_depth": {"type": "integer", "description": "Max traversal depth (get_class_hierarchy, default 10)"},
                 "node_path": {"type": "string", "description": "Node path (get_node_importance)"},
                 "node_type": {"type": "string", "description": "Node type (get_node_importance)"},
                 "description": {"type": "string", "description": "Implementation description (plan_implementation)"},
@@ -759,13 +776,13 @@ fn code_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
@@ -942,6 +959,8 @@ mod tests {
             "get_meilisearch_stats",
             "delete_meilisearch_orphans",
             "cleanup_cross_project_calls",
+            "cleanup_builtin_calls",
+            "migrate_calls_confidence",
             "cleanup_sync_data",
             "list_notes",
             "create_note",
@@ -1015,6 +1034,17 @@ mod tests {
             "get_code_health",
             "get_node_importance",
             "plan_implementation",
+            "detect_processes",
+            "get_class_hierarchy",
+            "find_subclasses",
+            "find_interface_implementors",
+            "list_processes",
+            "get_process",
+            "get_entry_points",
+            "enrich_communities",
+            "get_hotspots",
+            "get_knowledge_gaps",
+            "get_risk_assessment",
         ];
 
         for name in &old_names {

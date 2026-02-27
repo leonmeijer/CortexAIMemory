@@ -62,6 +62,19 @@ Workspace
 - Commit → Plan : `commit(action: "link_to_plan", plan_id, commit_sha)`
 - Note → Entité : `note(action: "link_to_entity", note_id, entity_type, entity_id)`
 
+### Graphe de code — Relations structurelles
+
+Le graphe Neo4j contient aussi les relations extraites par Tree-sitter :
+- `IMPORTS` : File → File — imports/requires entre fichiers
+- `CALLS` : Function → Function — appels de fonctions (avec confidence score)
+- `EXTENDS` : Struct → Struct — héritage de classes (Java, TS, Python, PHP, C++, Ruby, Kotlin, Swift)
+- `IMPLEMENTS` : Struct → Struct — implémentation d'interfaces (Java, TS, PHP)
+- `IMPLEMENTS_TRAIT` / `IMPLEMENTS_FOR` : implémentation de traits Rust
+- `STEP_IN_PROCESS` : Process → Function — étapes ordonnées d'un processus métier détecté par BFS sur le CALLS graph
+
+Navigation heritage : `code(action: "get_class_hierarchy")`, `code(action: "find_subclasses")`, `code(action: "find_interface_implementors")`
+Processus métier : `code(action: "list_processes")`, `code(action: "get_process")`, `code(action: "get_entry_points")`
+
 ### Notes (base de connaissances)
 
 - **Types** : guideline, gotcha, pattern, context, tip, observation, assertion
@@ -368,6 +381,51 @@ Le Knowledge Fabric connecte toutes les entités du graphe via des relations sé
 - `workspace_milestone(action: "create", slug, title)` — milestones cross-projets
 - `workspace(action: "get_topology", slug)` — composants et dépendances entre services
 - `resource(action: "list", workspace_slug)` — contrats API, schémas partagés
+
+### Stratégie heritage (EXTENDS / IMPLEMENTS)
+
+Avant de modifier une classe dans un langage OOP :
+1. `code(action: "get_class_hierarchy", type_name)` — vérifier parents ET enfants (modifier une classe peut casser ses sous-classes)
+2. `code(action: "find_subclasses", class_name)` — identifier toutes les sous-classes transitives
+3. `code(action: "find_interface_implementors", interface_name)` — toutes les implémentations d'une interface
+
+**Règle** : toujours vérifier la hiérarchie d'héritage AVANT de modifier une méthode protégée/publique. Un changement de signature dans une classe parent peut casser silencieusement N sous-classes.
+
+### Process detection & workflow awareness
+
+Les processus métier sont des traces BFS sur le graphe CALLS depuis les entry points :
+- `code(action: "get_entry_points", project_slug)` — fonctions main, handlers HTTP, CLI commands, event handlers
+- `code(action: "list_processes", project_slug)` — tous les processus détectés (nom, entry point, steps count)
+- `code(action: "get_process", process_id)` — steps ordonnés d'un processus
+
+**Utilise ceci** : avant de modifier du code transversal (middleware, service partagé), explorer les processus qui le traversent pour anticiper les effets de bord.
+
+### Co-change patterns dans l'analyse d'impact
+
+Compléter `analyze_impact` (structural) avec les signaux de co-changement :
+- `code(action: "get_co_change_graph", project_slug)` — graphe global des fichiers co-modifiés
+- `code(action: "get_file_co_changers", file_path)` — fichiers souvent modifiés avec un fichier donné
+
+Les fichiers qui changent ensemble sont souvent couplés même sans import direct (couplage temporel). Penser à les vérifier après une modification.
+
+### Community-aware planning
+
+Utiliser `code(action: "get_communities", project_slug)` pour segmenter les tâches lors de la planification :
+- Chaque communauté = cluster de fichiers/fonctions fortement couplés (score `cohesion`)
+- Un task ne devrait pas traverser plus de 2 communautés sauf refactoring cross-cutting
+- Les labels enrichis (champ `enriched_by`) aident à nommer les modules fonctionnels
+- `code(action: "enrich_communities", project_slug)` — enrichir les labels via LLM (batch)
+
+### Notes globales vs project-scoped
+
+- **Note project-scoped** (avec `project_id`) : gotcha/pattern spécifique à un projet (ex: "cette API retourne 204 pas 200")
+- **Note globale** (sans `project_id`) : convention cross-projets, pattern workspace-wide (ex: "toujours utiliser ULID pour les IDs")
+- `note(action: "list_project", slug)` — lister les notes d'un projet spécifique
+- `note(action: "list")` — inclut aussi les notes globales
+
+### add_discussed obligatoire
+
+Appeler `chat(action: "add_discussed", session_id, entities)` pour chaque fichier/fonction significativement modifié ou analysé dans la session. Cela nourrit les relations DISCUSSED du Knowledge Fabric et améliore la propagation contextuelle pour les sessions futures.
 "#;
 
 use anyhow::Result;
@@ -473,7 +531,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Code Exploration & Analytics ────────────────────────────────
     ToolGroup {
         name: "code_exploration",
-        description: "Recherche sémantique, graphe d'appels, impact, analytics GDS, hotspots, risk",
+        description: "Recherche sémantique, graphe d'appels, impact, analytics GDS, heritage, process, community, risk",
         keywords: &[
             "code", "fonction", "struct", "fichier", "import", "appel",
             "architecture", "symbole", "trait", "impl", "référence",
@@ -481,10 +539,14 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
             "pagerank", "GDS", "plan_implementation",
             "risque", "hotspot", "churn", "health", "knowledge-gap",
             "risk-assessment", "density",
+            "héritage", "extends", "implements", "interface", "class",
+            "subclass", "hierarchy", "sous-classe",
+            "process", "entry point", "processus", "workflow",
+            "co-change", "co_change", "cohesion", "enrichment",
         ],
         tools: &[ToolRef {
             name: "code",
-            description: "Explore code (search/find_references/get_call_graph/analyze_impact/get_architecture/get_communities/get_health/get_node_importance/plan_implementation) — get_health includes hotspots, knowledge_gaps, risk_assessment, neural_metrics; analyze_impact includes affecting_decisions",
+            description: "Explore code (search/search_project/search_workspace/get_file_symbols/find_references/get_file_dependencies/get_call_graph/analyze_impact/get_architecture/find_similar/find_trait_implementations/find_type_traits/get_impl_blocks/get_communities/get_health/get_node_importance/plan_implementation/get_co_change_graph/get_file_co_changers/detect_processes/get_class_hierarchy/find_subclasses/find_interface_implementors/list_processes/get_process/get_entry_points/enrich_communities/get_hotspots/get_knowledge_gaps/get_risk_assessment)",
         }],
     },
     // ── Knowledge / Notes ───────────────────────────────────────────
@@ -498,7 +560,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         ],
         tools: &[ToolRef {
             name: "note",
-            description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/get_context/get_context_knowledge/get_propagated/get_entity/get_needing_review)",
+            description: "Manage notes (list/create/get/update/delete/search/search_semantic/confirm/invalidate/supersede/link_to_entity/unlink_from_entity/get_context/get_context_knowledge/get_propagated/get_propagated_knowledge/get_entity/get_needing_review/list_project)",
         }],
     },
     // ── Git Tracking ────────────────────────────────────────────────
@@ -557,15 +619,16 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
     // ── Chat & Feature Graphs ───────────────────────────────────────
     ToolGroup {
         name: "chat_features",
-        description: "Sessions de conversation et feature graphs",
+        description: "Sessions de conversation, feature graphs, discussed entities",
         keywords: &[
             "chat", "session", "conversation", "message", "feature",
             "graphe", "sous-graphe", "auto-build",
+            "discussed", "session entities",
         ],
         tools: &[
             ToolRef {
                 name: "chat",
-                description: "Manage chat sessions (list_sessions/get_session/delete_session/send_message/list_messages)",
+                description: "Manage chat sessions (list_sessions/get_session/delete_session/send_message/list_messages/add_discussed/get_session_entities)",
             },
             ToolRef {
                 name: "feature_graph",
@@ -584,7 +647,7 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         ],
         tools: &[ToolRef {
             name: "admin",
-            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/update_fabric_scores/bootstrap_knowledge_fabric)",
+            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/delete_meilisearch_orphans/cleanup_cross_project_calls/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/backfill_decision_embeddings/backfill_touches/backfill_discussed/update_fabric_scores/bootstrap_knowledge_fabric)",
         }],
     },
 ];

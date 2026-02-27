@@ -48,36 +48,41 @@ impl Neo4jClient {
         Ok(())
     }
 
-    /// Delete files that are no longer on the filesystem
-    /// Returns the number of files and symbols deleted
+    /// Delete files that are no longer on the filesystem.
+    ///
+    /// Returns `(files_deleted, symbols_deleted, deleted_paths)` so the caller
+    /// can also clean secondary indexes (e.g. Meilisearch).
     pub async fn delete_stale_files(
         &self,
         project_id: Uuid,
         valid_paths: &[String],
-    ) -> Result<(usize, usize)> {
-        // First, count what we're about to delete
+    ) -> Result<(usize, usize, Vec<String>)> {
+        // First, count and collect paths of what we're about to delete
         let count_q = query(
             r#"
             MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
             WHERE NOT f.path IN $valid_paths
             OPTIONAL MATCH (f)-[:CONTAINS]->(symbol)
-            RETURN count(DISTINCT f) AS file_count, count(DISTINCT symbol) AS symbol_count
+            RETURN count(DISTINCT f) AS file_count,
+                   count(DISTINCT symbol) AS symbol_count,
+                   collect(DISTINCT f.path) AS stale_paths
             "#,
         )
         .param("project_id", project_id.to_string())
         .param("valid_paths", valid_paths.to_vec());
 
         let mut result = self.graph.execute(count_q).await?;
-        let (file_count, symbol_count) = if let Some(row) = result.next().await? {
+        let (file_count, symbol_count, stale_paths) = if let Some(row) = result.next().await? {
             let files: i64 = row.get("file_count").unwrap_or(0);
             let symbols: i64 = row.get("symbol_count").unwrap_or(0);
-            (files as usize, symbols as usize)
+            let paths: Vec<String> = row.get("stale_paths").unwrap_or_default();
+            (files as usize, symbols as usize, paths)
         } else {
-            (0, 0)
+            (0, 0, vec![])
         };
 
         if file_count == 0 {
-            return Ok((0, 0));
+            return Ok((0, 0, vec![]));
         }
 
         // Delete the stale files and their symbols
@@ -101,7 +106,7 @@ impl Neo4jClient {
             project_id
         );
 
-        Ok((file_count, symbol_count))
+        Ok((file_count, symbol_count, stale_paths))
     }
 
     /// Link a file to a project (create CONTAINS relationship)
@@ -155,6 +160,82 @@ impl Neo4jClient {
             .param("path", file.path.clone());
 
             self.graph.run(q).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Batch upsert file nodes using UNWIND.
+    ///
+    /// Creates or updates all file nodes in a single query and links them
+    /// to their project in a second query.
+    pub async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+
+        use crate::neo4j::batch::{run_unwind_in_chunks, BoltMap};
+
+        let items: Vec<BoltMap> = files
+            .iter()
+            .map(|f| {
+                let mut m = BoltMap::new();
+                m.insert("path".into(), f.path.clone().into());
+                m.insert("language".into(), f.language.clone().into());
+                m.insert("hash".into(), f.hash.clone().into());
+                m.insert("last_parsed".into(), f.last_parsed.to_rfc3339().into());
+                m.insert(
+                    "project_id".into(),
+                    f.project_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default()
+                        .into(),
+                );
+                m
+            })
+            .collect();
+
+        run_unwind_in_chunks(
+            &self.graph,
+            items,
+            r#"
+            UNWIND $items AS item
+            MERGE (f:File {path: item.path})
+            SET f.language = item.language,
+                f.hash = item.hash,
+                f.last_parsed = datetime(item.last_parsed),
+                f.project_id = item.project_id
+            "#,
+        )
+        .await?;
+
+        // Link files to projects (only for files with a project_id)
+        let project_items: Vec<BoltMap> = files
+            .iter()
+            .filter(|f| f.project_id.is_some())
+            .map(|f| {
+                let mut m = BoltMap::new();
+                m.insert("path".into(), f.path.clone().into());
+                m.insert(
+                    "project_id".into(),
+                    f.project_id.unwrap().to_string().into(),
+                );
+                m
+            })
+            .collect();
+
+        if !project_items.is_empty() {
+            run_unwind_in_chunks(
+                &self.graph,
+                project_items,
+                r#"
+                UNWIND $items AS item
+                MATCH (p:Project {id: item.project_id})
+                MATCH (f:File {path: item.path})
+                MERGE (p)-[:CONTAINS]->(f)
+                "#,
+            )
+            .await?;
         }
 
         Ok(())
@@ -320,7 +401,9 @@ impl Neo4jClient {
                 s.file_path = $file_path,
                 s.line_start = $line_start,
                 s.line_end = $line_end,
-                s.docstring = $docstring
+                s.docstring = $docstring,
+                s.parent_class = $parent_class,
+                s.interfaces = $interfaces
             WITH s
             MATCH (file:File {path: $file_path})
             MERGE (file)-[:CONTAINS]->(s)
@@ -333,7 +416,9 @@ impl Neo4jClient {
         .param("file_path", s.file_path.clone())
         .param("line_start", s.line_start as i64)
         .param("line_end", s.line_end as i64)
-        .param("docstring", s.docstring.clone().unwrap_or_default());
+        .param("docstring", s.docstring.clone().unwrap_or_default())
+        .param("parent_class", s.parent_class.clone().unwrap_or_default())
+        .param("interfaces", s.interfaces.clone());
 
         self.graph.run(q).await?;
         Ok(())
@@ -768,12 +853,21 @@ impl Neo4jClient {
     /// Create a CALLS relationship between functions, scoped to the same project.
     /// Uses a 2-phase strategy: prefer same-file callee, then project-scoped with LIMIT 1
     /// to avoid Cartesian products on common names like "new", "default", "from".
+    /// Sets `confidence` (0.0-1.0) and `reason` properties on the CALLS relationship.
     pub async fn create_call_relationship(
         &self,
         caller_id: &str,
         callee_name: &str,
         project_id: Option<Uuid>,
+        confidence: f64,
+        reason: &str,
     ) -> Result<()> {
+        // Double protection: filter out built-in calls at insertion level
+        use crate::parser::noise_filter;
+        if noise_filter::is_builtin_call(callee_name) {
+            return Ok(());
+        }
+
         // Phase 1: Try same-file match (most common case, O(1) via index)
         // Extract file_path from caller_id (format: "file_path:func_name:line_start")
         let caller_file_path = caller_id.rsplitn(3, ':').last().unwrap_or(caller_id);
@@ -784,13 +878,16 @@ impl Neo4jClient {
             MATCH (callee:Function {name: $callee_name})
             WHERE callee.file_path = $caller_file_path AND callee.id <> $caller_id
             WITH caller, callee LIMIT 1
-            MERGE (caller)-[:CALLS]->(callee)
+            MERGE (caller)-[r:CALLS]->(callee)
+            SET r.confidence = $confidence, r.reason = $reason
             RETURN count(*) AS linked
             "#,
         )
         .param("caller_id", caller_id)
         .param("callee_name", callee_name)
-        .param("caller_file_path", caller_file_path);
+        .param("caller_file_path", caller_file_path)
+        .param("confidence", confidence)
+        .param("reason", reason);
 
         let same_file_linked = match self.graph.execute(same_file_q).await {
             Ok(mut result) => {
@@ -815,23 +912,29 @@ impl Neo4jClient {
                 MATCH (callee:Function {name: $callee_name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
                 WHERE callee.id <> $caller_id
                 WITH caller, callee LIMIT 1
-                MERGE (caller)-[:CALLS]->(callee)
+                MERGE (caller)-[r:CALLS]->(callee)
+                SET r.confidence = $confidence, r.reason = $reason
                 "#,
             )
             .param("caller_id", caller_id)
             .param("callee_name", callee_name)
-            .param("project_id", pid.to_string()),
+            .param("project_id", pid.to_string())
+            .param("confidence", confidence)
+            .param("reason", reason),
             None => query(
                 r#"
                 MATCH (caller:Function {id: $caller_id})
                 MATCH (callee:Function {name: $callee_name})
                 WHERE callee.id <> $caller_id
                 WITH caller, callee LIMIT 1
-                MERGE (caller)-[:CALLS]->(callee)
+                MERGE (caller)-[r:CALLS]->(callee)
+                SET r.confidence = $confidence, r.reason = $reason
                 "#,
             )
             .param("caller_id", caller_id)
-            .param("callee_name", callee_name),
+            .param("callee_name", callee_name)
+            .param("confidence", confidence)
+            .param("reason", reason),
         };
 
         // Ignore errors if callee not found (might be external)
@@ -979,6 +1082,11 @@ impl Neo4jClient {
                     "docstring".into(),
                     s.docstring.clone().unwrap_or_default().into(),
                 );
+                m.insert(
+                    "parent_class".into(),
+                    s.parent_class.clone().unwrap_or_default().into(),
+                );
+                m.insert("interfaces".into(), s.interfaces.clone().into());
                 m
             })
             .collect();
@@ -993,7 +1101,9 @@ impl Neo4jClient {
                 st.file_path = s.file_path,
                 st.line_start = s.line_start,
                 st.line_end = s.line_end,
-                st.docstring = s.docstring
+                st.docstring = s.docstring,
+                st.parent_class = s.parent_class,
+                st.interfaces = s.interfaces
             WITH st, s
             MATCH (file:File {path: s.file_path})
             MERGE (file)-[:CONTAINS]->(st)
@@ -1486,6 +1596,9 @@ impl Neo4jClient {
     /// Batch create CALLS relationships using UNWIND — 2-phase strategy:
     /// Phase 1: same-file callee match (most common, O(1) via index)
     /// Phase 2: project-scoped fallback for unresolved calls
+    ///
+    /// Both phases are chunked (BATCH_SIZE items per query) to avoid Neo4j OOM/timeout
+    /// on large projects (50K+ calls).
     pub async fn batch_create_call_relationships(
         &self,
         calls: &[crate::parser::FunctionCall],
@@ -1495,8 +1608,14 @@ impl Neo4jClient {
             return Ok(());
         }
 
+        use crate::neo4j::batch::BATCH_SIZE;
+        // Double protection: filter out built-in calls at insertion level
+        // (primary filter is in the parser, this catches any remaining)
+        use crate::parser::noise_filter;
+
         let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = calls
             .iter()
+            .filter(|call| !noise_filter::is_builtin_call(&call.callee_name))
             .map(|call| {
                 let caller_file_path = call
                     .caller_id
@@ -1508,38 +1627,47 @@ impl Neo4jClient {
                 m.insert("caller_id".into(), call.caller_id.clone().into());
                 m.insert("callee_name".into(), call.callee_name.clone().into());
                 m.insert("caller_file_path".into(), caller_file_path.into());
+                m.insert(
+                    "confidence".into(),
+                    neo4rs::BoltType::Float(neo4rs::BoltFloat {
+                        value: call.confidence,
+                    }),
+                );
+                m.insert("reason".into(), call.reason.clone().into());
                 m
             })
             .collect();
 
         // Phase 1: same-file match with CALL {} subquery for per-row LIMIT 1
-        let q = query(
-            r#"
+        // Chunked to avoid OOM on large call arrays (50K+ items)
+        let phase1_cypher = r#"
             UNWIND $items AS call
             CALL {
                 WITH call
                 MATCH (caller:Function {id: call.caller_id})
                 MATCH (callee:Function {name: call.callee_name})
                 WHERE callee.file_path = call.caller_file_path AND callee.id <> call.caller_id
-                WITH caller, callee LIMIT 1
-                MERGE (caller)-[:CALLS]->(callee)
+                WITH caller, callee, call LIMIT 1
+                MERGE (caller)-[r:CALLS]->(callee)
+                SET r.confidence = call.confidence, r.reason = call.reason
                 RETURN caller.id AS resolved_caller, callee.name AS resolved_callee
             }
             RETURN resolved_caller, resolved_callee
-            "#,
-        )
-        .param("items", items.clone());
+            "#;
 
         let mut resolved: std::collections::HashSet<(String, String)> =
             std::collections::HashSet::new();
         // Phase 1 failure is not fatal — Phase 2 will try all calls
-        if let Ok(mut result) = self.graph.execute(q).await {
-            while let Ok(Some(row)) = result.next().await {
-                if let (Ok(caller), Ok(callee)) = (
-                    row.get::<String>("resolved_caller"),
-                    row.get::<String>("resolved_callee"),
-                ) {
-                    resolved.insert((caller, callee));
+        for chunk in items.chunks(BATCH_SIZE) {
+            let q = query(phase1_cypher).param("items", chunk.to_vec());
+            if let Ok(mut result) = self.graph.execute(q).await {
+                while let Ok(Some(row)) = result.next().await {
+                    if let (Ok(caller), Ok(callee)) = (
+                        row.get::<String>("resolved_caller"),
+                        row.get::<String>("resolved_callee"),
+                    ) {
+                        resolved.insert((caller, callee));
+                    }
                 }
             }
         }
@@ -1561,41 +1689,201 @@ impl Neo4jClient {
             .collect();
 
         if !unresolved.is_empty() {
-            let q = match project_id {
-                Some(pid) => query(
-                    r#"
-                    UNWIND $items AS call
-                    CALL {
-                        WITH call
-                        MATCH (caller:Function {id: call.caller_id})
-                        MATCH (callee:Function {name: call.callee_name, project_id: $project_id})
-                        WHERE callee.id <> call.caller_id
-                        WITH caller, callee LIMIT 1
-                        MERGE (caller)-[:CALLS]->(callee)
+            match project_id {
+                Some(pid) => {
+                    let cypher = r#"
+                        UNWIND $items AS call
+                        CALL {
+                            WITH call
+                            MATCH (caller:Function {id: call.caller_id})
+                            MATCH (callee:Function {name: call.callee_name, project_id: $project_id})
+                            WHERE callee.id <> call.caller_id
+                            WITH caller, callee, call LIMIT 1
+                            MERGE (caller)-[r:CALLS]->(callee)
+                            SET r.confidence = call.confidence, r.reason = call.reason
+                        }
+                        "#;
+                    let pid_str = pid.to_string();
+                    for chunk in unresolved.chunks(BATCH_SIZE) {
+                        let q = query(cypher)
+                            .param("items", chunk.to_vec())
+                            .param("project_id", pid_str.clone());
+                        if let Err(e) = self.graph.run(q).await {
+                            tracing::warn!("batch_create_call_relationships Phase 2 (project) chunk failed: {}", e);
+                        }
                     }
-                    "#,
-                )
-                .param("items", unresolved)
-                .param("project_id", pid.to_string()),
-                None => query(
-                    r#"
-                    UNWIND $items AS call
-                    CALL {
-                        WITH call
-                        MATCH (caller:Function {id: call.caller_id})
-                        MATCH (callee:Function {name: call.callee_name})
-                        WHERE callee.id <> call.caller_id
-                        WITH caller, callee LIMIT 1
-                        MERGE (caller)-[:CALLS]->(callee)
+                }
+                None => {
+                    let cypher = r#"
+                        UNWIND $items AS call
+                        CALL {
+                            WITH call
+                            MATCH (caller:Function {id: call.caller_id})
+                            MATCH (callee:Function {name: call.callee_name})
+                            WHERE callee.id <> call.caller_id
+                            WITH caller, callee, call LIMIT 1
+                            MERGE (caller)-[r:CALLS]->(callee)
+                            SET r.confidence = call.confidence, r.reason = call.reason
+                        }
+                        "#;
+                    for chunk in unresolved.chunks(BATCH_SIZE) {
+                        let q = query(cypher).param("items", chunk.to_vec());
+                        if let Err(e) = self.graph.run(q).await {
+                            tracing::warn!(
+                                "batch_create_call_relationships Phase 2 (global) chunk failed: {}",
+                                e
+                            );
+                        }
                     }
-                    "#,
-                )
-                .param("items", unresolved),
-            };
-
-            let _ = self.graph.run(q).await;
+                }
+            }
         }
 
+        Ok(())
+    }
+
+    /// Batch create EXTENDS relationships (class inheritance).
+    /// Two-phase: 1) same-file match, 2) project-scoped fallback.
+    ///
+    /// Both phases are chunked (BATCH_SIZE items per query) to avoid Neo4j OOM/timeout.
+    pub async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()> {
+        if rels.is_empty() {
+            return Ok(());
+        }
+
+        use crate::neo4j::batch::BATCH_SIZE;
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = rels
+            .iter()
+            .map(|(child_name, child_file, parent_name, pid)| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("child_name".into(), child_name.clone().into());
+                m.insert("child_file".into(), child_file.clone().into());
+                m.insert("parent_name".into(), parent_name.clone().into());
+                m.insert("project_id".into(), pid.clone().into());
+                m
+            })
+            .collect();
+
+        // Phase 1: same-file match — chunked to avoid OOM on large arrays
+        let phase1_cypher = r#"
+            UNWIND $items AS rel
+            CALL {
+                WITH rel
+                MATCH (child:Struct {name: rel.child_name, file_path: rel.child_file})
+                MATCH (parent:Struct {name: rel.parent_name, file_path: rel.child_file})
+                WITH child, parent LIMIT 1
+                MERGE (child)-[:EXTENDS]->(parent)
+                RETURN child.name AS resolved, child.file_path AS resolved_file
+            }
+            RETURN resolved, resolved_file
+            "#;
+
+        let mut resolved: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        for chunk in items.chunks(BATCH_SIZE) {
+            let q = query(phase1_cypher).param("items", chunk.to_vec());
+            if let Ok(mut result) = self.graph.execute(q).await {
+                while let Ok(Some(row)) = result.next().await {
+                    if let (Ok(name), Ok(file)) = (
+                        row.get::<String>("resolved"),
+                        row.get::<String>("resolved_file"),
+                    ) {
+                        resolved.insert((name, file));
+                    }
+                }
+            }
+        }
+
+        // Phase 2: project-scoped fallback for unresolved — also chunked
+        let unresolved: Vec<_> = items
+            .into_iter()
+            .filter(|m| {
+                let child = match m.get("child_name") {
+                    Some(neo4rs::BoltType::String(s)) => s.value.clone(),
+                    _ => String::new(),
+                };
+                let child_file = match m.get("child_file") {
+                    Some(neo4rs::BoltType::String(s)) => s.value.clone(),
+                    _ => String::new(),
+                };
+                !resolved.contains(&(child, child_file))
+            })
+            .collect();
+
+        if !unresolved.is_empty() {
+            let phase2_cypher = r#"
+                UNWIND $items AS rel
+                CALL {
+                    WITH rel
+                    MATCH (child:Struct {name: rel.child_name, file_path: rel.child_file})
+                    MATCH (parent:Struct {name: rel.parent_name, project_id: rel.project_id})
+                    WHERE parent.file_path <> child.file_path
+                    WITH child, parent LIMIT 1
+                    MERGE (child)-[:EXTENDS]->(parent)
+                }
+                "#;
+            for chunk in unresolved.chunks(BATCH_SIZE) {
+                let q = query(phase2_cypher).param("items", chunk.to_vec());
+                if let Err(e) = self.graph.run(q).await {
+                    tracing::warn!(
+                        "batch_create_extends_relationships Phase 2 chunk failed: {}",
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Batch create IMPLEMENTS relationships (interface/protocol implementation).
+    /// Matches against Trait nodes (interfaces stored as Trait in Java, TS, PHP, Kotlin, Swift).
+    ///
+    /// Chunked (BATCH_SIZE items per query) to avoid Neo4j OOM/timeout.
+    pub async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()> {
+        if rels.is_empty() {
+            return Ok(());
+        }
+
+        use crate::neo4j::batch::run_unwind_in_chunks;
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = rels
+            .iter()
+            .map(|(struct_name, struct_file, iface_name, pid)| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("struct_name".into(), struct_name.clone().into());
+                m.insert("struct_file".into(), struct_file.clone().into());
+                m.insert("iface_name".into(), iface_name.clone().into());
+                m.insert("project_id".into(), pid.clone().into());
+                m
+            })
+            .collect();
+
+        if let Err(e) = run_unwind_in_chunks(
+            &self.graph,
+            items,
+            r#"
+            UNWIND $items AS rel
+            CALL {
+                WITH rel
+                MATCH (s:Struct {name: rel.struct_name, file_path: rel.struct_file})
+                MATCH (iface:Trait {name: rel.iface_name, project_id: rel.project_id})
+                WITH s, iface LIMIT 1
+                MERGE (s)-[:IMPLEMENTS]->(iface)
+            }
+            "#,
+        )
+        .await
+        {
+            tracing::warn!("batch_create_implements_relationships failed: {}", e);
+        }
         Ok(())
     }
 
@@ -1610,13 +1898,22 @@ impl Neo4jClient {
 
         // Delete code relationships first (batched to avoid massive transactions)
         // CALLS alone can be 300k+ rels — unbatched DELETE causes OOM/timeout
+        //
+        // NOTE: Types not yet in use (EXTENDS, IMPLEMENTS, STEP_IN_PROCESS)
+        // are forward-compatible no-ops — the batched loop simply returns 0.
         let rel_types = vec![
             "CALLS",
             "IMPORTS",
+            "IMPORTS_SYMBOL",
+            "USES_TYPE",
             "IMPLEMENTS_FOR",
             "IMPLEMENTS_TRAIT",
             "HAS_IMPORT",
             "INCLUDES_ENTITY",
+            // Forward-compatible: Plans 5 & 6
+            "EXTENDS",
+            "IMPLEMENTS",
+            "STEP_IN_PROCESS",
         ];
 
         for rel_type in &rel_types {
@@ -1665,6 +1962,10 @@ impl Neo4jClient {
         }
 
         // Delete code entity nodes (batched DETACH DELETE removes remaining CONTAINS edges)
+        //
+        // NOTE: Process is forward-compatible for Plan 6 (Process Detection).
+        // Class/Interface are NOT added — Struct and Trait cover these concepts
+        // in the current model (Rust-centric). If needed later, add here.
         let node_labels = vec![
             "Function",
             "Struct",
@@ -1674,6 +1975,8 @@ impl Neo4jClient {
             "Import",
             "File",
             "FeatureGraph",
+            // Forward-compatible: Plan 6
+            "Process",
         ];
 
         for label in &node_labels {
@@ -1748,6 +2051,114 @@ impl Neo4jClient {
         } else {
             Ok(0)
         }
+    }
+
+    /// Delete all CALLS relationships where the callee function name matches a known built-in.
+    /// Uses the noise_filter::BUILT_IN_NAMES list. Batched to handle large graphs.
+    /// Returns the number of deleted relationships.
+    pub async fn cleanup_builtin_calls(&self) -> Result<i64> {
+        use crate::parser::noise_filter;
+
+        let builtins: Vec<String> = noise_filter::builtin_names()
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        let batch_size = 10_000;
+        let mut total_deleted: i64 = 0;
+
+        loop {
+            let q = query(
+                r#"
+                MATCH (caller:Function)-[r:CALLS]->(callee:Function)
+                WHERE callee.name IN $builtins
+                WITH r LIMIT $batch_size
+                DELETE r
+                RETURN count(r) AS cnt
+                "#,
+            )
+            .param("builtins", builtins.clone())
+            .param("batch_size", batch_size as i64);
+
+            match self.graph.execute(q).await {
+                Ok(mut result) => {
+                    if let Ok(Some(row)) = result.next().await {
+                        let cnt: i64 = row.get("cnt").unwrap_or(0);
+                        if cnt == 0 {
+                            break;
+                        }
+                        total_deleted += cnt;
+                        tracing::info!(
+                            "cleanup_builtin_calls: deleted batch of {} CALLS rels (total: {})",
+                            cnt,
+                            total_deleted
+                        );
+                    } else {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("cleanup_builtin_calls query failed: {}", e);
+                    break;
+                }
+            }
+        }
+
+        tracing::info!(
+            "cleanup_builtin_calls: deleted {} built-in CALLS relationships total",
+            total_deleted
+        );
+        Ok(total_deleted)
+    }
+
+    /// Migrate existing CALLS relationships: set default confidence and reason
+    /// for any CALLS rel that doesn't have these properties yet.
+    /// Returns the number of relationships updated.
+    pub async fn migrate_calls_confidence(&self) -> Result<i64> {
+        let batch_size = 10_000;
+        let mut total_updated: i64 = 0;
+
+        loop {
+            let q = query(&format!(
+                r#"
+                MATCH (caller:Function)-[r:CALLS]->(callee:Function)
+                WHERE r.confidence IS NULL
+                WITH r LIMIT {}
+                SET r.confidence = 0.50, r.reason = 'fuzzy-global'
+                RETURN count(r) AS cnt
+                "#,
+                batch_size
+            ));
+
+            match self.graph.execute(q).await {
+                Ok(mut result) => {
+                    if let Ok(Some(row)) = result.next().await {
+                        let cnt: i64 = row.get("cnt").unwrap_or(0);
+                        if cnt == 0 {
+                            break;
+                        }
+                        total_updated += cnt;
+                        tracing::info!(
+                            "migrate_calls_confidence: updated batch of {} CALLS rels (total: {})",
+                            cnt,
+                            total_updated
+                        );
+                    } else {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("migrate_calls_confidence query failed: {}", e);
+                    break;
+                }
+            }
+        }
+
+        tracing::info!(
+            "migrate_calls_confidence: updated {} CALLS relationships total",
+            total_updated
+        );
+        Ok(total_updated)
     }
 
     /// Get all functions called by a function
@@ -1911,6 +2322,293 @@ impl Neo4jClient {
         }
 
         Ok(impl_blocks)
+    }
+
+    // ========================================================================
+    // Heritage navigation queries (EXTENDS + IMPLEMENTS)
+    // ========================================================================
+
+    /// Get the full class hierarchy (parents + children) for a type.
+    ///
+    /// Traverses EXTENDS up (parents) and down (children) with depth limit.
+    pub async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        max_depth: u32,
+    ) -> Result<serde_json::Value> {
+        // Parents (traverse EXTENDS upward)
+        let q_parents = query(&format!(
+            r#"
+            MATCH path = (child)-[:EXTENDS*1..{}]->(ancestor)
+            WHERE child.name = $type_name
+            WITH ancestor, length(path) AS depth
+            WHERE depth <= $max_depth
+            RETURN DISTINCT ancestor.name AS name,
+                   ancestor.path AS path,
+                   depth
+            ORDER BY depth ASC
+            "#,
+            max_depth
+        ))
+        .param("type_name", type_name)
+        .param("max_depth", max_depth as i64);
+
+        let mut result = self.graph.execute(q_parents).await?;
+        let mut parents = Vec::new();
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name").unwrap_or_default();
+            let path: Option<String> = row.get("path").ok();
+            let depth: i64 = row.get("depth").unwrap_or(0);
+            parents.push(serde_json::json!({
+                "name": name,
+                "path": path,
+                "depth": depth,
+            }));
+        }
+
+        // Children (traverse EXTENDS downward — reverse direction)
+        let q_children = query(&format!(
+            r#"
+            MATCH path = (descendant)-[:EXTENDS*1..{}]->(parent)
+            WHERE parent.name = $type_name
+            WITH descendant, length(path) AS depth
+            WHERE depth <= $max_depth
+            RETURN DISTINCT descendant.name AS name,
+                   descendant.path AS path,
+                   depth
+            ORDER BY depth ASC
+            "#,
+            max_depth
+        ))
+        .param("type_name", type_name)
+        .param("max_depth", max_depth as i64);
+
+        let mut result = self.graph.execute(q_children).await?;
+        let mut children = Vec::new();
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name").unwrap_or_default();
+            let path: Option<String> = row.get("path").ok();
+            let depth: i64 = row.get("depth").unwrap_or(0);
+            children.push(serde_json::json!({
+                "name": name,
+                "path": path,
+                "depth": depth,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "type_name": type_name,
+            "parents": parents,
+            "children": children,
+        }))
+    }
+
+    /// Find all subclasses of a given class (direct + transitive via EXTENDS).
+    pub async fn find_subclasses(&self, class_name: &str) -> Result<Vec<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH path = (child)-[:EXTENDS*1..10]->(parent)
+            WHERE parent.name = $class_name
+            WITH child, length(path) AS depth
+            RETURN DISTINCT child.name AS name,
+                   child.path AS path,
+                   depth
+            ORDER BY depth ASC, name ASC
+            "#,
+        )
+        .param("class_name", class_name);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut subclasses = Vec::new();
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name").unwrap_or_default();
+            let path: Option<String> = row.get("path").ok();
+            let depth: i64 = row.get("depth").unwrap_or(0);
+            subclasses.push(serde_json::json!({
+                "name": name,
+                "path": path,
+                "depth": depth,
+                "direct": depth == 1,
+            }));
+        }
+        Ok(subclasses)
+    }
+
+    /// Find all classes/types that implement a given interface (via IMPLEMENTS).
+    pub async fn find_interface_implementors(
+        &self,
+        interface_name: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH (type)-[:IMPLEMENTS]->(iface)
+            WHERE iface.name = $interface_name
+            RETURN DISTINCT type.name AS name,
+                   type.path AS path,
+                   labels(type) AS labels
+            ORDER BY name ASC
+            "#,
+        )
+        .param("interface_name", interface_name);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut implementors = Vec::new();
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name").unwrap_or_default();
+            let path: Option<String> = row.get("path").ok();
+            implementors.push(serde_json::json!({
+                "name": name,
+                "path": path,
+            }));
+        }
+        Ok(implementors)
+    }
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    /// List all detected processes for a project.
+    pub async fn list_processes(&self, project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH (p:Process {project_id: $project_id})
+            OPTIONAL MATCH (p)-[s:STEP_IN_PROCESS]->(f:Function)
+            WITH p, count(s) AS step_count
+            RETURN p.id AS id,
+                   p.label AS label,
+                   p.process_type AS process_type,
+                   p.entry_point_id AS entry_point,
+                   p.terminal_id AS terminal,
+                   step_count
+            ORDER BY step_count DESC
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        let mut processes = Vec::new();
+        while let Some(row) = result.next().await? {
+            let id: String = row.get("id").unwrap_or_default();
+            let label: String = row.get("label").unwrap_or_default();
+            let process_type: String = row.get("process_type").unwrap_or_default();
+            let entry_point: String = row.get("entry_point").unwrap_or_default();
+            let terminal: String = row.get("terminal").unwrap_or_default();
+            let step_count: i64 = row.get("step_count").unwrap_or(0);
+            processes.push(serde_json::json!({
+                "id": id,
+                "label": label,
+                "process_type": process_type,
+                "entry_point": entry_point,
+                "terminal": terminal,
+                "step_count": step_count,
+            }));
+        }
+        Ok(processes)
+    }
+
+    /// Get details of a specific process including ordered steps.
+    pub async fn get_process_detail(&self, process_id: &str) -> Result<Option<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH (p:Process {id: $process_id})
+            OPTIONAL MATCH (p)-[s:STEP_IN_PROCESS]->(f:Function)
+            WITH p, f, s
+            ORDER BY s.order ASC
+            RETURN p.id AS id,
+                   p.label AS label,
+                   p.process_type AS process_type,
+                   p.entry_point_id AS entry_point,
+                   p.terminal_id AS terminal,
+                   collect({
+                       function_id: f.id,
+                       name: f.name,
+                       file_path: f.file_path,
+                       order: s.order
+                   }) AS steps
+            "#,
+        )
+        .param("process_id", process_id);
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let id: String = row.get("id").unwrap_or_default();
+            if id.is_empty() {
+                return Ok(None);
+            }
+            let label: String = row.get("label").unwrap_or_default();
+            let process_type: String = row.get("process_type").unwrap_or_default();
+            let entry_point: String = row.get("entry_point").unwrap_or_default();
+            let terminal: String = row.get("terminal").unwrap_or_default();
+            let steps: Vec<serde_json::Value> =
+                serde_json::from_value(row.get::<serde_json::Value>("steps").unwrap_or_default())
+                    .unwrap_or_default();
+
+            Ok(Some(serde_json::json!({
+                "id": id,
+                "label": label,
+                "process_type": process_type,
+                "entry_point": entry_point,
+                "terminal": terminal,
+                "steps": steps,
+            })))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Get scored entry points for a project.
+    ///
+    /// Entry points are functions with in_degree=0 on the CALLS graph,
+    /// or functions matching framework/naming patterns.
+    pub async fn get_entry_points(
+        &self,
+        project_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let q = query(
+            r#"
+            MATCH (f:Function)
+            WHERE f.project_id = $project_id OR
+                  EXISTS {
+                      MATCH (file:File {project_id: $project_id})
+                      WHERE f.file_path = file.path
+                  }
+            OPTIONAL MATCH (caller:Function)-[:CALLS]->(f)
+            WITH f, count(caller) AS in_degree
+            WHERE in_degree = 0
+            OPTIONAL MATCH (f)-[:CALLS]->(callee:Function)
+            WITH f, in_degree, count(callee) AS out_degree
+            WHERE out_degree > 0
+            RETURN f.name AS name,
+                   f.file_path AS file_path,
+                   f.id AS id,
+                   in_degree,
+                   out_degree
+            ORDER BY out_degree DESC
+            LIMIT $limit
+            "#,
+        )
+        .param("project_id", project_id.to_string())
+        .param("limit", limit as i64);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut entry_points = Vec::new();
+        while let Some(row) = result.next().await? {
+            let name: String = row.get("name").unwrap_or_default();
+            let file_path: String = row.get("file_path").unwrap_or_default();
+            let id: String = row.get("id").unwrap_or_default();
+            let in_degree: i64 = row.get("in_degree").unwrap_or(0);
+            let out_degree: i64 = row.get("out_degree").unwrap_or(0);
+            entry_points.push(serde_json::json!({
+                "name": name,
+                "file_path": file_path,
+                "id": id,
+                "in_degree": in_degree,
+                "out_degree": out_degree,
+            }));
+        }
+        Ok(entry_points)
     }
 
     // ========================================================================
@@ -2314,6 +3012,102 @@ impl Neo4jClient {
         while let Some(row) = result.next().await? {
             if let Ok(name) = row.get::<String>("name") {
                 callees.push(name);
+            }
+        }
+
+        Ok(callees)
+    }
+
+    /// Get direct callers of a function with confidence scores on each CALLS edge.
+    /// Depth 1 only (direct callers) to return per-edge confidence.
+    pub async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        // Returns (caller_name, caller_file, confidence, reason)
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (f:Function {name: $name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                MATCH (caller:Function)-[r:CALLS]->(f)
+                WHERE EXISTS { MATCH (caller)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }
+                RETURN DISTINCT caller.name AS name, caller.file_path AS file,
+                       coalesce(r.confidence, 0.50) AS confidence,
+                       coalesce(r.reason, 'unknown') AS reason
+                "#,
+            )
+            .param("name", function_name)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (f:Function {name: $name})
+                MATCH (caller:Function)-[r:CALLS]->(f)
+                RETURN DISTINCT caller.name AS name, caller.file_path AS file,
+                       coalesce(r.confidence, 0.50) AS confidence,
+                       coalesce(r.reason, 'unknown') AS reason
+                "#,
+            )
+            .param("name", function_name),
+        };
+
+        let mut result = self.graph.execute(q).await?;
+        let mut callers = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(name), Ok(file)) = (row.get::<String>("name"), row.get::<String>("file")) {
+                let confidence = row.get::<f64>("confidence").unwrap_or(0.50);
+                let reason = row
+                    .get::<String>("reason")
+                    .unwrap_or_else(|_| "unknown".to_string());
+                callers.push((name, file, confidence, reason));
+            }
+        }
+
+        Ok(callers)
+    }
+
+    /// Get direct callees of a function with confidence scores on each CALLS edge.
+    pub async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        let q = match project_id {
+            Some(pid) => query(
+                r#"
+                MATCH (f:Function {name: $name})<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p:Project {id: $project_id})
+                MATCH (f)-[r:CALLS]->(callee:Function)
+                WHERE EXISTS { MATCH (callee)<-[:CONTAINS]-(:File)<-[:CONTAINS]-(p) }
+                RETURN DISTINCT callee.name AS name, callee.file_path AS file,
+                       coalesce(r.confidence, 0.50) AS confidence,
+                       coalesce(r.reason, 'unknown') AS reason
+                "#,
+            )
+            .param("name", function_name)
+            .param("project_id", pid.to_string()),
+            None => query(
+                r#"
+                MATCH (f:Function {name: $name})
+                MATCH (f)-[r:CALLS]->(callee:Function)
+                RETURN DISTINCT callee.name AS name, callee.file_path AS file,
+                       coalesce(r.confidence, 0.50) AS confidence,
+                       coalesce(r.reason, 'unknown') AS reason
+                "#,
+            )
+            .param("name", function_name),
+        };
+
+        let mut result = self.graph.execute(q).await?;
+        let mut callees = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(name), Ok(file)) = (row.get::<String>("name"), row.get::<String>("file")) {
+                let confidence = row.get::<f64>("confidence").unwrap_or(0.50);
+                let reason = row
+                    .get::<String>("reason")
+                    .unwrap_or_else(|_| "unknown".to_string());
+                callees.push((name, file, confidence, reason));
             }
         }
 
@@ -2841,5 +3635,117 @@ impl Neo4jClient {
         }
 
         Ok(functions)
+    }
+
+    /// Batch upsert Process nodes using UNWIND + MERGE.
+    pub async fn batch_upsert_processes(
+        &self,
+        processes: &[crate::neo4j::models::ProcessNode],
+    ) -> Result<()> {
+        if processes.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = processes
+            .iter()
+            .map(|p| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("id".into(), p.id.clone().into());
+                m.insert("label".into(), p.label.clone().into());
+                m.insert("process_type".into(), p.process_type.clone().into());
+                m.insert("step_count".into(), (p.step_count as i64).into());
+                m.insert("entry_point_id".into(), p.entry_point_id.clone().into());
+                m.insert("terminal_id".into(), p.terminal_id.clone().into());
+                m.insert(
+                    "communities".into(),
+                    p.communities
+                        .iter()
+                        .map(|c| *c as i64)
+                        .collect::<Vec<i64>>()
+                        .into(),
+                );
+                m.insert(
+                    "project_id".into(),
+                    p.project_id
+                        .map(|id| id.to_string())
+                        .unwrap_or_default()
+                        .into(),
+                );
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS proc
+            MERGE (p:Process {id: proc.id})
+            SET p.label = proc.label,
+                p.process_type = proc.process_type,
+                p.step_count = proc.step_count,
+                p.entry_point_id = proc.entry_point_id,
+                p.terminal_id = proc.terminal_id,
+                p.communities = proc.communities,
+                p.project_id = proc.project_id
+            "#,
+        )
+        .param("items", items);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Batch create STEP_IN_PROCESS relationships.
+    pub async fn batch_create_step_relationships(
+        &self,
+        steps: &[(String, String, u32)],
+    ) -> Result<()> {
+        if steps.is_empty() {
+            return Ok(());
+        }
+
+        let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = steps
+            .iter()
+            .map(|(process_id, function_id, step_number)| {
+                let mut m = std::collections::HashMap::new();
+                m.insert("process_id".into(), process_id.clone().into());
+                m.insert("function_id".into(), function_id.clone().into());
+                m.insert("step".into(), (*step_number as i64).into());
+                m
+            })
+            .collect();
+
+        let q = query(
+            r#"
+            UNWIND $items AS s
+            MATCH (p:Process {id: s.process_id})
+            MATCH (f:Function {id: s.function_id})
+            MERGE (p)-[r:STEP_IN_PROCESS]->(f)
+            SET r.step = s.step
+            "#,
+        )
+        .param("items", items);
+
+        self.graph.run(q).await?;
+        Ok(())
+    }
+
+    /// Delete all Process nodes and STEP_IN_PROCESS relationships for a project.
+    pub async fn delete_project_processes(&self, project_id: uuid::Uuid) -> Result<u64> {
+        let q = query(
+            r#"
+            MATCH (p:Process {project_id: $project_id})
+            DETACH DELETE p
+            RETURN count(p) AS deleted
+            "#,
+        )
+        .param("project_id", project_id.to_string());
+
+        let mut result = self.graph.execute(q).await?;
+        if let Some(row) = result.next().await? {
+            let deleted: i64 = row.get("deleted")?;
+            Ok(deleted as u64)
+        } else {
+            Ok(0)
+        }
     }
 }

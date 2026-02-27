@@ -278,6 +278,17 @@ impl ToolHandler {
             ("code", "plan_implementation") => "plan_implementation",
             ("code", "get_co_change_graph") => "get_co_change_graph",
             ("code", "get_file_co_changers") => "get_file_co_changers",
+            ("code", "detect_processes") => "detect_processes",
+            ("code", "get_class_hierarchy") => "get_class_hierarchy",
+            ("code", "find_subclasses") => "find_subclasses",
+            ("code", "find_interface_implementors") => "find_interface_implementors",
+            ("code", "list_processes") => "list_processes",
+            ("code", "get_process") => "get_process",
+            ("code", "get_entry_points") => "get_entry_points",
+            ("code", "enrich_communities") => "enrich_communities",
+            ("code", "get_hotspots") => "get_hotspots",
+            ("code", "get_knowledge_gaps") => "get_knowledge_gaps",
+            ("code", "get_risk_assessment") => "get_risk_assessment",
 
             // Admin
             ("admin", "sync_directory") => "sync_directory",
@@ -287,6 +298,8 @@ impl ToolHandler {
             ("admin", "meilisearch_stats") => "get_meilisearch_stats",
             ("admin", "delete_meilisearch_orphans") => "delete_meilisearch_orphans",
             ("admin", "cleanup_cross_project_calls") => "cleanup_cross_project_calls",
+            ("admin", "cleanup_builtin_calls") => "cleanup_builtin_calls",
+            ("admin", "migrate_calls_confidence") => "migrate_calls_confidence",
             ("admin", "cleanup_sync_data") => "cleanup_sync_data",
             ("admin", "update_staleness_scores") => "update_staleness_scores",
             ("admin", "update_energy_scores") => "update_energy_scores",
@@ -2782,6 +2795,113 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            "detect_processes" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let body = serde_json::json!({"project_slug": project_slug});
+                let result = http.post("/api/code/processes/detect", &body).await?;
+                Ok(Some(result))
+            }
+
+            // ── Heritage Navigation ──────────────────────────────────────
+            "get_class_hierarchy" => {
+                let type_name = extract_string(args, "type_name")?;
+                let mut query = vec![("type_name".to_string(), type_name)];
+                if let Some(v) = args.get("max_depth").and_then(|v| v.as_i64()) {
+                    query.push(("max_depth".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/code/class-hierarchy", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "find_subclasses" => {
+                let class_name = extract_string(args, "class_name")?;
+                let query = vec![("class_name".to_string(), class_name)];
+                let result = http.get_with_query("/api/code/subclasses", &query).await?;
+                Ok(Some(result))
+            }
+
+            "find_interface_implementors" => {
+                let interface_name = extract_string(args, "interface_name")?;
+                let query = vec![("interface_name".to_string(), interface_name)];
+                let result = http
+                    .get_with_query("/api/code/interface-implementors", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            // ── Process Navigation ───────────────────────────────────────
+            "list_processes" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let query = vec![("project_slug".to_string(), project_slug)];
+                let result = http.get_with_query("/api/code/processes", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_process" => {
+                let process_id = extract_string(args, "process_id")?;
+                let query = vec![("process_id".to_string(), process_id)];
+                let result = http
+                    .get_with_query("/api/code/processes/detail", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_entry_points" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![("project_slug".to_string(), project_slug)];
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/code/entry-points", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            // ── Community Enrichment + REST Gaps ─────────────────────────
+            "enrich_communities" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let body = serde_json::json!({"project_slug": project_slug});
+                let result = http.post("/api/code/communities/enrich", &body).await?;
+                Ok(Some(result))
+            }
+
+            "get_hotspots" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![("project_slug".to_string(), project_slug)];
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/code/hotspots", &query).await?;
+                Ok(Some(result))
+            }
+
+            "get_knowledge_gaps" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![("project_slug".to_string(), project_slug)];
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/code/knowledge-gaps", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "get_risk_assessment" => {
+                let project_slug = extract_string(args, "project_slug")?;
+                let mut query = vec![("project_slug".to_string(), project_slug)];
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = http
+                    .get_with_query("/api/code/risk-assessment", &query)
+                    .await?;
+                Ok(Some(result))
+            }
+
             "get_meilisearch_stats" => {
                 let result = http.get("/api/meilisearch/stats").await?;
                 Ok(Some(result))
@@ -2839,6 +2959,20 @@ impl ToolHandler {
             "cleanup_sync_data" => {
                 let result = http
                     .post("/api/admin/cleanup-sync-data", &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "cleanup_builtin_calls" => {
+                let result = http
+                    .post("/api/admin/cleanup-builtin-calls", &json!({}))
+                    .await?;
+                Ok(Some(result))
+            }
+
+            "migrate_calls_confidence" => {
+                let result = http
+                    .post("/api/admin/migrate-calls-confidence", &json!({}))
                     .await?;
                 Ok(Some(result))
             }

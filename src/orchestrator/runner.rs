@@ -30,7 +30,7 @@ use super::context::ContextBuilder;
 /// - Resolves `.` and `..`
 /// - Makes relative paths absolute using current_dir
 /// - Returns the path as a String
-fn normalize_path(path: &str) -> String {
+pub(crate) fn normalize_path(path: &str) -> String {
     let expanded = if let Some(rest) = path.strip_prefix('~') {
         if let Some(home) = dirs::home_dir() {
             home.join(rest.trim_start_matches('/'))
@@ -77,6 +77,24 @@ fn normalize_path(path: &str) -> String {
             Err(_) => expanded,
         }
     }
+}
+
+/// Resolve a relative path (like `./foo` or `../bar`) against a base directory.
+/// Returns a clean path with `.` and `..` resolved, without filesystem access.
+fn resolve_relative_path(base_dir: &str, relative: &str) -> String {
+    let mut segments: Vec<&str> = base_dir.split('/').filter(|s| !s.is_empty()).collect();
+
+    for part in relative.split('/') {
+        match part {
+            "." | "" => {}
+            ".." => {
+                segments.pop();
+            }
+            other => segments.push(other),
+        }
+    }
+
+    segments.join("/")
 }
 
 // ============================================================================
@@ -140,6 +158,9 @@ pub struct Orchestrator {
     /// Embedding provider for code embeddings (File/Function nodes).
     /// Shared with NoteManager and SpreadingActivationEngine.
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
+    /// LRU cache for parsed AST results, avoiding re-parsing unchanged files
+    /// across consecutive syncs.
+    ast_cache: tokio::sync::Mutex<crate::parser::ast_cache::AstCache>,
 }
 
 /// Create an embedding provider from resolved [`Config`] fields.
@@ -320,6 +341,7 @@ impl Orchestrator {
             event_bus: None,
             event_emitter: None,
             embedding_provider: embedding_provider.clone(),
+            ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
         })
     }
 
@@ -408,6 +430,7 @@ impl Orchestrator {
             event_bus: Some(event_bus),
             event_emitter: Some(emitter),
             embedding_provider: embedding_provider.clone(),
+            ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
         })
     }
 
@@ -498,6 +521,7 @@ impl Orchestrator {
             event_bus: None,
             event_emitter: Some(emitter),
             embedding_provider: embedding_provider.clone(),
+            ast_cache: tokio::sync::Mutex::new(crate::parser::ast_cache::AstCache::new()),
         })
     }
 
@@ -511,6 +535,16 @@ impl Orchestrator {
         if let Some(emitter) = &self.event_emitter {
             emitter.emit(event);
         }
+    }
+
+    /// Get AST cache statistics (hits, misses, size).
+    pub async fn ast_cache_stats(&self) -> crate::parser::ast_cache::AstCacheStats {
+        self.ast_cache.lock().await.stats()
+    }
+
+    /// Reset AST cache hit/miss counters (useful between test sync runs).
+    pub async fn reset_ast_cache_stats(&self) {
+        self.ast_cache.lock().await.reset_stats();
     }
 
     /// Get the plan manager
@@ -1413,79 +1447,121 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     ) -> Result<SyncResult> {
         let project_slug = project_slug.map(|s| s.to_string());
         let mut result = SyncResult::default();
-        let mut synced_paths: HashSet<String> = HashSet::new();
 
-        // All supported languages - must match SupportedLanguage::from_extension()
-        let extensions = [
-            "rs", // Rust
-            "ts", "tsx", "js", "jsx",  // TypeScript/JavaScript
-            "py",   // Python
-            "go",   // Go
-            "java", // Java
-            "c", "h", // C
-            "cpp", "cc", "cxx", "hpp", "hxx", // C++
-            "rb",  // Ruby
-            "php", // PHP
-            "kt", "kts",   // Kotlin
-            "swift", // Swift
-            "sh", "bash", // Bash
-        ];
+        // ── Phase 1: Scan ──────────────────────────────────────────
+        let entries = scan_files(dir_path);
 
-        for entry in WalkDir::new(dir_path)
-            .follow_links(true)
-            .into_iter()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().is_file())
-        {
-            let path = entry.path();
-            let ext = path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or_default();
+        // Track all scanned paths for stale-file cleanup
+        let synced_paths: HashSet<String> = entries.iter().map(|e| e.path.clone()).collect();
 
-            if !extensions.contains(&ext) {
-                continue;
-            }
+        // ── Phase 2: Read ───────────────────────────────────────────
+        let file_contents = read_files(entries).await;
 
-            // Skip ignored directories (shared constant with watcher.rs)
-            let path_str = path.to_string_lossy();
-            if super::should_ignore_path(&path_str) {
-                continue;
-            }
-
-            // Track the path for cleanup
-            synced_paths.insert(path_str.to_string());
-
-            match self
-                .sync_file_for_project_with_options(
-                    path,
-                    project_id,
-                    project_slug.as_deref(),
-                    force,
-                )
-                .await
-            {
-                Ok(synced) => {
-                    if synced {
-                        result.files_synced += 1;
-                    } else {
+        // ── Hash check: skip unchanged files ───────────────────────
+        let mut to_parse = Vec::with_capacity(file_contents.len());
+        for fc in file_contents {
+            if !force {
+                if let Ok(Some(existing)) = self.state.neo4j.get_file(&fc.path).await {
+                    if existing.hash == fc.hash {
                         result.files_skipped += 1;
+                        continue;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to sync {}: {}", path.display(), e);
-                    result.errors += 1;
+            }
+            to_parse.push(fc);
+        }
+
+        // ── Phase 3: Parse (with AST cache) ─────────────────────────
+        let mut cache_guard = self.ast_cache.lock().await;
+        let parsed_files = parse_files_with_cache(to_parse, Some(&mut *cache_guard)).await;
+        drop(cache_guard); // Release lock before Neo4j calls
+        let parse_count = parsed_files.len();
+
+        // ── Build ImportResolutionContext once for all files ────────
+        // SuffixIndex is built from ALL scanned paths (not just changed ones)
+        // so cross-file import resolution works even for unchanged files.
+        let all_paths: Vec<String> = synced_paths.iter().cloned().collect();
+        let mut import_ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
+
+        // Populate SymbolTable from all parsed files
+        import_ctx.populate_symbols(&parsed_files);
+
+        // Load language-specific config files (lazy, only when needed)
+        import_ctx.load_go_module_path(dir_path.to_str().unwrap_or(""));
+        import_ctx.load_composer_psr4(dir_path.to_str().unwrap_or(""));
+        import_ctx.load_cmake_include_paths(dir_path.to_str().unwrap_or(""));
+
+        import_ctx.log_stats();
+
+        // ── Store: Batch Neo4j (~10 queries total) ─────────────────
+        match self
+            .store_parsed_files_batch(&parsed_files, project_id, &mut import_ctx)
+            .await
+        {
+            Ok(stored) => {
+                result.files_synced = stored;
+            }
+            Err(e) => {
+                tracing::error!("Batch store failed: {}", e);
+                result.errors = parse_count;
+            }
+        }
+
+        // ── Index in MeiliSearch ───────────────────────────────────
+        if let (Some(pid), Some(slug)) = (project_id, project_slug.as_deref()) {
+            for parsed in &parsed_files {
+                let doc = CodeParser::to_code_document(parsed, &pid.to_string(), slug);
+                if let Err(e) = self.state.meili.index_code(&doc).await {
+                    tracing::warn!("Failed to index {} in Meilisearch: {}", parsed.path, e);
                 }
             }
         }
 
-        // Clean up stale files if we have a project_id
+        // ── Verify notes (best-effort) ─────────────────────────────
+        for parsed in &parsed_files {
+            if let Ok(content) = tokio::fs::read_to_string(&parsed.path).await {
+                if let Err(e) = self
+                    .verify_notes_for_file(&parsed.path, parsed, &content)
+                    .await
+                {
+                    tracing::warn!("Failed to verify notes for {}: {}", parsed.path, e);
+                }
+            }
+        }
+
+        tracing::info!(
+            "sync pipeline: scanned {} → read {} → parsed {} → stored {}",
+            synced_paths.len(),
+            synced_paths.len(),
+            parse_count,
+            result.files_synced,
+        );
+
+        // ── Cleanup: remove stale files ────────────────────────────
         if let Some(pid) = project_id {
             let valid_paths: Vec<String> = synced_paths.into_iter().collect();
             match self.neo4j().delete_stale_files(pid, &valid_paths).await {
-                Ok((files_deleted, symbols_deleted)) => {
+                Ok((files_deleted, symbols_deleted, stale_paths)) => {
                     result.files_deleted = files_deleted;
                     result.symbols_deleted = symbols_deleted;
+
+                    // Also clean up stale files from Meilisearch search index
+                    if !stale_paths.is_empty() {
+                        tracing::info!(
+                            "Cleaning {} stale file(s) from Meilisearch for project {}",
+                            stale_paths.len(),
+                            pid
+                        );
+                        for path in &stale_paths {
+                            if let Err(e) = self.meili().delete_code(path).await {
+                                tracing::warn!(
+                                    "Failed to delete stale file {} from Meilisearch: {}",
+                                    path,
+                                    e
+                                );
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to clean up stale files: {}", e);
@@ -1842,6 +1918,20 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         parsed: &ParsedFile,
         project_id: Option<Uuid>,
     ) -> Result<()> {
+        self.store_parsed_file_for_project_with_ctx(parsed, project_id, None)
+            .await
+    }
+
+    /// Store a parsed file in Neo4j with optional ImportResolutionContext.
+    ///
+    /// When ctx is provided, uses SuffixIndex for O(1) import resolution
+    /// instead of filesystem lookups.
+    async fn store_parsed_file_for_project_with_ctx(
+        &self,
+        parsed: &ParsedFile,
+        project_id: Option<Uuid>,
+        mut ctx: Option<&mut crate::resolver::ImportResolutionContext>,
+    ) -> Result<()> {
         // Store file node (path already normalized in sync_file_for_project)
         let file_node = FileNode {
             path: normalize_path(&parsed.path),
@@ -1869,6 +1959,30 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .batch_upsert_impls(&parsed.impl_blocks)
             .await?;
 
+        // ── Plans 5 & 6: Heritage & Process relations ───────────────────
+        // When Plans 5 (Heritage) and 6 (Process Detection) are implemented,
+        // add the following sequence HERE for each new relationship type:
+        //
+        // 1. DELETE stale relations for this file:
+        //    "MATCH (f:File {path: $path})-[:CONTAINS]->(sym)-[r:EXTENDS]->()
+        //     DELETE r"
+        //    (same for IMPLEMENTS, STEP_IN_PROCESS)
+        //
+        // 2. UPSERT new relations via batch helper:
+        //    use crate::neo4j::batch::{run_unwind_in_chunks, BoltMap};
+        //    let items: Vec<BoltMap> = build_extends_items(&parsed.heritage);
+        //    run_unwind_in_chunks(&graph, items, "UNWIND $items AS ...").await?;
+        //
+        // This DELETE-then-CREATE pattern ensures no stale rels persist when
+        // a file's inheritance hierarchy changes on re-sync.
+        //
+        // NOTE: The current CALLS/IMPORTS/IMPLEMENTS_FOR use MERGE (idempotent)
+        // which does NOT clean up removed relations. This is acceptable for now
+        // because cleanup_sync_data handles full-project cleanup, and the watcher
+        // handles file deletion. Per-file incremental cleanup is a future
+        // improvement tracked in the batch audit note.
+        // ─────────────────────────────────────────────────────────────────
+
         // Batch upsert imports, then resolve relationships (logic stays in runner)
         self.state
             .neo4j
@@ -1880,8 +1994,15 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let mut symbol_rels: Vec<(String, String, Option<Uuid>)> = Vec::new();
         for import in &parsed.imports {
             // Resolve imports to file paths (language-aware)
-            let resolved_files =
-                self.resolve_imports_for_language(import, &parsed.path, &parsed.language);
+            let resolved_files = match ctx {
+                Some(ref mut c) => self.resolve_imports_for_language_with_ctx(
+                    import,
+                    &parsed.path,
+                    &parsed.language,
+                    Some(&mut *c),
+                ),
+                None => self.resolve_imports_for_language(import, &parsed.path, &parsed.language),
+            };
             for target_file in &resolved_files {
                 import_rels.push((
                     parsed.path.clone(),
@@ -1906,11 +2027,58 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .batch_create_imports_symbol_relationships(&symbol_rels)
             .await?;
 
+        // Score confidence for each function call before persisting
+        let scored_calls = Self::score_function_calls(
+            &parsed.function_calls,
+            parsed,
+            &import_rels,
+            ctx.as_deref(),
+        );
+
         // Batch create CALLS relationships (scoped to project to prevent cross-project pollution)
         self.state
             .neo4j
-            .batch_create_call_relationships(&parsed.function_calls, project_id)
+            .batch_create_call_relationships(&scored_calls, project_id)
             .await?;
+
+        // ── Heritage relationships (EXTENDS / IMPLEMENTS) ───────────────
+        let project_id_str = project_id.map(|id| id.to_string()).unwrap_or_default();
+
+        let mut extends_rels: Vec<(String, String, String, String)> = Vec::new();
+        let mut implements_rels: Vec<(String, String, String, String)> = Vec::new();
+
+        for s in &parsed.structs {
+            let file_path = normalize_path(&s.file_path);
+            if let Some(ref parent) = s.parent_class {
+                extends_rels.push((
+                    s.name.clone(),
+                    file_path.clone(),
+                    parent.clone(),
+                    project_id_str.clone(),
+                ));
+            }
+            for iface in &s.interfaces {
+                implements_rels.push((
+                    s.name.clone(),
+                    file_path.clone(),
+                    iface.clone(),
+                    project_id_str.clone(),
+                ));
+            }
+        }
+
+        if !extends_rels.is_empty() {
+            self.state
+                .neo4j
+                .batch_create_extends_relationships(&extends_rels)
+                .await?;
+        }
+        if !implements_rels.is_empty() {
+            self.state
+                .neo4j
+                .batch_create_implements_relationships(&implements_rels)
+                .await?;
+        }
 
         // Embed file and functions (best-effort, non-blocking)
         if self.embedding_provider.is_some() {
@@ -1928,6 +2096,214 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
 
         Ok(())
+    }
+
+    /// Store multiple parsed files in Neo4j using batch operations.
+    ///
+    /// Instead of calling `store_parsed_file_for_project_with_ctx` per file
+    /// (which issues ~10 Neo4j queries each), this method accumulates all
+    /// entities across files and issues ~10 batch queries total:
+    ///
+    /// 1. batch_upsert_files
+    /// 2. batch_upsert_functions
+    /// 3. batch_upsert_structs
+    /// 4. batch_upsert_traits
+    /// 5. batch_upsert_enums
+    /// 6. batch_upsert_impls
+    /// 7. batch_upsert_imports
+    /// 8. batch_create_import_relationships (per-file resolution, batched write)
+    /// 9. batch_create_imports_symbol_relationships
+    /// 10. batch_create_call_relationships (per-file scoring, batched write)
+    ///
+    /// This reduces Neo4j round-trips from O(files × 10) to O(10).
+    async fn store_parsed_files_batch(
+        &self,
+        parsed_files: &[ParsedFile],
+        project_id: Option<Uuid>,
+        ctx: &mut crate::resolver::ImportResolutionContext,
+    ) -> Result<usize> {
+        if parsed_files.is_empty() {
+            return Ok(0);
+        }
+
+        let store_start = std::time::Instant::now();
+
+        // ── 1. Accumulate file nodes ──────────────────────────────────
+        let file_nodes: Vec<FileNode> = parsed_files
+            .iter()
+            .map(|p| FileNode {
+                path: normalize_path(&p.path),
+                language: p.language.clone(),
+                hash: p.hash.clone(),
+                last_parsed: chrono::Utc::now(),
+                project_id,
+            })
+            .collect();
+        self.state.neo4j.batch_upsert_files(&file_nodes).await?;
+
+        // ── 2. Accumulate all symbols ─────────────────────────────────
+        let all_functions: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.functions.iter().cloned())
+            .collect();
+        let all_structs: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.structs.iter().cloned())
+            .collect();
+        let all_traits: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.traits.iter().cloned())
+            .collect();
+        let all_enums: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.enums.iter().cloned())
+            .collect();
+        let all_impls: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.impl_blocks.iter().cloned())
+            .collect();
+        let all_imports: Vec<_> = parsed_files
+            .iter()
+            .flat_map(|p| p.imports.iter().cloned())
+            .collect();
+
+        self.state
+            .neo4j
+            .batch_upsert_functions(&all_functions)
+            .await?;
+        self.state.neo4j.batch_upsert_structs(&all_structs).await?;
+        self.state.neo4j.batch_upsert_traits(&all_traits).await?;
+        self.state.neo4j.batch_upsert_enums(&all_enums).await?;
+        self.state.neo4j.batch_upsert_impls(&all_impls).await?;
+        self.state.neo4j.batch_upsert_imports(&all_imports).await?;
+
+        // ── 3. Resolve imports per-file, accumulate relationships ─────
+        let mut all_import_rels: Vec<(String, String, String)> = Vec::new();
+        let mut all_symbol_rels: Vec<(String, String, Option<Uuid>)> = Vec::new();
+        let mut all_scored_calls: Vec<crate::parser::FunctionCall> = Vec::new();
+        let mut all_extends_rels: Vec<(String, String, String, String)> = Vec::new();
+        let mut all_implements_rels: Vec<(String, String, String, String)> = Vec::new();
+        let project_id_str = project_id.map(|id| id.to_string()).unwrap_or_default();
+
+        for parsed in parsed_files {
+            // Import resolution (per-file — needs source file path)
+            let mut file_import_rels: Vec<(String, String, String)> = Vec::new();
+            for import in &parsed.imports {
+                let resolved_files = self.resolve_imports_for_language_with_ctx(
+                    import,
+                    &parsed.path,
+                    &parsed.language,
+                    Some(ctx),
+                );
+                for target_file in &resolved_files {
+                    file_import_rels.push((
+                        parsed.path.clone(),
+                        target_file.clone(),
+                        import.path.clone(),
+                    ));
+                }
+
+                // IMPORTS_SYMBOL relationships
+                let import_id = format!("{}:{}:{}", import.file_path, import.line, import.path);
+                let symbols = Self::extract_imported_symbols(import);
+                for symbol_name in &symbols {
+                    all_symbol_rels.push((import_id.clone(), symbol_name.clone(), project_id));
+                }
+            }
+
+            // Score function calls (per-file — needs same-file context)
+            let scored_calls = Self::score_function_calls(
+                &parsed.function_calls,
+                parsed,
+                &file_import_rels,
+                Some(ctx),
+            );
+            all_scored_calls.extend(scored_calls);
+            all_import_rels.extend(file_import_rels);
+
+            // Heritage (EXTENDS / IMPLEMENTS)
+            for s in &parsed.structs {
+                let file_path = normalize_path(&s.file_path);
+                if let Some(ref parent) = s.parent_class {
+                    all_extends_rels.push((
+                        s.name.clone(),
+                        file_path.clone(),
+                        parent.clone(),
+                        project_id_str.clone(),
+                    ));
+                }
+                for iface in &s.interfaces {
+                    all_implements_rels.push((
+                        s.name.clone(),
+                        file_path.clone(),
+                        iface.clone(),
+                        project_id_str.clone(),
+                    ));
+                }
+            }
+        }
+
+        // ── 4. Batch write all relationships ──────────────────────────
+        self.state
+            .neo4j
+            .batch_create_import_relationships(&all_import_rels)
+            .await?;
+        self.state
+            .neo4j
+            .batch_create_imports_symbol_relationships(&all_symbol_rels)
+            .await?;
+        self.state
+            .neo4j
+            .batch_create_call_relationships(&all_scored_calls, project_id)
+            .await?;
+
+        // Heritage relationships (EXTENDS / IMPLEMENTS)
+        if !all_extends_rels.is_empty() {
+            self.state
+                .neo4j
+                .batch_create_extends_relationships(&all_extends_rels)
+                .await?;
+        }
+        if !all_implements_rels.is_empty() {
+            self.state
+                .neo4j
+                .batch_create_implements_relationships(&all_implements_rels)
+                .await?;
+        }
+
+        // ── 5. Embeddings (best-effort, non-blocking) ─────────────────
+        if self.embedding_provider.is_some() {
+            for parsed in parsed_files {
+                let provider = self.embedding_provider.clone().unwrap();
+                let neo4j = self.state.neo4j.clone();
+                let parsed_clone = parsed.clone();
+                let file_path = normalize_path(&parsed.path);
+                tokio::spawn(async move {
+                    if let Err(e) =
+                        Self::embed_parsed_file(&provider, &neo4j, &parsed_clone, &file_path).await
+                    {
+                        tracing::warn!(
+                            file = %file_path,
+                            error = %e,
+                            "Failed to embed file (best-effort)"
+                        );
+                    }
+                });
+            }
+        }
+
+        let elapsed = store_start.elapsed();
+        tracing::info!(
+            "store_parsed_files_batch: stored {} files ({} functions, {} imports, {} calls) \
+             in ~10 Neo4j queries, {:?}",
+            parsed_files.len(),
+            all_functions.len(),
+            all_imports.len(),
+            all_scored_calls.len(),
+            elapsed,
+        );
+
+        Ok(parsed_files.len())
     }
 
     /// Build a summary text for embedding a file.
@@ -2461,25 +2837,1162 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         None
     }
 
-    /// Resolve import paths to file paths based on language
+    /// Resolve import paths to file paths based on language.
+    ///
+    /// When a resolution context is provided, uses SuffixIndex for O(1) lookups
+    /// and caches results. Falls back to filesystem-based resolution otherwise.
     fn resolve_imports_for_language(
         &self,
         import: &ImportNode,
         parsed_path: &str,
         language: &str,
     ) -> Vec<String> {
-        match language {
-            "rust" => self.resolve_rust_imports(&import.path, parsed_path),
-            "typescript" | "javascript" | "tsx" | "jsx" => self
-                .resolve_typescript_import(&import.path, parsed_path)
-                .into_iter()
-                .collect(),
-            "python" => self
-                .resolve_python_import(&import.path, parsed_path)
-                .into_iter()
-                .collect(),
-            _ => Vec::new(),
+        self.resolve_imports_for_language_with_ctx(import, parsed_path, language, None)
+    }
+
+    /// Resolve import paths using optional ImportResolutionContext.
+    fn resolve_imports_for_language_with_ctx(
+        &self,
+        import: &ImportNode,
+        parsed_path: &str,
+        language: &str,
+        ctx: Option<&mut crate::resolver::ImportResolutionContext>,
+    ) -> Vec<String> {
+        match ctx {
+            Some(ctx) => {
+                // Check cache first
+                if let Some(cached) = ctx.resolve_cache.get(parsed_path, &import.path) {
+                    return cached.clone();
+                }
+
+                let result = match language {
+                    "rust" => Self::resolve_rust_imports_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    ),
+                    "typescript" | "javascript" | "tsx" | "jsx" => {
+                        Self::resolve_typescript_import_indexed(
+                            &import.path,
+                            parsed_path,
+                            &ctx.suffix_index,
+                        )
+                        .into_iter()
+                        .collect()
+                    }
+                    "python" => Self::resolve_python_import_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    )
+                    .into_iter()
+                    .collect(),
+                    "go" => Self::resolve_go_import_indexed(
+                        &import.path,
+                        ctx.go_module_path.as_deref(),
+                        &ctx.suffix_index,
+                    ),
+                    "java" => Self::resolve_java_import_indexed(&import.path, &ctx.suffix_index),
+                    "php" => Self::resolve_php_import_indexed(
+                        &import.path,
+                        &ctx.psr4_mappings,
+                        &ctx.suffix_index,
+                    ),
+                    "c" | "cpp" => Self::resolve_c_include_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.c_include_paths,
+                        &ctx.suffix_index,
+                    ),
+                    "csharp" => {
+                        Self::resolve_csharp_import_indexed(&import.path, &ctx.suffix_index)
+                    }
+                    "ruby" => Self::resolve_ruby_import_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    ),
+                    "scala" => {
+                        // Expand selective imports: if items are populated (e.g. {A, B}),
+                        // resolve each as "base_path.item" individually.
+                        if !import.items.is_empty() {
+                            import
+                                .items
+                                .iter()
+                                .flat_map(|item| {
+                                    let full_path = format!("{}.{}", import.path, item);
+                                    Self::resolve_scala_import_indexed(
+                                        &full_path,
+                                        &ctx.suffix_index,
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            Self::resolve_scala_import_indexed(&import.path, &ctx.suffix_index)
+                        }
+                    }
+                    "kotlin" => {
+                        Self::resolve_kotlin_import_indexed(&import.path, &ctx.suffix_index)
+                    }
+                    "zig" => Self::resolve_zig_import_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    ),
+                    "swift" => Self::resolve_swift_import_indexed(&import.path, &ctx.suffix_index),
+                    "bash" => Self::resolve_bash_import_indexed(
+                        &import.path,
+                        parsed_path,
+                        &ctx.suffix_index,
+                    ),
+                    _ => Vec::new(),
+                };
+
+                // Cache the full result Vec (empty Vec = negative cache)
+                ctx.resolve_cache.insert(
+                    parsed_path.to_string(),
+                    import.path.clone(),
+                    result.clone(),
+                );
+
+                result
+            }
+            None => {
+                // Legacy fallback: filesystem-based resolution
+                match language {
+                    "rust" => self.resolve_rust_imports(&import.path, parsed_path),
+                    "typescript" | "javascript" | "tsx" | "jsx" => self
+                        .resolve_typescript_import(&import.path, parsed_path)
+                        .into_iter()
+                        .collect(),
+                    "python" => self
+                        .resolve_python_import(&import.path, parsed_path)
+                        .into_iter()
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            }
         }
+    }
+
+    // ========================================================================
+    // SuffixIndex-based resolvers (O(1) lookups, no filesystem access)
+    // ========================================================================
+
+    /// Resolve Rust imports using SuffixIndex (no filesystem access).
+    fn resolve_rust_imports_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let paths = Self::flatten_grouped_import(import_path);
+        let mut resolved = Vec::new();
+
+        for path in paths {
+            if let Some(file) = Self::resolve_single_rust_import_indexed(&path, source_file, index)
+            {
+                if !resolved.contains(&file) {
+                    resolved.push(file);
+                }
+            }
+        }
+
+        resolved
+    }
+
+    /// Resolve a single Rust import using SuffixIndex.
+    fn resolve_single_rust_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Option<String> {
+        let path: Vec<&str> = import_path.split("::").collect();
+        if path.is_empty() {
+            return None;
+        }
+
+        let first = path[0];
+
+        // External crates — skip
+        if !matches!(first, "crate" | "super" | "self") {
+            return None;
+        }
+
+        match first {
+            "crate" => {
+                if path.len() < 2 {
+                    return None;
+                }
+                // Try full path first (import might target a file directly)
+                // e.g., crate::neo4j::client → neo4j/client.rs
+                let full_path = path[1..].join("/");
+                let rs_suffix = format!("{}.rs", full_path);
+                if let Some(resolved) = index.get(&rs_suffix) {
+                    return Some(resolved.to_string());
+                }
+                let mod_suffix = format!("{}/mod.rs", full_path);
+                if let Some(resolved) = index.get(&mod_suffix) {
+                    return Some(resolved.to_string());
+                }
+                // Fallback: strip last segment (it's likely a type/function name)
+                // e.g., crate::neo4j::client::Client → neo4j/client.rs
+                let module_path = &path[1..path.len().saturating_sub(1)];
+                if !module_path.is_empty() {
+                    let suffix = module_path.join("/");
+                    let rs_suffix = format!("{}.rs", suffix);
+                    if let Some(resolved) = index.get(&rs_suffix) {
+                        return Some(resolved.to_string());
+                    }
+                    let mod_suffix = format!("{}/mod.rs", suffix);
+                    if let Some(resolved) = index.get(&mod_suffix) {
+                        return Some(resolved.to_string());
+                    }
+                }
+                None
+            }
+            "super" | "self" => {
+                // For super/self, we need the source file's directory context
+                let source_dir = source_file.rsplit_once('/').map(|(dir, _)| dir)?;
+                let mut segments: Vec<&str> = source_dir.split('/').collect();
+
+                let start = if first == "self" { 1 } else { 0 };
+                for &part in &path[start..] {
+                    if part == "super" {
+                        segments.pop()?;
+                    } else {
+                        segments.push(part);
+                    }
+                }
+
+                // Try full path first (import might target a file directly)
+                let suffix = segments.join("/");
+                let rs_suffix = format!("{}.rs", suffix);
+                if let Some(resolved) = index.get(&rs_suffix) {
+                    return Some(resolved.to_string());
+                }
+                let mod_suffix = format!("{}/mod.rs", suffix);
+                if let Some(resolved) = index.get(&mod_suffix) {
+                    return Some(resolved.to_string());
+                }
+
+                // Fallback: strip last segment (likely a type name)
+                if segments.len() > 1 {
+                    let try_without_last: Vec<&str> =
+                        segments[..segments.len().saturating_sub(1)].to_vec();
+                    let suffix = try_without_last.join("/");
+                    let rs_suffix = format!("{}.rs", suffix);
+                    if let Some(resolved) = index.get(&rs_suffix) {
+                        return Some(resolved.to_string());
+                    }
+                    let mod_suffix = format!("{}/mod.rs", suffix);
+                    if let Some(resolved) = index.get(&mod_suffix) {
+                        return Some(resolved.to_string());
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolve TypeScript/JavaScript import using SuffixIndex.
+    fn resolve_typescript_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Option<String> {
+        // Only resolve relative imports and @/ aliases
+        if !import_path.starts_with('.') && !import_path.starts_with('@') {
+            return None; // npm package — skip
+        }
+
+        if import_path.starts_with('.') {
+            // Relative import: resolve against source directory
+            let source_dir = source_file
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("");
+            let target = resolve_relative_path(source_dir, import_path);
+
+            // Try extensions
+            let extensions = ["ts", "tsx", "js", "jsx"];
+            for ext in &extensions {
+                let with_ext = format!("{}.{}", target, ext);
+                if let Some(resolved) = index.get(&with_ext) {
+                    return Some(resolved.to_string());
+                }
+            }
+
+            // Try index files
+            let index_files = ["index.ts", "index.tsx", "index.js", "index.jsx"];
+            for idx in &index_files {
+                let index_path = format!("{}/{}", target, idx);
+                if let Some(resolved) = index.get(&index_path) {
+                    return Some(resolved.to_string());
+                }
+            }
+        } else if let Some(after_alias) = import_path.strip_prefix("@/") {
+            // @/ alias — try src/ prefix
+            let target = format!("src/{}", after_alias);
+
+            let extensions = ["ts", "tsx", "js", "jsx"];
+            for ext in &extensions {
+                let with_ext = format!("{}.{}", target, ext);
+                if let Some(resolved) = index.get(&with_ext) {
+                    return Some(resolved.to_string());
+                }
+            }
+
+            let index_files = ["index.ts", "index.tsx", "index.js", "index.jsx"];
+            for idx in &index_files {
+                let index_path = format!("{}/{}", target, idx);
+                if let Some(resolved) = index.get(&index_path) {
+                    return Some(resolved.to_string());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Resolve Go import using SuffixIndex and go.mod module path.
+    ///
+    /// Go imports are full package paths like `github.com/user/project/pkg/foo`.
+    /// If the import starts with the go.mod module path, we strip it and look up
+    /// the resulting directory in the SuffixIndex to find all `.go` files in that
+    /// package (excluding `_test.go`).
+    fn resolve_go_import_indexed(
+        import_path: &str,
+        go_module_path: Option<&str>,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let module_path = match go_module_path {
+            Some(mp) => mp,
+            None => return Vec::new(), // No go.mod — can't resolve
+        };
+
+        // Check if this is an internal import (starts with our module path)
+        if !import_path.starts_with(module_path) {
+            return Vec::new(); // External package — skip
+        }
+
+        // Strip the module path prefix to get the relative package directory
+        // e.g. "github.com/user/project/pkg/foo" → "pkg/foo"
+        let relative = &import_path[module_path.len()..];
+        let relative = relative.trim_start_matches('/');
+
+        if relative.is_empty() {
+            // Importing the root package — look for .go files at root
+            // This is rare but valid
+            return Vec::new();
+        }
+
+        // Look up all .go files in this directory
+        let go_files = index.get_files_in_dir(relative, "go");
+
+        // Filter out test files (_test.go)
+        go_files
+            .into_iter()
+            .filter(|f| !f.ends_with("_test.go"))
+            .map(|f| f.to_string())
+            .collect()
+    }
+
+    /// Resolve Java import using SuffixIndex.
+    ///
+    /// Handles 3 cases:
+    /// 1. Standard: `import com.example.Foo` → look for `com/example/Foo.java`
+    /// 2. Wildcard: `import com.example.*` → all `.java` files in `com/example/`
+    /// 3. Static: `import static com.example.Foo.BAR` → strip member, resolve to `Foo.java`
+    fn resolve_java_import_indexed(
+        import_path: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+
+        // Strip "static " prefix for static imports
+        let (is_static, path) = if path.starts_with("static ") {
+            (true, path.strip_prefix("static ").unwrap_or(path).trim())
+        } else {
+            (false, path)
+        };
+
+        // Ignore Java stdlib
+        if path.starts_with("java.")
+            || path.starts_with("javax.")
+            || path.starts_with("org.w3c.")
+            || path.starts_with("org.xml.")
+            || path.starts_with("sun.")
+            || path.starts_with("com.sun.")
+        {
+            return Vec::new();
+        }
+
+        // Check for wildcard imports (com.example.*)
+        if let Some(package) = path.strip_suffix(".*") {
+            let dir = package.replace('.', "/");
+            return index
+                .get_files_in_dir(&dir, "java")
+                .into_iter()
+                .map(|f| f.to_string())
+                .collect();
+        }
+
+        // Convert dots to path separators
+        let parts: Vec<&str> = path.split('.').collect();
+
+        if is_static && parts.len() >= 2 {
+            // Static import: strip last segment (member name), resolve the class
+            // import static com.example.Foo.BAR → com/example/Foo.java
+            let class_parts = &parts[..parts.len() - 1];
+            let suffix = format!("{}.java", class_parts.join("/"));
+            if let Some(resolved) = index.get(&suffix) {
+                return vec![resolved.to_string()];
+            }
+            return Vec::new();
+        }
+
+        // Standard import: com.example.Foo → com/example/Foo.java
+        let suffix = format!("{}.java", parts.join("/"));
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve PHP import using PSR-4 mappings from composer.json.
+    ///
+    /// PSR-4 resolution: find the longest matching namespace prefix,
+    /// replace it with the directory prefix, convert `\` to `/`, append `.php`.
+    /// Falls back to direct SuffixIndex lookup if no PSR-4 mapping matches.
+    fn resolve_php_import_indexed(
+        import_path: &str,
+        psr4_mappings: &std::collections::HashMap<String, String>,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        // Strip leading backslash (fully-qualified namespace)
+        let path = path.strip_prefix('\\').unwrap_or(path);
+
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // PSR-4: find longest matching namespace prefix
+        let mut best_prefix = "";
+        let mut best_dir = "";
+        for (ns_prefix, dir) in psr4_mappings {
+            if path.starts_with(ns_prefix.as_str()) && ns_prefix.len() > best_prefix.len() {
+                best_prefix = ns_prefix;
+                best_dir = dir;
+            }
+        }
+
+        if !best_prefix.is_empty() {
+            // Strip namespace prefix, convert \ to /, prepend directory, append .php
+            let relative = &path[best_prefix.len()..];
+            let file_path = format!("{}{}.php", best_dir, relative.replace('\\', "/"));
+            if let Some(resolved) = index.get(&file_path) {
+                return vec![resolved.to_string()];
+            }
+            // PSR-4 matched but file not found — don't fallback (the mapping is authoritative)
+            return Vec::new();
+        }
+
+        // No PSR-4 mapping matched — fallback: convert namespace to path directly
+        let suffix = format!("{}.php", path.replace('\\', "/"));
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve C/C++ `#include` using relative path, include paths, and SuffixIndex.
+    ///
+    /// Resolution order:
+    /// 1. Relative to source file directory
+    /// 2. Each configured include path (from CMakeLists.txt)
+    /// 3. Direct SuffixIndex lookup (filename-based)
+    ///
+    /// System headers (not found in project) naturally return empty.
+    fn resolve_c_include_indexed(
+        include_path: &str,
+        source_file: &str,
+        include_paths: &[String],
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = include_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // 1. Try relative to source file directory
+        let source_dir = source_file
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or("");
+        if !source_dir.is_empty() {
+            let relative = format!("{}/{}", source_dir, path);
+            if let Some(resolved) = index.get(&relative) {
+                return vec![resolved.to_string()];
+            }
+        }
+
+        // 2. Try each include path
+        for inc_dir in include_paths {
+            let candidate = format!("{}/{}", inc_dir.trim_end_matches('/'), path);
+            if let Some(resolved) = index.get(&candidate) {
+                return vec![resolved.to_string()];
+            }
+        }
+
+        // 3. Direct suffix lookup (handles flat includes like "utils.h")
+        if let Some(resolved) = index.get(path) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve C# using directive to project files.
+    ///
+    /// Handles three patterns:
+    /// - `using Namespace.Sub;` → search Namespace/Sub/ directory for .cs files
+    /// - `using static Namespace.Class;` → resolve Class.cs
+    /// - `using Alias = Namespace.Type;` → resolve the aliased type
+    ///
+    /// System namespaces (System.*, Microsoft.*) are ignored.
+    fn resolve_csharp_import_indexed(
+        import_path: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore system namespaces
+        if path.starts_with("System")
+            || path.starts_with("Microsoft")
+            || path.starts_with("global::")
+        {
+            return Vec::new();
+        }
+
+        // Handle "static Namespace.Class" or "static Namespace.Class.Member"
+        if path.starts_with("static ") {
+            let static_path = path.strip_prefix("static ").unwrap_or(path).trim();
+            let parts: Vec<&str> = static_path.split('.').collect();
+            if parts.len() >= 2 {
+                // Strip last segment (member name), resolve class file
+                let class_parts = &parts[..parts.len() - 1];
+                let suffix = format!("{}.cs", class_parts.join("/"));
+                if let Some(resolved) = index.get(&suffix) {
+                    return vec![resolved.to_string()];
+                }
+                // Try: last part is the class itself
+                let suffix = format!("{}.cs", parts.join("/"));
+                if let Some(resolved) = index.get(&suffix) {
+                    return vec![resolved.to_string()];
+                }
+            }
+            return Vec::new();
+        }
+
+        // Handle "Alias = Namespace.Type"
+        if let Some(eq_pos) = path.find('=') {
+            let type_path = path[eq_pos + 1..].trim();
+            if type_path.starts_with("System") || type_path.starts_with("Microsoft") {
+                return Vec::new();
+            }
+            let suffix = format!("{}.cs", type_path.replace('.', "/"));
+            if let Some(resolved) = index.get(&suffix) {
+                return vec![resolved.to_string()];
+            }
+            return Vec::new();
+        }
+
+        // Standard using: namespace→directory, try as class file first, then directory
+        let parts: Vec<&str> = path.split('.').collect();
+
+        // Try as direct class file: Namespace.Sub.Class → Namespace/Sub/Class.cs
+        let suffix = format!("{}.cs", parts.join("/"));
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        // Try as directory (namespace import): get all .cs files in dir
+        let dir = parts.join("/");
+        let dir_files = index.get_files_in_dir(&dir, "cs");
+        if !dir_files.is_empty() {
+            return dir_files.into_iter().map(|f| f.to_string()).collect();
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Ruby require/require_relative using SuffixIndex.
+    ///
+    /// - Paths starting with `.` or `..` → resolve relative to source file + `.rb`
+    /// - Other paths → append `.rb` and lookup via SuffixIndex
+    /// - System gems (not found in index) naturally return empty
+    fn resolve_ruby_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ensure .rb extension
+        let with_ext = if path.ends_with(".rb") {
+            path.to_string()
+        } else {
+            format!("{}.rb", path)
+        };
+
+        // Relative require (require_relative or path starting with ./)
+        if path.starts_with('.') {
+            let source_dir = source_file
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("");
+
+            // Normalize: strip leading ./ and resolve ../
+            let rel_path = with_ext.strip_prefix("./").unwrap_or(&with_ext);
+
+            let candidate = if source_dir.is_empty() {
+                rel_path.to_string()
+            } else {
+                resolve_relative_path(source_dir, rel_path)
+            };
+
+            if let Some(resolved) = index.get(&candidate) {
+                return vec![resolved.to_string()];
+            }
+            return Vec::new();
+        }
+
+        // Absolute require: try suffix index directly
+        if let Some(resolved) = index.get(&with_ext) {
+            return vec![resolved.to_string()];
+        }
+
+        // Try with lib/ prefix (common Ruby project layout)
+        let lib_path = format!("lib/{}", with_ext);
+        if let Some(resolved) = index.get(&lib_path) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Scala import to project files.
+    ///
+    /// Handles four patterns:
+    /// - `import com.example.Foo` → com/example/Foo.scala
+    /// - `import com.example._` → all .scala files in com/example/
+    /// - `import com.example.{Foo, Bar}` → resolve each selectively
+    /// - `import com.example.{Foo => MyFoo}` → resolve Foo (ignore rename)
+    ///
+    /// Scala stdlib (scala.*, java.*) is ignored.
+    fn resolve_scala_import_indexed(
+        import_path: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore Scala/Java stdlib
+        if path.starts_with("scala.") || path.starts_with("java.") || path.starts_with("javax.") {
+            return Vec::new();
+        }
+
+        // Check for selective import: com.example.{Foo, Bar}
+        if let Some(brace_start) = path.find('{') {
+            let package = &path[..brace_start].trim_end_matches('.');
+            let selectors = &path[brace_start + 1..].trim_end_matches('}');
+
+            let mut results = Vec::new();
+            for selector in selectors.split(',') {
+                let selector = selector.trim();
+                // Handle rename: Foo => MyFoo — use original name
+                let name = selector.split("=>").next().unwrap_or(selector).trim();
+
+                if name == "_" {
+                    // Wildcard within selective import
+                    let dir = package.replace('.', "/");
+                    let files = index.get_files_in_dir(&dir, "scala");
+                    for f in files {
+                        let s = f.to_string();
+                        if !results.contains(&s) {
+                            results.push(s);
+                        }
+                    }
+                } else {
+                    let suffix = format!("{}/{}.scala", package.replace('.', "/"), name);
+                    if let Some(resolved) = index.get(&suffix) {
+                        let s = resolved.to_string();
+                        if !results.contains(&s) {
+                            results.push(s);
+                        }
+                    }
+                }
+            }
+            return results;
+        }
+
+        // Check for wildcard: com.example._
+        if let Some(package) = path.strip_suffix("._") {
+            let dir = package.replace('.', "/");
+            return index
+                .get_files_in_dir(&dir, "scala")
+                .into_iter()
+                .map(|f| f.to_string())
+                .collect();
+        }
+
+        // Standard import: com.example.Foo → com/example/Foo.scala
+        let suffix = format!("{}.scala", path.replace('.', "/"));
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Kotlin import to project files.
+    ///
+    /// Same convention as Java (package → directory) with .kt extension:
+    /// - `import com.example.Foo` → com/example/Foo.kt
+    /// - `import com.example.*` → all .kt files in com/example/
+    ///
+    /// Kotlin stdlib (kotlin.*, kotlinx.*, java.*) is ignored.
+    fn resolve_kotlin_import_indexed(
+        import_path: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore Kotlin/Java stdlib
+        if path.starts_with("kotlin.")
+            || path.starts_with("kotlinx.")
+            || path.starts_with("java.")
+            || path.starts_with("javax.")
+            || path.starts_with("android.")
+        {
+            return Vec::new();
+        }
+
+        // Wildcard import: com.example.*
+        if let Some(package) = path.strip_suffix(".*") {
+            let dir = package.replace('.', "/");
+            return index
+                .get_files_in_dir(&dir, "kt")
+                .into_iter()
+                .map(|f| f.to_string())
+                .collect();
+        }
+
+        // Standard import: com.example.Foo → com/example/Foo.kt
+        let parts: Vec<&str> = path.split('.').collect();
+        let suffix = format!("{}.kt", parts.join("/"));
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        // Try .kts (Gradle script)
+        let suffix_kts = format!("{}.kts", parts.join("/"));
+        if let Some(resolved) = index.get(&suffix_kts) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Zig @import using SuffixIndex.
+    ///
+    /// Zig imports are simple: `@import("file.zig")` imports a file relative
+    /// to the source, or `@import("std")` / `@cImport(...)` for stdlib/C interop.
+    fn resolve_zig_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim().trim_matches('"');
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore standard library and C interop
+        if path == "std" || path == "builtin" || path.starts_with("@cImport") {
+            return Vec::new();
+        }
+
+        // Relative path: resolve from source file directory
+        if path.ends_with(".zig") {
+            let source_dir = source_file
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("");
+            let candidate = if source_dir.is_empty() {
+                path.to_string()
+            } else {
+                resolve_relative_path(source_dir, path)
+            };
+
+            // Try direct relative resolution via suffix index
+            if let Some(resolved) = index.get(&candidate) {
+                return vec![resolved.to_string()];
+            }
+
+            // Fallback: try suffix-only lookup (basename)
+            if let Some(resolved) = index.get(path) {
+                return vec![resolved.to_string()];
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Swift import using SuffixIndex.
+    ///
+    /// Swift `import Module` imports an entire module. System frameworks
+    /// (Foundation, UIKit, SwiftUI, etc.) are ignored. For local modules,
+    /// we look for `.swift` files in a `Sources/<Module>/` directory
+    /// (Swift Package Manager convention).
+    fn resolve_swift_import_indexed(
+        import_path: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Handle `import class/struct/func Module.Type` → extract module name
+        let module = if path.starts_with("class ")
+            || path.starts_with("struct ")
+            || path.starts_with("enum ")
+            || path.starts_with("func ")
+            || path.starts_with("var ")
+            || path.starts_with("typealias ")
+            || path.starts_with("protocol ")
+        {
+            // e.g. "class Foundation.NSObject" → "Foundation"
+            let rest = path.split_whitespace().nth(1).unwrap_or("");
+            rest.split('.').next().unwrap_or("")
+        } else {
+            // e.g. "Foundation" or "MyModule.SubModule"
+            path.split('.').next().unwrap_or(path)
+        };
+
+        if module.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore Apple/system frameworks
+        const SYSTEM_FRAMEWORKS: &[&str] = &[
+            "Foundation",
+            "UIKit",
+            "SwiftUI",
+            "AppKit",
+            "Combine",
+            "CoreData",
+            "CoreGraphics",
+            "CoreLocation",
+            "CoreImage",
+            "CoreML",
+            "MapKit",
+            "Metal",
+            "MetalKit",
+            "SceneKit",
+            "SpriteKit",
+            "AVFoundation",
+            "ARKit",
+            "RealityKit",
+            "GameplayKit",
+            "StoreKit",
+            "CloudKit",
+            "HealthKit",
+            "HomeKit",
+            "WatchKit",
+            "WidgetKit",
+            "ActivityKit",
+            "Accelerate",
+            "Darwin",
+            "Dispatch",
+            "ObjectiveC",
+            "os",
+            "Swift",
+            "XCTest",
+            "PlaygroundSupport",
+            "CryptoKit",
+            "Network",
+            "NaturalLanguage",
+            "Vision",
+            "CoreMotion",
+            "CoreBluetooth",
+            "MultipeerConnectivity",
+            "Security",
+            "LocalAuthentication",
+            "WebKit",
+            "SafariServices",
+            "MessageUI",
+            "Contacts",
+            "EventKit",
+            "Photos",
+            "PhotosUI",
+            "UniformTypeIdentifiers",
+            "Intents",
+            "IntentsUI",
+            "UserNotifications",
+            "NotificationCenter",
+            "SystemConfiguration",
+            "IOKit",
+            "OSLog",
+        ];
+
+        if SYSTEM_FRAMEWORKS.contains(&module) {
+            return Vec::new();
+        }
+
+        // SPM convention: Sources/<Module>/*.swift
+        let dir = format!("Sources/{}", module);
+        let files = index.get_files_in_dir(&dir, "swift");
+        if !files.is_empty() {
+            return files.into_iter().map(|f| f.to_string()).collect();
+        }
+
+        // Fallback: try to find <Module>.swift directly
+        let suffix = format!("{}.swift", module);
+        if let Some(resolved) = index.get(&suffix) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Bash source/. import using SuffixIndex.
+    ///
+    /// `source ./script.sh` → relative to source file.
+    /// `. /path/to/lib.sh` → resolve relative to source file.
+    /// Paths containing shell variables ($HOME, ${DIR}, etc.) are ignored.
+    fn resolve_bash_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Vec<String> {
+        let path = import_path.trim().trim_matches('"').trim_matches('\'');
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        // Ignore paths with shell variables
+        if path.contains('$') {
+            return Vec::new();
+        }
+
+        let source_dir = source_file
+            .rsplit_once('/')
+            .map(|(dir, _)| dir)
+            .unwrap_or("");
+
+        // Strip leading ./ if present
+        let clean_path = path.strip_prefix("./").unwrap_or(path);
+
+        // Build relative candidate
+        let candidate = if source_dir.is_empty() {
+            clean_path.to_string()
+        } else {
+            resolve_relative_path(source_dir, clean_path)
+        };
+
+        // Try relative resolution
+        if let Some(resolved) = index.get(&candidate) {
+            return vec![resolved.to_string()];
+        }
+
+        // Fallback: suffix-only lookup (basename)
+        if let Some(resolved) = index.get(clean_path) {
+            return vec![resolved.to_string()];
+        }
+
+        Vec::new()
+    }
+
+    /// Resolve Python import using SuffixIndex.
+    fn resolve_python_import_indexed(
+        import_path: &str,
+        source_file: &str,
+        index: &crate::resolver::SuffixIndex,
+    ) -> Option<String> {
+        if import_path.starts_with('.') {
+            // Relative import
+            let source_dir = source_file
+                .rsplit_once('/')
+                .map(|(dir, _)| dir)
+                .unwrap_or("");
+            let dots = import_path.chars().take_while(|c| *c == '.').count();
+            let module_part = &import_path[dots..];
+
+            // Navigate up for each extra dot
+            let mut segments: Vec<&str> = source_dir.split('/').collect();
+            for _ in 1..dots {
+                if segments.is_empty() {
+                    break;
+                }
+                segments.pop();
+            }
+
+            if !module_part.is_empty() {
+                for part in module_part.split('.') {
+                    segments.push(part);
+                }
+            }
+
+            let suffix = segments.join("/");
+
+            // Try module.py
+            let py_suffix = format!("{}.py", suffix);
+            if let Some(resolved) = index.get(&py_suffix) {
+                return Some(resolved.to_string());
+            }
+            // Try module/__init__.py
+            let init_suffix = format!("{}/__init__.py", suffix);
+            if let Some(resolved) = index.get(&init_suffix) {
+                return Some(resolved.to_string());
+            }
+        } else {
+            // Absolute import — convert dots to path
+            let suffix = import_path.replace('.', "/");
+
+            let py_suffix = format!("{}.py", suffix);
+            if let Some(resolved) = index.get(&py_suffix) {
+                return Some(resolved.to_string());
+            }
+            let init_suffix = format!("{}/__init__.py", suffix);
+            if let Some(resolved) = index.get(&init_suffix) {
+                return Some(resolved.to_string());
+            }
+        }
+
+        None
+    }
+
+    // ========================================================================
+    // Confidence scoring for CALLS relationships
+    // ========================================================================
+
+    /// Score each function call with a confidence level based on how the callee was resolved.
+    ///
+    /// Scoring levels:
+    /// - **import-resolved** (0.90): callee is defined in a file that the caller's file imports
+    /// - **same-file** (0.85): callee is defined in the same file as the caller
+    /// - **fuzzy-unique** (0.50): callee name found exactly once in the SymbolTable
+    /// - **fuzzy-ambiguous** (0.30): callee name found in multiple files
+    /// - **unscored** (0.50): no SymbolTable available (legacy fallback)
+    fn score_function_calls(
+        calls: &[crate::parser::FunctionCall],
+        parsed: &ParsedFile,
+        import_rels: &[(String, String, String)], // (source_file, target_file, import_path)
+        ctx: Option<&crate::resolver::ImportResolutionContext>,
+    ) -> Vec<crate::parser::FunctionCall> {
+        // Build set of function names defined in this file
+        let same_file_names: std::collections::HashSet<&str> =
+            parsed.functions.iter().map(|f| f.name.as_str()).collect();
+
+        // Build set of imported file paths from this file
+        let imported_files: std::collections::HashSet<&str> = import_rels
+            .iter()
+            .filter(|(src, _, _)| *src == parsed.path)
+            .map(|(_, target, _)| target.as_str())
+            .collect();
+
+        calls
+            .iter()
+            .map(|call| {
+                let (confidence, reason) = Self::score_single_call(
+                    &call.callee_name,
+                    &call.caller_id,
+                    &same_file_names,
+                    &imported_files,
+                    ctx,
+                );
+
+                crate::parser::FunctionCall {
+                    caller_id: call.caller_id.clone(),
+                    callee_name: call.callee_name.clone(),
+                    line: call.line,
+                    confidence,
+                    reason,
+                }
+            })
+            .collect()
+    }
+
+    /// Score a single function call.
+    fn score_single_call(
+        callee_name: &str,
+        caller_id: &str,
+        same_file_names: &std::collections::HashSet<&str>,
+        imported_files: &std::collections::HashSet<&str>,
+        ctx: Option<&crate::resolver::ImportResolutionContext>,
+    ) -> (f64, String) {
+        // Priority 1: same-file match (callee defined in same file as caller)
+        if same_file_names.contains(callee_name) {
+            return (0.85, "same-file".to_string());
+        }
+
+        // Use SymbolTable from context for deeper resolution
+        if let Some(ctx) = ctx {
+            let defs = ctx.symbol_table.lookup_fuzzy(callee_name);
+
+            if defs.is_empty() {
+                // Not found in any parsed file — could be external
+                return (0.30, "fuzzy-unresolved".to_string());
+            }
+
+            // Check if any definition is in an imported file
+            let caller_file = caller_id.rsplitn(3, ':').last().unwrap_or(caller_id);
+            for def in defs {
+                // Normalize: imported_files may have full paths, def.file_path may be relative
+                let def_path = def.file_path.as_str();
+                if imported_files.contains(def_path)
+                    || imported_files
+                        .iter()
+                        .any(|f| f.ends_with(def_path) || def_path.ends_with(f))
+                {
+                    return (0.90, "import-resolved".to_string());
+                }
+                // Also check if the def is in the same file (by file_path comparison)
+                if def_path == caller_file
+                    || caller_file.ends_with(def_path)
+                    || def_path.ends_with(caller_file)
+                {
+                    return (0.85, "same-file".to_string());
+                }
+            }
+
+            // Fuzzy: callee found but not in imported or same file
+            if defs.len() == 1 {
+                return (0.50, "fuzzy-unique".to_string());
+            } else {
+                return (0.30, "fuzzy-ambiguous".to_string());
+            }
+        }
+
+        // No context available — keep the default
+        (0.50, "unscored".to_string())
     }
 
     // ========================================================================
@@ -3488,6 +5001,396 @@ pub struct GitFileChange {
     pub deletions: Option<i64>,
 }
 
+// ── Pipeline functions ──────────────────────────────────────────────
+// 3-phase sync pipeline: scan → read → parse
+
+/// Initialize the rayon global thread pool for parallel parsing.
+///
+/// Limits threads to `min(8, num_cpus - 1)` to leave one core for
+/// the OS/tokio and avoid diminishing returns past 8 parser threads.
+///
+/// This is idempotent — calling it when the pool is already initialized
+/// is a no-op (rayon logs a warning but doesn't panic).
+pub fn init_rayon_pool() {
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let max_threads = num_cpus.saturating_sub(1).clamp(1, 8);
+
+    match rayon::ThreadPoolBuilder::new()
+        .num_threads(max_threads)
+        .thread_name(|idx| format!("po-parse-{}", idx))
+        .build_global()
+    {
+        Ok(()) => {
+            tracing::info!(
+                "rayon pool initialized: {} threads (cpus: {})",
+                max_threads,
+                num_cpus
+            );
+        }
+        Err(_) => {
+            // Already initialized — that's fine
+        }
+    }
+}
+
+/// Phase 1: Scan a directory and return all eligible files.
+///
+/// Walks the directory tree, applies gitignore-like filtering via
+/// [`super::should_ignore_path`], and detects language from extension.
+/// Returns only files whose extension maps to a [`SupportedLanguage`].
+///
+/// This is a pure I/O-free metadata scan — no file content is loaded.
+pub fn scan_files(root: &Path) -> Vec<FileEntry> {
+    use crate::parser::SupportedLanguage;
+
+    let start = std::time::Instant::now();
+    let mut entries = Vec::new();
+
+    for entry in WalkDir::new(root)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_file())
+    {
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or_default();
+
+        // Only keep files whose extension maps to a supported language
+        let language = match SupportedLanguage::from_extension(ext) {
+            Some(lang) => lang,
+            None => continue,
+        };
+
+        // Skip ignored directories (shared constant with watcher.rs)
+        let path_str = path.to_string_lossy();
+        if super::should_ignore_path(&path_str) {
+            continue;
+        }
+
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        let normalized = normalize_path(&path_str);
+
+        entries.push(FileEntry {
+            path: normalized,
+            size,
+            language,
+        });
+    }
+
+    let elapsed = start.elapsed();
+    tracing::info!(
+        "scan_files: found {} eligible files in {:?}",
+        entries.len(),
+        elapsed
+    );
+
+    entries
+}
+
+/// Default byte budget per chunk: 20 MB.
+///
+/// Files are grouped so that each chunk's total size does not exceed this limit.
+/// This controls peak memory usage during parsing: only one chunk's ASTs
+/// are in memory at a time. Inspired by GitGenius `CHUNK_BYTE_BUDGET`.
+pub const CHUNK_BYTE_BUDGET: u64 = 20 * 1024 * 1024;
+
+/// Group files into chunks that fit within a byte budget.
+///
+/// Each chunk's total file size is ≤ `budget`. Files larger than the budget
+/// are placed in their own single-file chunk.
+///
+/// Files are consumed in order — no sorting is performed.
+pub fn chunk_by_size(files: Vec<FileContent>, budget: u64) -> Vec<Vec<FileContent>> {
+    if files.is_empty() {
+        return vec![];
+    }
+
+    let mut chunks: Vec<Vec<FileContent>> = Vec::new();
+    let mut current_chunk: Vec<FileContent> = Vec::new();
+    let mut current_size: u64 = 0;
+
+    for file in files {
+        let file_size = file.size.max(file.content.len() as u64);
+
+        // Oversized file → always gets its own chunk
+        if file_size > budget {
+            // Flush current chunk first
+            if !current_chunk.is_empty() {
+                chunks.push(std::mem::take(&mut current_chunk));
+                current_size = 0;
+            }
+            chunks.push(vec![file]);
+            continue;
+        }
+
+        // Would exceed budget → start a new chunk
+        if current_size + file_size > budget && !current_chunk.is_empty() {
+            chunks.push(std::mem::take(&mut current_chunk));
+            current_size = 0;
+        }
+
+        current_size += file_size;
+        current_chunk.push(file);
+    }
+
+    // Don't forget the last chunk
+    if !current_chunk.is_empty() {
+        chunks.push(current_chunk);
+    }
+
+    chunks
+}
+
+/// Phase 3: Parse files with tree-sitter, using chunked + parallel processing.
+///
+/// Files are grouped into chunks of [`CHUNK_BYTE_BUDGET`] bytes to limit
+/// peak memory usage. Within each chunk, files are parsed in parallel using
+/// rayon's thread pool. Each rayon thread gets its own `CodeParser` via
+/// `thread_local!` (tree-sitter `Parser` is not `Send`).
+///
+/// An optional [`AstCache`] is consulted before parsing: cache hits skip
+/// the tree-sitter step entirely. Cache misses are parsed via rayon and
+/// then inserted into the cache.
+///
+/// The `_parser` parameter is kept for API compatibility but is NOT used —
+/// parallel parsing creates thread-local parsers instead.
+///
+/// Returns only successfully parsed files.
+pub async fn parse_files(
+    files: Vec<FileContent>,
+    _parser: &Arc<RwLock<CodeParser>>,
+) -> Vec<ParsedFile> {
+    parse_files_with_cache(files, None).await
+}
+
+/// Parse files with optional AST cache.
+///
+/// See [`parse_files`] for details. When `cache` is provided, files whose
+/// `(path, hash)` pair is in the cache are returned immediately without
+/// re-parsing.
+pub async fn parse_files_with_cache(
+    files: Vec<FileContent>,
+    mut cache: Option<&mut crate::parser::ast_cache::AstCache>,
+) -> Vec<ParsedFile> {
+    let start = std::time::Instant::now();
+    let total_files = files.len();
+    let total_bytes: u64 = files
+        .iter()
+        .map(|f| f.size.max(f.content.len() as u64))
+        .sum();
+
+    // ── Cache lookup (single-threaded, before rayon) ───────────
+    let mut cached_results: Vec<ParsedFile> = Vec::new();
+    let to_parse: Vec<FileContent> = if let Some(c) = &mut cache {
+        let mut needs_parse = Vec::new();
+        for file in files {
+            if let Some(cached) = c.get(&file.path, &file.hash) {
+                cached_results.push(cached.clone());
+            } else {
+                needs_parse.push(file);
+            }
+        }
+        needs_parse
+    } else {
+        files
+    };
+
+    let cache_hits = cached_results.len();
+
+    // ── Capture original FileContent hashes for cache population ──
+    // We use FileContent.hash (from read_files) as the cache key, not
+    // ParsedFile.hash (recomputed by parse_file). In production they are
+    // identical (both SHA-256 of the same content), but keeping the key
+    // source consistent avoids subtle mismatches.
+    let file_hashes: std::collections::HashMap<String, String> = to_parse
+        .iter()
+        .map(|f| (f.path.clone(), f.hash.clone()))
+        .collect();
+
+    // ── Chunk + parallel parse for cache misses ────────────────
+    let chunks = chunk_by_size(to_parse, CHUNK_BYTE_BUDGET);
+    let num_chunks = chunks.len();
+
+    let (newly_parsed, parse_errors) = if chunks.is_empty() {
+        (Vec::new(), 0)
+    } else {
+        tokio::task::spawn_blocking(move || {
+            use rayon::prelude::*;
+            use std::cell::RefCell;
+
+            thread_local! {
+                static TL_PARSER: RefCell<Option<CodeParser>> = const { RefCell::new(None) };
+            }
+
+            let mut all_parsed = Vec::new();
+            let mut total_errors = 0usize;
+
+            for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+                let chunk_files = chunk.len();
+                let chunk_bytes: u64 = chunk
+                    .iter()
+                    .map(|f| f.size.max(f.content.len() as u64))
+                    .sum();
+
+                let chunk_results: Vec<Option<ParsedFile>> = chunk
+                    .par_iter()
+                    .map(|file| {
+                        TL_PARSER.with(|p| {
+                            let mut p = p.borrow_mut();
+                            if p.is_none() {
+                                *p = CodeParser::new().ok();
+                            }
+                            let parser = p.as_mut()?;
+                            let file_path = std::path::Path::new(&file.path);
+                            match parser.parse_file(file_path, &file.content) {
+                                Ok(pf) => Some(pf),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "parse_files: failed to parse {}: {}",
+                                        file.path,
+                                        e
+                                    );
+                                    None
+                                }
+                            }
+                        })
+                    })
+                    .collect();
+
+                let chunk_errors = chunk_results.iter().filter(|r| r.is_none()).count();
+                total_errors += chunk_errors;
+                all_parsed.extend(chunk_results.into_iter().flatten());
+
+                tracing::info!(
+                    "parse_files: chunk {}/{}: {} files ({} errors), {:.1} MB",
+                    chunk_idx + 1,
+                    num_chunks,
+                    chunk_files,
+                    chunk_errors,
+                    chunk_bytes as f64 / (1024.0 * 1024.0),
+                );
+            }
+
+            (all_parsed, total_errors)
+        })
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("parse_files: spawn_blocking panicked: {}", e);
+            (Vec::new(), total_files)
+        })
+    };
+
+    // ── Populate cache with newly parsed files ─────────────────
+    // Use the original FileContent hash as the cache key so that lookups
+    // (which also use FileContent.hash) will match on subsequent calls.
+    if let Some(c) = cache {
+        for parsed in &newly_parsed {
+            let hash = file_hashes.get(&parsed.path).unwrap_or(&parsed.hash);
+            c.set(&parsed.path, hash, parsed.clone());
+        }
+    }
+
+    // ── Merge cached + newly parsed ────────────────────────────
+    let mut all_parsed = cached_results;
+    all_parsed.extend(newly_parsed);
+
+    let elapsed = start.elapsed();
+    tracing::info!(
+        "parse_files: {} total ({} cached, {} parsed, {} errors, {:.1} MB, {} chunks) in {:?}",
+        all_parsed.len(),
+        cache_hits,
+        all_parsed.len() - cache_hits,
+        parse_errors,
+        total_bytes as f64 / (1024.0 * 1024.0),
+        num_chunks,
+        elapsed
+    );
+
+    all_parsed
+}
+
+/// Phase 2: Read file contents from disk.
+///
+/// Loads each file's content and computes a SHA-256 hash.
+/// Files that fail to read (permission errors, etc.) are logged and skipped.
+///
+/// Returns only successfully read files.
+pub async fn read_files(entries: Vec<FileEntry>) -> Vec<FileContent> {
+    use sha2::{Digest, Sha256};
+
+    let start = std::time::Instant::now();
+    let mut files = Vec::with_capacity(entries.len());
+    let mut read_errors = 0usize;
+
+    for entry in entries {
+        match tokio::fs::read_to_string(&entry.path).await {
+            Ok(content) => {
+                let mut hasher = Sha256::new();
+                hasher.update(content.as_bytes());
+                let hash = hex::encode(hasher.finalize());
+
+                files.push(FileContent {
+                    path: entry.path,
+                    content,
+                    size: entry.size,
+                    language: entry.language,
+                    hash,
+                });
+            }
+            Err(e) => {
+                tracing::warn!("read_files: failed to read {}: {}", entry.path, e);
+                read_errors += 1;
+            }
+        }
+    }
+
+    let elapsed = start.elapsed();
+    tracing::info!(
+        "read_files: loaded {} files ({} errors) in {:?}",
+        files.len(),
+        read_errors,
+        elapsed
+    );
+
+    files
+}
+
+// ── Pipeline types ──────────────────────────────────────────────────
+// Used by the 3-phase sync pipeline: scan → read → parse
+
+/// A file discovered during the scan phase.
+///
+/// Contains only metadata — no content loaded yet.
+#[derive(Debug, Clone)]
+pub struct FileEntry {
+    /// Normalized absolute path
+    pub path: String,
+    /// File size in bytes
+    pub size: u64,
+    /// Detected language from extension
+    pub language: crate::parser::SupportedLanguage,
+}
+
+/// A file whose content has been loaded from disk (read phase).
+#[derive(Debug, Clone)]
+pub struct FileContent {
+    /// Normalized absolute path
+    pub path: String,
+    /// Raw source content
+    pub content: String,
+    /// File size in bytes
+    pub size: u64,
+    /// Detected language
+    pub language: crate::parser::SupportedLanguage,
+    /// SHA-256 hash of content
+    pub hash: String,
+}
+
 /// Result of a sync operation
 #[derive(Debug, Default)]
 pub struct SyncResult {
@@ -3502,6 +5405,7 @@ pub struct SyncResult {
 mod tests {
     use super::*;
     use crate::events::{CrudAction, EntityType as EventEntityType, EventBus, HybridEmitter};
+    use crate::parser::FunctionCall;
     use crate::test_helpers::*;
 
     /// Helper: create an Orchestrator with HybridEmitter, return (orchestrator, receiver)
@@ -4876,6 +6780,8 @@ mod tests {
                 line_start: 40,
                 line_end: 50,
                 docstring: None,
+                parent_class: None,
+                interfaces: vec![],
             }],
             traits: vec![TraitNode {
                 name: "MyTrait".to_string(),
@@ -4917,6 +6823,8 @@ mod tests {
                 caller_id: format!("{}:foo:1", file_path),
                 callee_name: "bar".to_string(),
                 line: 5,
+                confidence: 0.50,
+                reason: "unscored".to_string(),
             }],
             symbols: vec!["foo".to_string(), "bar".to_string()],
         };
@@ -5011,6 +6919,8 @@ mod tests {
                 line_start: 1,
                 line_end: 5,
                 docstring: None,
+                parent_class: None,
+                interfaces: vec![],
             }],
             traits: vec![],
             enums: vec![],
@@ -5220,5 +7130,3185 @@ mod tests {
             "Should backfill some commits"
         );
         assert!(result.elapsed_ms > 0 || result.commits_parsed > 0);
+    }
+
+    // =====================================================================
+    // SuffixIndex-based resolver tests
+    // =====================================================================
+
+    #[test]
+    fn test_resolve_rust_import_indexed_crate() {
+        let paths = vec![
+            "src/neo4j/client.rs".to_string(),
+            "src/neo4j/mod.rs".to_string(),
+            "src/parser/mod.rs".to_string(),
+            "src/parser/helpers.rs".to_string(),
+            "src/lib.rs".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // crate::neo4j::client → src/neo4j/client.rs
+        let result = Orchestrator::resolve_single_rust_import_indexed(
+            "crate::neo4j::client",
+            "src/main.rs",
+            &index,
+        );
+        assert_eq!(result, Some("src/neo4j/client.rs".to_string()));
+
+        // crate::parser::helpers → src/parser/helpers.rs
+        let result = Orchestrator::resolve_single_rust_import_indexed(
+            "crate::parser::helpers",
+            "src/main.rs",
+            &index,
+        );
+        assert_eq!(result, Some("src/parser/helpers.rs".to_string()));
+
+        // crate::parser (module) → src/parser/mod.rs
+        let result = Orchestrator::resolve_single_rust_import_indexed(
+            "crate::parser",
+            "src/main.rs",
+            &index,
+        );
+        assert_eq!(result, Some("src/parser/mod.rs".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_rust_import_indexed_crate_with_type() {
+        let paths = vec![
+            "src/neo4j/client.rs".to_string(),
+            "src/neo4j/models.rs".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // crate::neo4j::models::FunctionNode → src/neo4j/models.rs (strip type name)
+        let result = Orchestrator::resolve_single_rust_import_indexed(
+            "crate::neo4j::models::FunctionNode",
+            "src/main.rs",
+            &index,
+        );
+        assert_eq!(result, Some("src/neo4j/models.rs".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_rust_import_indexed_external_skip() {
+        let paths = vec!["src/main.rs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // External crate — should return None
+        let result = Orchestrator::resolve_single_rust_import_indexed(
+            "serde::Serialize",
+            "src/main.rs",
+            &index,
+        );
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_typescript_import_indexed_relative() {
+        let paths = vec![
+            "src/components/Button.tsx".to_string(),
+            "src/components/index.ts".to_string(),
+            "src/utils/helpers.ts".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // ./Button from src/components/App.tsx
+        let result = Orchestrator::resolve_typescript_import_indexed(
+            "./Button",
+            "src/components/App.tsx",
+            &index,
+        );
+        assert_eq!(result, Some("src/components/Button.tsx".to_string()));
+
+        // ../utils/helpers from src/components/App.tsx
+        let result = Orchestrator::resolve_typescript_import_indexed(
+            "../utils/helpers",
+            "src/components/App.tsx",
+            &index,
+        );
+        assert_eq!(result, Some("src/utils/helpers.ts".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_typescript_import_indexed_alias() {
+        let paths = vec![
+            "src/components/Button.tsx".to_string(),
+            "src/utils/helpers.ts".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // @/components/Button
+        let result = Orchestrator::resolve_typescript_import_indexed(
+            "@/components/Button",
+            "src/pages/Home.tsx",
+            &index,
+        );
+        assert_eq!(result, Some("src/components/Button.tsx".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_typescript_import_indexed_npm_skip() {
+        let paths = vec!["src/main.ts".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // npm package — should return None
+        let result =
+            Orchestrator::resolve_typescript_import_indexed("react", "src/main.ts", &index);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_python_import_indexed_relative() {
+        let paths = vec![
+            "src/models/user.py".to_string(),
+            "src/models/__init__.py".to_string(),
+            "src/utils/helpers.py".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // .models from src/app.py (1 dot = same directory)
+        let result = Orchestrator::resolve_python_import_indexed(".models", "src/app.py", &index);
+        assert_eq!(result, Some("src/models/__init__.py".to_string()));
+
+        // .utils.helpers from src/app.py
+        let result =
+            Orchestrator::resolve_python_import_indexed(".utils.helpers", "src/app.py", &index);
+        assert_eq!(result, Some("src/utils/helpers.py".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_python_import_indexed_absolute() {
+        let paths = vec![
+            "mypackage/models/user.py".to_string(),
+            "mypackage/__init__.py".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // mypackage.models.user
+        let result = Orchestrator::resolve_python_import_indexed(
+            "mypackage.models.user",
+            "mypackage/app.py",
+            &index,
+        );
+        assert_eq!(result, Some("mypackage/models/user.py".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_relative_path_helper() {
+        assert_eq!(
+            super::resolve_relative_path("src/components", "./Button"),
+            "src/components/Button"
+        );
+        assert_eq!(
+            super::resolve_relative_path("src/components", "../utils/helpers"),
+            "src/utils/helpers"
+        );
+        assert_eq!(
+            super::resolve_relative_path("src/a/b/c", "../../x"),
+            "src/a/x"
+        );
+    }
+
+    #[test]
+    fn test_resolve_go_import_indexed_internal_package() {
+        let paths = vec![
+            "pkg/foo/handler.go".to_string(),
+            "pkg/foo/handler_test.go".to_string(),
+            "pkg/foo/types.go".to_string(),
+            "pkg/bar/service.go".to_string(),
+            "cmd/main.go".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Internal import: github.com/user/project/pkg/foo → pkg/foo/*.go (sans _test.go)
+        let result = Orchestrator::resolve_go_import_indexed(
+            "github.com/user/project/pkg/foo",
+            Some("github.com/user/project"),
+            &index,
+        );
+        assert_eq!(result.len(), 2, "should resolve 2 .go files (not _test.go)");
+        assert!(result.contains(&"pkg/foo/handler.go".to_string()));
+        assert!(result.contains(&"pkg/foo/types.go".to_string()));
+        assert!(
+            !result.iter().any(|f| f.contains("_test.go")),
+            "test files should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_resolve_go_import_indexed_external_package() {
+        let paths = vec!["pkg/foo/handler.go".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // External import — should return empty
+        let result = Orchestrator::resolve_go_import_indexed(
+            "github.com/gin-gonic/gin",
+            Some("github.com/user/project"),
+            &index,
+        );
+        assert!(result.is_empty(), "external imports should be skipped");
+    }
+
+    #[test]
+    fn test_resolve_go_import_indexed_no_module() {
+        let paths = vec!["pkg/foo/handler.go".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // No go.mod module path — should return empty
+        let result = Orchestrator::resolve_go_import_indexed(
+            "github.com/user/project/pkg/foo",
+            None,
+            &index,
+        );
+        assert!(result.is_empty(), "no go.mod → no resolution");
+    }
+
+    #[test]
+    fn test_resolve_go_import_indexed_stdlib() {
+        let paths = vec!["internal/handler.go".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Standard library import — doesn't match our module path
+        let result =
+            Orchestrator::resolve_go_import_indexed("fmt", Some("github.com/user/project"), &index);
+        assert!(result.is_empty(), "stdlib imports should be skipped");
+
+        let result = Orchestrator::resolve_go_import_indexed(
+            "net/http",
+            Some("github.com/user/project"),
+            &index,
+        );
+        assert!(result.is_empty(), "stdlib imports should be skipped");
+    }
+
+    #[test]
+    fn test_resolve_java_import_indexed_standard() {
+        let paths = vec![
+            "com/example/models/User.java".to_string(),
+            "com/example/models/Order.java".to_string(),
+            "com/example/utils/StringHelper.java".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Standard import: com.example.models.User → com/example/models/User.java
+        let result = Orchestrator::resolve_java_import_indexed("com.example.models.User", &index);
+        assert_eq!(result, vec!["com/example/models/User.java"]);
+    }
+
+    #[test]
+    fn test_resolve_java_import_indexed_wildcard() {
+        let paths = vec![
+            "com/example/models/User.java".to_string(),
+            "com/example/models/Order.java".to_string(),
+            "com/example/utils/StringHelper.java".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Wildcard import: com.example.models.* → all .java in com/example/models/
+        let result = Orchestrator::resolve_java_import_indexed("com.example.models.*", &index);
+        assert_eq!(result.len(), 2, "should find 2 .java files in models/");
+        assert!(result.contains(&"com/example/models/User.java".to_string()));
+        assert!(result.contains(&"com/example/models/Order.java".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_java_import_indexed_static() {
+        let paths = vec!["com/example/Utils.java".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Static import: static com.example.Utils.MAX_VALUE → com/example/Utils.java
+        let result =
+            Orchestrator::resolve_java_import_indexed("static com.example.Utils.MAX_VALUE", &index);
+        assert_eq!(result, vec!["com/example/Utils.java"]);
+    }
+
+    #[test]
+    fn test_resolve_java_import_indexed_nonexistent() {
+        let paths = vec!["com/example/Foo.java".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Package that doesn't exist
+        let result = Orchestrator::resolve_java_import_indexed("org.missing.Bar", &index);
+        assert!(result.is_empty());
+    }
+
+    // ── PHP PSR-4 resolver tests ──────────────────────────────────
+
+    #[test]
+    fn test_resolve_php_import_psr4_simple() {
+        let paths = vec!["src/Models/User.php".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let mut psr4 = std::collections::HashMap::new();
+        psr4.insert("App\\".to_string(), "src/".to_string());
+
+        // App\Models\User → src/Models/User.php
+        let result = Orchestrator::resolve_php_import_indexed("App\\Models\\User", &psr4, &index);
+        assert_eq!(result, vec!["src/Models/User.php"]);
+    }
+
+    #[test]
+    fn test_resolve_php_import_psr4_multi_mapping() {
+        let paths = vec![
+            "src/Controllers/HomeController.php".to_string(),
+            "lib/domain/Entity/Product.php".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let mut psr4 = std::collections::HashMap::new();
+        psr4.insert("App\\".to_string(), "src/".to_string());
+        psr4.insert("Domain\\".to_string(), "lib/domain/".to_string());
+
+        let result =
+            Orchestrator::resolve_php_import_indexed("Domain\\Entity\\Product", &psr4, &index);
+        assert_eq!(result, vec!["lib/domain/Entity/Product.php"]);
+
+        let result = Orchestrator::resolve_php_import_indexed(
+            "App\\Controllers\\HomeController",
+            &psr4,
+            &index,
+        );
+        assert_eq!(result, vec!["src/Controllers/HomeController.php"]);
+    }
+
+    #[test]
+    fn test_resolve_php_import_psr4_longest_prefix_wins() {
+        let paths = vec!["src/Sub/Deep/Thing.php".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let mut psr4 = std::collections::HashMap::new();
+        psr4.insert("App\\".to_string(), "src/".to_string());
+        psr4.insert("App\\Sub\\".to_string(), "src/Sub/".to_string());
+
+        // "App\Sub\Deep\Thing" matches both "App\" and "App\Sub\",
+        // longest prefix "App\Sub\" wins → src/Sub/ + Deep/Thing.php
+        let result =
+            Orchestrator::resolve_php_import_indexed("App\\Sub\\Deep\\Thing", &psr4, &index);
+        assert_eq!(result, vec!["src/Sub/Deep/Thing.php"]);
+    }
+
+    #[test]
+    fn test_resolve_php_import_no_composer() {
+        let paths = vec!["Models/User.php".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let psr4 = std::collections::HashMap::new(); // empty = no composer.json
+
+        // Fallback: direct namespace→path conversion
+        let result = Orchestrator::resolve_php_import_indexed("Models\\User", &psr4, &index);
+        assert_eq!(result, vec!["Models/User.php"]);
+    }
+
+    #[test]
+    fn test_resolve_php_import_fully_qualified() {
+        let paths = vec!["src/Models/User.php".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let mut psr4 = std::collections::HashMap::new();
+        psr4.insert("App\\".to_string(), "src/".to_string());
+
+        // Leading backslash (fully qualified) should be stripped
+        let result = Orchestrator::resolve_php_import_indexed("\\App\\Models\\User", &psr4, &index);
+        assert_eq!(result, vec!["src/Models/User.php"]);
+    }
+
+    #[test]
+    fn test_resolve_php_import_nonexistent() {
+        let paths = vec!["src/Models/User.php".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let mut psr4 = std::collections::HashMap::new();
+        psr4.insert("App\\".to_string(), "src/".to_string());
+
+        let result = Orchestrator::resolve_php_import_indexed("App\\Missing\\Class", &psr4, &index);
+        assert!(result.is_empty());
+    }
+
+    // ── C/C++ include resolver tests ──────────────────────────────
+
+    #[test]
+    fn test_resolve_c_include_relative() {
+        let paths = vec![
+            "src/main.c".to_string(),
+            "src/utils.h".to_string(),
+            "include/config.h".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // #include "utils.h" from src/main.c → relative: src/utils.h
+        let result = Orchestrator::resolve_c_include_indexed("utils.h", "src/main.c", &[], &index);
+        assert_eq!(result, vec!["src/utils.h"]);
+    }
+
+    #[test]
+    fn test_resolve_c_include_with_path() {
+        let paths = vec!["src/main.c".to_string(), "src/lib/parser.h".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // #include "lib/parser.h" from src/main.c → src/lib/parser.h
+        let result =
+            Orchestrator::resolve_c_include_indexed("lib/parser.h", "src/main.c", &[], &index);
+        assert_eq!(result, vec!["src/lib/parser.h"]);
+    }
+
+    #[test]
+    fn test_resolve_c_include_via_include_path() {
+        let paths = vec!["src/main.c".to_string(), "include/config.h".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+        let include_paths = vec!["include".to_string()];
+
+        // #include "config.h" from src/main.c — not found relative,
+        // found via include path: include/config.h
+        let result = Orchestrator::resolve_c_include_indexed(
+            "config.h",
+            "src/main.c",
+            &include_paths,
+            &index,
+        );
+        assert_eq!(result, vec!["include/config.h"]);
+    }
+
+    #[test]
+    fn test_resolve_c_include_system_header_ignored() {
+        let paths = vec!["src/main.c".to_string(), "src/utils.h".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // System header like <stdio.h> — not in project index, returns empty
+        let result = Orchestrator::resolve_c_include_indexed("stdio.h", "src/main.c", &[], &index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_c_include_suffix_fallback() {
+        let paths = vec!["vendor/lib/common.h".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Not relative, not in include paths, but found via suffix index
+        let result = Orchestrator::resolve_c_include_indexed(
+            "vendor/lib/common.h",
+            "src/main.c",
+            &[],
+            &index,
+        );
+        assert_eq!(result, vec!["vendor/lib/common.h"]);
+    }
+
+    // ── C# resolver tests ────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_csharp_using_standard() {
+        let paths = vec![
+            "Models/User.cs".to_string(),
+            "Models/Product.cs".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // using Models; → directory lookup
+        let result = Orchestrator::resolve_csharp_import_indexed("Models", &index);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"Models/User.cs".to_string()));
+        assert!(result.contains(&"Models/Product.cs".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_csharp_using_class() {
+        let paths = vec!["Services/Auth/TokenService.cs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // using Services.Auth.TokenService; → direct class file
+        let result =
+            Orchestrator::resolve_csharp_import_indexed("Services.Auth.TokenService", &index);
+        assert_eq!(result, vec!["Services/Auth/TokenService.cs"]);
+    }
+
+    #[test]
+    fn test_resolve_csharp_using_static() {
+        let paths = vec!["Utils/MathHelper.cs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // using static Utils.MathHelper.PI → strip member, resolve class
+        let result =
+            Orchestrator::resolve_csharp_import_indexed("static Utils.MathHelper.PI", &index);
+        assert_eq!(result, vec!["Utils/MathHelper.cs"]);
+    }
+
+    #[test]
+    fn test_resolve_csharp_using_alias() {
+        let paths = vec!["Data/Repositories/UserRepo.cs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // using Repo = Data.Repositories.UserRepo; → resolve aliased type
+        let result = Orchestrator::resolve_csharp_import_indexed(
+            "Repo = Data.Repositories.UserRepo",
+            &index,
+        );
+        assert_eq!(result, vec!["Data/Repositories/UserRepo.cs"]);
+    }
+
+    #[test]
+    fn test_resolve_csharp_system_namespace_ignored() {
+        let paths = vec!["System/Console.cs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result =
+            Orchestrator::resolve_csharp_import_indexed("System.Collections.Generic", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_csharp_import_indexed(
+            "Microsoft.Extensions.DependencyInjection",
+            &index,
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_csharp_nonexistent() {
+        let paths = vec!["Models/User.cs".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_csharp_import_indexed("Missing.Namespace", &index);
+        assert!(result.is_empty());
+    }
+
+    // ── Ruby resolver tests ──────────────────────────────────────
+
+    #[test]
+    fn test_resolve_ruby_require_simple() {
+        let paths = vec!["lib/models/user.rb".to_string(), "lib/utils.rb".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // require 'models/user' → lib/models/user.rb (lib/ prefix fallback)
+        let result =
+            Orchestrator::resolve_ruby_import_indexed("models/user", "app/main.rb", &index);
+        assert_eq!(result, vec!["lib/models/user.rb"]);
+    }
+
+    #[test]
+    fn test_resolve_ruby_require_relative() {
+        let paths = vec![
+            "app/models/user.rb".to_string(),
+            "app/models/helper.rb".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // require_relative './helper' from app/models/user.rb
+        let result =
+            Orchestrator::resolve_ruby_import_indexed("./helper", "app/models/user.rb", &index);
+        assert_eq!(result, vec!["app/models/helper.rb"]);
+    }
+
+    #[test]
+    fn test_resolve_ruby_require_gem_ignored() {
+        let paths = vec!["lib/app.rb".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // System gem — not in project index
+        let result = Orchestrator::resolve_ruby_import_indexed("json", "lib/app.rb", &index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_ruby_require_with_rb_extension() {
+        let paths = vec!["lib/config.rb".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // require 'config.rb' (explicit extension)
+        let result = Orchestrator::resolve_ruby_import_indexed("config.rb", "app/main.rb", &index);
+        assert_eq!(result, vec!["lib/config.rb"]);
+    }
+
+    // ── Scala resolver tests ─────────────────────────────────────
+
+    #[test]
+    fn test_resolve_scala_import_standard() {
+        let paths = vec!["com/example/Foo.scala".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_scala_import_indexed("com.example.Foo", &index);
+        assert_eq!(result, vec!["com/example/Foo.scala"]);
+    }
+
+    #[test]
+    fn test_resolve_scala_import_wildcard() {
+        let paths = vec![
+            "com/example/Foo.scala".to_string(),
+            "com/example/Bar.scala".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_scala_import_indexed("com.example._", &index);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_scala_import_selective() {
+        let paths = vec![
+            "com/example/Foo.scala".to_string(),
+            "com/example/Bar.scala".to_string(),
+            "com/example/Baz.scala".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_scala_import_indexed("com.example.{Foo, Bar}", &index);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"com/example/Foo.scala".to_string()));
+        assert!(result.contains(&"com/example/Bar.scala".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_scala_import_rename() {
+        let paths = vec!["com/example/Foo.scala".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // Rename: Foo => MyFoo — should resolve Foo
+        let result =
+            Orchestrator::resolve_scala_import_indexed("com.example.{Foo => MyFoo}", &index);
+        assert_eq!(result, vec!["com/example/Foo.scala"]);
+    }
+
+    #[test]
+    fn test_resolve_scala_stdlib_ignored() {
+        let paths = vec!["scala/collection/List.scala".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result =
+            Orchestrator::resolve_scala_import_indexed("scala.collection.mutable._", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_scala_import_indexed("java.util.List", &index);
+        assert!(result.is_empty());
+    }
+
+    // ── Kotlin resolver tests ────────────────────────────────────
+
+    #[test]
+    fn test_resolve_kotlin_import_standard() {
+        let paths = vec!["com/example/UserService.kt".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_kotlin_import_indexed("com.example.UserService", &index);
+        assert_eq!(result, vec!["com/example/UserService.kt"]);
+    }
+
+    #[test]
+    fn test_resolve_kotlin_import_wildcard() {
+        let paths = vec![
+            "com/example/Foo.kt".to_string(),
+            "com/example/Bar.kt".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_kotlin_import_indexed("com.example.*", &index);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_resolve_kotlin_stdlib_ignored() {
+        let paths = vec!["kotlin/collections/List.kt".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_kotlin_import_indexed("kotlin.collections.List", &index);
+        assert!(result.is_empty());
+
+        let result =
+            Orchestrator::resolve_kotlin_import_indexed("kotlinx.coroutines.launch", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_kotlin_import_indexed("android.os.Bundle", &index);
+        assert!(result.is_empty());
+    }
+
+    // ── Zig resolver tests ──────────────────────────────────────
+
+    #[test]
+    fn test_resolve_zig_import_local() {
+        let paths = vec!["src/main.zig".to_string(), "src/utils.zig".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_zig_import_indexed("utils.zig", "src/main.zig", &index);
+        assert_eq!(result, vec!["src/utils.zig"]);
+    }
+
+    #[test]
+    fn test_resolve_zig_import_subdirectory() {
+        let paths = vec!["src/main.zig".to_string(), "src/lib/parser.zig".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result =
+            Orchestrator::resolve_zig_import_indexed("lib/parser.zig", "src/main.zig", &index);
+        assert_eq!(result, vec!["src/lib/parser.zig"]);
+    }
+
+    #[test]
+    fn test_resolve_zig_std_ignored() {
+        let paths = vec!["src/main.zig".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_zig_import_indexed("std", "src/main.zig", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_zig_import_indexed("builtin", "src/main.zig", &index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_zig_nonexistent() {
+        let paths = vec!["src/main.zig".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result =
+            Orchestrator::resolve_zig_import_indexed("nonexistent.zig", "src/main.zig", &index);
+        assert!(result.is_empty());
+    }
+
+    // ── Swift resolver tests ────────────────────────────────────
+
+    #[test]
+    fn test_resolve_swift_import_local_module() {
+        let paths = vec![
+            "Sources/MyModule/Foo.swift".to_string(),
+            "Sources/MyModule/Bar.swift".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_swift_import_indexed("MyModule", &index);
+        assert_eq!(result.len(), 2);
+        assert!(result.contains(&"Sources/MyModule/Foo.swift".to_string()));
+        assert!(result.contains(&"Sources/MyModule/Bar.swift".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_swift_import_single_file() {
+        let paths = vec!["lib/Networking.swift".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // No Sources/Networking/ dir, falls back to Networking.swift
+        let result = Orchestrator::resolve_swift_import_indexed("Networking", &index);
+        assert_eq!(result, vec!["lib/Networking.swift"]);
+    }
+
+    #[test]
+    fn test_resolve_swift_system_framework_ignored() {
+        let paths = vec!["Sources/Foundation/fake.swift".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result = Orchestrator::resolve_swift_import_indexed("Foundation", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_swift_import_indexed("UIKit", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_swift_import_indexed("SwiftUI", &index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_swift_import_submodule() {
+        let paths = vec!["Sources/MyLib/Core.swift".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // `import MyLib.Core` → module = "MyLib"
+        let result = Orchestrator::resolve_swift_import_indexed("MyLib.Core", &index);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_resolve_swift_import_kind_prefix() {
+        let paths = vec!["Sources/MyModule/Types.swift".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // `import class MyModule.SomeClass` → module = "MyModule"
+        let result = Orchestrator::resolve_swift_import_indexed("class MyModule.SomeClass", &index);
+        assert_eq!(result.len(), 1);
+    }
+
+    // ── Bash resolver tests ─────────────────────────────────────
+
+    #[test]
+    fn test_resolve_bash_source_relative() {
+        let paths = vec![
+            "scripts/main.sh".to_string(),
+            "scripts/utils.sh".to_string(),
+        ];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result =
+            Orchestrator::resolve_bash_import_indexed("./utils.sh", "scripts/main.sh", &index);
+        assert_eq!(result, vec!["scripts/utils.sh"]);
+    }
+
+    #[test]
+    fn test_resolve_bash_dot_source() {
+        let paths = vec!["bin/run.sh".to_string(), "bin/lib/helpers.sh".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        // `. lib/helpers.sh` from bin/run.sh
+        let result =
+            Orchestrator::resolve_bash_import_indexed("lib/helpers.sh", "bin/run.sh", &index);
+        assert_eq!(result, vec!["bin/lib/helpers.sh"]);
+    }
+
+    #[test]
+    fn test_resolve_bash_variable_ignored() {
+        let paths = vec!["scripts/lib.sh".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result =
+            Orchestrator::resolve_bash_import_indexed("$HOME/scripts/lib.sh", "main.sh", &index);
+        assert!(result.is_empty());
+
+        let result = Orchestrator::resolve_bash_import_indexed("${DIR}/lib.sh", "main.sh", &index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_bash_nonexistent() {
+        let paths = vec!["scripts/main.sh".to_string()];
+        let index = crate::resolver::SuffixIndex::build(&paths);
+
+        let result =
+            Orchestrator::resolve_bash_import_indexed("./missing.sh", "scripts/main.sh", &index);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_import_resolution_context() {
+        let paths = vec![
+            "src/api/handlers.rs".to_string(),
+            "src/neo4j/client.rs".to_string(),
+        ];
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&paths);
+
+        // Cache miss
+        assert!(ctx
+            .resolve_cache
+            .get("src/main.rs", "crate::api::handlers")
+            .is_none());
+
+        // Insert + hit
+        ctx.resolve_cache.insert(
+            "src/main.rs".to_string(),
+            "crate::api::handlers".to_string(),
+            vec!["src/api/handlers.rs".to_string()],
+        );
+        assert!(ctx
+            .resolve_cache
+            .get("src/main.rs", "crate::api::handlers")
+            .is_some());
+
+        // SuffixIndex works
+        assert_eq!(
+            ctx.suffix_index.get("handlers.rs"),
+            Some("src/api/handlers.rs")
+        );
+    }
+
+    // =========================================================================
+    // Confidence scoring tests
+    // =========================================================================
+
+    fn make_test_parsed_file(path: &str, func_names: &[&str]) -> ParsedFile {
+        ParsedFile {
+            path: path.to_string(),
+            language: "rust".to_string(),
+            hash: "test".to_string(),
+            functions: func_names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| FunctionNode {
+                    name: name.to_string(),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: path.to_string(),
+                    line_start: (i as u32 + 1) * 10,
+                    line_end: (i as u32 + 1) * 10 + 5,
+                    docstring: None,
+                })
+                .collect(),
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            imports: vec![],
+            impl_blocks: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        }
+    }
+
+    #[test]
+    fn test_score_same_file() {
+        // foo calls bar, both in the same file → same-file (0.85)
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo", "bar"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "bar".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![];
+
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, None);
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.85);
+        assert_eq!(scored[0].reason, "same-file");
+    }
+
+    #[test]
+    fn test_score_import_resolved_with_symbol_table() {
+        // foo calls helper, helper is in "src/utils.rs" which is imported
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "helper".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![(
+            "src/lib.rs".to_string(),
+            "src/utils.rs".to_string(),
+            "crate::utils".to_string(),
+        )];
+
+        // Build a symbol table with helper in src/utils.rs
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&[
+            "src/lib.rs".to_string(),
+            "src/utils.rs".to_string(),
+        ]);
+        ctx.symbol_table.add(
+            "helper",
+            "src/utils.rs:helper:1",
+            "src/utils.rs",
+            crate::resolver::symbol_table::SymbolType::Function,
+            1,
+        );
+
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, Some(&ctx));
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.90);
+        assert_eq!(scored[0].reason, "import-resolved");
+    }
+
+    #[test]
+    fn test_score_fuzzy_unique() {
+        // foo calls helper, helper exists in exactly 1 file but NOT imported
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "helper".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![]; // No imports
+
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&[
+            "src/lib.rs".to_string(),
+            "src/other.rs".to_string(),
+        ]);
+        ctx.symbol_table.add(
+            "helper",
+            "src/other.rs:helper:1",
+            "src/other.rs",
+            crate::resolver::symbol_table::SymbolType::Function,
+            1,
+        );
+
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, Some(&ctx));
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.50);
+        assert_eq!(scored[0].reason, "fuzzy-unique");
+    }
+
+    #[test]
+    fn test_score_fuzzy_ambiguous() {
+        // foo calls process, process exists in 2 different files, not imported
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "process".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![];
+
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&[
+            "src/lib.rs".to_string(),
+            "src/a.rs".to_string(),
+            "src/b.rs".to_string(),
+        ]);
+        ctx.symbol_table.add(
+            "process",
+            "src/a.rs:process:1",
+            "src/a.rs",
+            crate::resolver::symbol_table::SymbolType::Function,
+            1,
+        );
+        ctx.symbol_table.add(
+            "process",
+            "src/b.rs:process:10",
+            "src/b.rs",
+            crate::resolver::symbol_table::SymbolType::Function,
+            10,
+        );
+
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, Some(&ctx));
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.30);
+        assert_eq!(scored[0].reason, "fuzzy-ambiguous");
+    }
+
+    #[test]
+    fn test_score_unresolved() {
+        // foo calls unknown_fn, not in symbol table at all
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "unknown_fn".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![];
+
+        let ctx = crate::resolver::ImportResolutionContext::new(&["src/lib.rs".to_string()]);
+
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, Some(&ctx));
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.30);
+        assert_eq!(scored[0].reason, "fuzzy-unresolved");
+    }
+
+    #[test]
+    fn test_score_no_context_fallback() {
+        // Without context, calls that are not same-file get default unscored
+        let parsed = make_test_parsed_file("src/lib.rs", &["foo"]);
+        let calls = vec![FunctionCall {
+            caller_id: "src/lib.rs:foo:10".to_string(),
+            callee_name: "external_fn".to_string(),
+            line: 15,
+            confidence: 0.50,
+            reason: "unscored".to_string(),
+        }];
+        let import_rels = vec![];
+
+        let scored = Orchestrator::score_function_calls(&calls, &parsed, &import_rels, None);
+
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].confidence, 0.50);
+        assert_eq!(scored[0].reason, "unscored");
+    }
+
+    // ── Batch utility validation ─────────────────────────────────
+
+    #[tokio::test]
+    async fn test_store_parsed_file_idempotent_resync() {
+        // Validates that re-storing a file with MERGE pattern is idempotent:
+        // storing the same file twice should NOT duplicate entities.
+        //
+        // NOTE: This test documents current behavior. When Plans 5/6 add
+        // EXTENDS/IMPLEMENTS, a separate DELETE-then-CREATE step must be added
+        // (see comment block in store_parsed_file_for_project_with_ctx).
+        use crate::neo4j::models::*;
+        use crate::parser::ParsedFile;
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(mock_store.clone());
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let file_path = "/tmp/test-project/src/resync.rs".to_string();
+
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "rust".to_string(),
+            hash: "hash1".to_string(),
+            functions: vec![FunctionNode {
+                name: "my_func".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: file_path.clone(),
+                line_start: 1,
+                line_end: 10,
+                docstring: None,
+            }],
+            structs: vec![StructNode {
+                name: "MyStruct".to_string(),
+                visibility: Visibility::Public,
+                generics: vec![],
+                file_path: file_path.clone(),
+                line_start: 20,
+                line_end: 30,
+                docstring: None,
+                parent_class: None,
+                interfaces: vec![],
+            }],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec!["my_func".to_string()],
+        };
+
+        // Store once
+        orch.store_parsed_file_for_project(&parsed, None)
+            .await
+            .unwrap();
+        assert_eq!(mock_store.functions.read().await.len(), 1);
+        assert_eq!(mock_store.structs_map.read().await.len(), 1);
+
+        // Store again (re-sync) — MERGE should NOT create duplicates
+        orch.store_parsed_file_for_project(&parsed, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            mock_store.functions.read().await.len(),
+            1,
+            "MERGE should be idempotent — no duplicate functions"
+        );
+        assert_eq!(
+            mock_store.structs_map.read().await.len(),
+            1,
+            "MERGE should be idempotent — no duplicate structs"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_utility_chunking_constants() {
+        // Validate that our batch utility constants match the cleanup_sync_data pattern
+        use crate::neo4j::batch::BATCH_SIZE;
+
+        assert_eq!(BATCH_SIZE, 10_000, "BATCH_SIZE must be 10K per constraint");
+
+        // Verify chunking produces expected splits
+        let large_vec: Vec<u8> = vec![0; 25_001];
+        let chunks: Vec<&[u8]> = large_vec.chunks(BATCH_SIZE).collect();
+        assert_eq!(chunks.len(), 3, "25001 items should produce 3 chunks");
+        assert_eq!(chunks[0].len(), 10_000);
+        assert_eq!(chunks[1].len(), 10_000);
+        assert_eq!(chunks[2].len(), 5_001);
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_pattern_comment_exists() {
+        // Meta-test: verify that the Plans 5/6 cleanup pattern documentation
+        // exists in store_parsed_file_for_project_with_ctx.
+        // This ensures no one accidentally removes the guidance comment.
+        let source = include_str!("runner.rs");
+        assert!(
+            source.contains("Plans 5 & 6: Heritage & Process relations"),
+            "Cleanup pattern comment for Plans 5/6 must exist in runner.rs"
+        );
+        assert!(
+            source.contains("DELETE stale relations for this file"),
+            "DELETE pattern guidance must exist in runner.rs"
+        );
+        assert!(
+            source.contains("run_unwind_in_chunks"),
+            "Batch helper reference must exist in runner.rs"
+        );
+    }
+
+    // ── T4.1: Pipeline phase separation tests ─────────────────────
+
+    #[test]
+    fn test_scan_files_finds_supported_extensions() {
+        // Create a temp directory with various file types
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Supported files
+        std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(root.join("app.ts"), "export {}").unwrap();
+        std::fs::write(root.join("lib.py"), "pass").unwrap();
+        std::fs::write(root.join("main.go"), "package main").unwrap();
+
+        // Unsupported files — should be excluded
+        std::fs::write(root.join("readme.md"), "# Hello").unwrap();
+        std::fs::write(root.join("data.json"), "{}").unwrap();
+        std::fs::write(root.join("style.css"), "body {}").unwrap();
+
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 4, "should find exactly 4 supported files");
+
+        // Verify all entries have a language
+        for entry in &entries {
+            assert!(!entry.path.is_empty());
+            assert!(entry.size > 0);
+        }
+
+        // Verify specific languages are detected
+        let languages: Vec<String> = entries
+            .iter()
+            .map(|e| e.language.as_str().to_string())
+            .collect();
+        assert!(languages.contains(&"rust".to_string()));
+        assert!(languages.contains(&"typescript".to_string()));
+        assert!(languages.contains(&"python".to_string()));
+        assert!(languages.contains(&"go".to_string()));
+    }
+
+    #[test]
+    fn test_scan_files_respects_ignore_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Normal file
+        std::fs::write(root.join("src.rs"), "fn f() {}").unwrap();
+
+        // Files in ignored directories
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(
+            root.join("node_modules/pkg/index.js"),
+            "module.exports = {}",
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join(".git/objects")).unwrap();
+        std::fs::write(root.join(".git/objects/hook.sh"), "#!/bin/bash").unwrap();
+
+        std::fs::create_dir_all(root.join("target/debug")).unwrap();
+        std::fs::write(root.join("target/debug/build.rs"), "fn main() {}").unwrap();
+
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 1, "should only find the root src.rs");
+        assert!(entries[0].path.ends_with("src.rs"));
+    }
+
+    #[test]
+    fn test_scan_files_empty_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = scan_files(tmp.path());
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn test_scan_files_paths_are_normalized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("test.rs"), "fn x() {}").unwrap();
+
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 1);
+        // Normalized paths should be absolute
+        assert!(
+            std::path::Path::new(&entries[0].path).is_absolute(),
+            "scan_files should return absolute paths"
+        );
+    }
+
+    #[test]
+    fn test_scan_files_all_language_extensions() {
+        // Verify that scan_files uses SupportedLanguage::from_extension
+        // which covers more extensions than the old hardcoded list
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Extensions that from_extension supports but old list missed
+        std::fs::write(root.join("lib.mjs"), "export default {}").unwrap();
+        std::fs::write(root.join("types.pyi"), "x: int").unwrap();
+        std::fs::write(root.join("Rakefile.rake"), "task :default").unwrap();
+
+        let entries = scan_files(root);
+        assert_eq!(
+            entries.len(),
+            3,
+            "from_extension should match mjs, pyi, rake"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_files_loads_content_and_hash() {
+        use crate::parser::SupportedLanguage;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let content = "fn hello() {}";
+        std::fs::write(root.join("hello.rs"), content).unwrap();
+
+        let entries = vec![FileEntry {
+            path: root.join("hello.rs").to_string_lossy().to_string(),
+            size: content.len() as u64,
+            language: SupportedLanguage::Rust,
+        }];
+
+        let files = read_files(entries).await;
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].content, content);
+        assert!(!files[0].hash.is_empty());
+        assert_eq!(files[0].size, content.len() as u64);
+
+        // Verify hash is deterministic
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::write(tmp2.path().join("hello.rs"), content).unwrap();
+        let entries2 = vec![FileEntry {
+            path: tmp2.path().join("hello.rs").to_string_lossy().to_string(),
+            size: content.len() as u64,
+            language: SupportedLanguage::Rust,
+        }];
+        let files2 = read_files(entries2).await;
+        assert_eq!(files[0].hash, files2[0].hash, "same content = same hash");
+    }
+
+    #[tokio::test]
+    async fn test_read_files_skips_unreadable() {
+        use crate::parser::SupportedLanguage;
+
+        // File that doesn't exist → should be skipped, not error
+        let entries = vec![FileEntry {
+            path: "/nonexistent/path/ghost.rs".to_string(),
+            size: 0,
+            language: SupportedLanguage::Rust,
+        }];
+
+        let files = read_files(entries).await;
+        assert!(files.is_empty(), "unreadable file should be skipped");
+    }
+
+    #[tokio::test]
+    async fn test_read_files_preserves_language() {
+        use crate::parser::SupportedLanguage;
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("app.py"), "pass").unwrap();
+
+        let entries = vec![FileEntry {
+            path: tmp.path().join("app.py").to_string_lossy().to_string(),
+            size: 4,
+            language: SupportedLanguage::Python,
+        }];
+
+        let files = read_files(entries).await;
+        assert_eq!(files.len(), 1);
+        assert!(matches!(files[0].language, SupportedLanguage::Python));
+    }
+
+    #[test]
+    fn test_file_entry_has_correct_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let content = "fn hello_world() { println!(\"hello\"); }";
+        std::fs::write(root.join("sized.rs"), content).unwrap();
+
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].size, content.len() as u64);
+    }
+
+    #[test]
+    fn test_chunk_by_size_basic() {
+        use crate::parser::SupportedLanguage;
+
+        // 3 files of 5MB each, budget 12MB → 2 chunks: [5+5, 5]
+        let mb5 = 5 * 1024 * 1024;
+        let files: Vec<FileContent> = (0..3)
+            .map(|i| FileContent {
+                path: format!("/tmp/file_{}.rs", i),
+                content: String::new(),
+                size: mb5,
+                language: SupportedLanguage::Rust,
+                hash: format!("h{}", i),
+            })
+            .collect();
+
+        let chunks = chunk_by_size(files, 12 * 1024 * 1024);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 2); // 5+5 = 10 < 12
+        assert_eq!(chunks[1].len(), 1); // 5 alone
+    }
+
+    #[test]
+    fn test_chunk_by_size_oversized_file() {
+        use crate::parser::SupportedLanguage;
+
+        // One file larger than budget → gets its own chunk
+        let budget = 10 * 1024 * 1024; // 10MB
+        let files = vec![
+            FileContent {
+                path: "/tmp/small.rs".to_string(),
+                content: String::new(),
+                size: 1024 * 1024, // 1MB
+                language: SupportedLanguage::Rust,
+                hash: "h1".to_string(),
+            },
+            FileContent {
+                path: "/tmp/huge.rs".to_string(),
+                content: String::new(),
+                size: 25 * 1024 * 1024, // 25MB > budget
+                language: SupportedLanguage::Rust,
+                hash: "h2".to_string(),
+            },
+            FileContent {
+                path: "/tmp/small2.rs".to_string(),
+                content: String::new(),
+                size: 2 * 1024 * 1024, // 2MB
+                language: SupportedLanguage::Rust,
+                hash: "h3".to_string(),
+            },
+        ];
+
+        let chunks = chunk_by_size(files, budget);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].len(), 1); // small.rs flushed before huge
+        assert_eq!(chunks[1].len(), 1); // huge.rs alone
+        assert_eq!(chunks[1][0].path, "/tmp/huge.rs");
+        assert_eq!(chunks[2].len(), 1); // small2.rs
+    }
+
+    #[test]
+    fn test_chunk_by_size_empty() {
+        let chunks = chunk_by_size(vec![], 10 * 1024 * 1024);
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_by_size_all_fit_in_one() {
+        use crate::parser::SupportedLanguage;
+
+        let files: Vec<FileContent> = (0..5)
+            .map(|i| FileContent {
+                path: format!("/tmp/f{}.rs", i),
+                content: String::new(),
+                size: 1000, // tiny
+                language: SupportedLanguage::Rust,
+                hash: format!("h{}", i),
+            })
+            .collect();
+
+        let chunks = chunk_by_size(files, CHUNK_BYTE_BUDGET);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 5);
+    }
+
+    #[test]
+    fn test_chunk_by_size_exact_budget_boundary() {
+        use crate::parser::SupportedLanguage;
+
+        // 4 files of exactly 5MB, budget exactly 10MB
+        // → 2 chunks: [5+5, 5+5]
+        let mb5 = 5 * 1024 * 1024;
+        let budget = 10 * 1024 * 1024;
+        let files: Vec<FileContent> = (0..4)
+            .map(|i| FileContent {
+                path: format!("/tmp/f{}.rs", i),
+                content: String::new(),
+                size: mb5,
+                language: SupportedLanguage::Rust,
+                hash: format!("h{}", i),
+            })
+            .collect();
+
+        let chunks = chunk_by_size(files, budget);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].len(), 2);
+        assert_eq!(chunks[1].len(), 2);
+    }
+
+    #[test]
+    fn test_chunk_by_size_uses_content_len_when_larger() {
+        use crate::parser::SupportedLanguage;
+
+        // If content.len() > size, chunk_by_size should use the max
+        let files = vec![FileContent {
+            path: "/tmp/f.rs".to_string(),
+            content: "x".repeat(2 * 1024 * 1024), // 2MB content
+            size: 100,                            // but size metadata says 100 bytes
+            language: SupportedLanguage::Rust,
+            hash: "h".to_string(),
+        }];
+
+        // Budget = 1MB → file should get its own chunk (content is 2MB)
+        let chunks = chunk_by_size(files, 1024 * 1024);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_extracts_symbols() {
+        use crate::parser::SupportedLanguage;
+
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+        let files = vec![FileContent {
+            path: "/tmp/test_parse.rs".to_string(),
+            content: r#"
+                pub fn greet(name: &str) -> String {
+                    format!("Hello, {}!", name)
+                }
+
+                pub struct User {
+                    pub name: String,
+                }
+            "#
+            .to_string(),
+            size: 100,
+            language: SupportedLanguage::Rust,
+            hash: "abc123".to_string(),
+        }];
+
+        let parsed = parse_files(files, &parser).await;
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].path, "/tmp/test_parse.rs");
+
+        // Should extract function 'greet' and struct 'User'
+        assert!(
+            parsed[0].functions.iter().any(|f| f.name == "greet"),
+            "should find function 'greet'"
+        );
+        assert!(
+            parsed[0].structs.iter().any(|s| s.name == "User"),
+            "should find struct 'User'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_handles_multiple_languages() {
+        use crate::parser::SupportedLanguage;
+
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+        let files = vec![
+            FileContent {
+                path: "/tmp/lib.rs".to_string(),
+                content: "pub fn add(a: i32, b: i32) -> i32 { a + b }".to_string(),
+                size: 44,
+                language: SupportedLanguage::Rust,
+                hash: "h1".to_string(),
+            },
+            FileContent {
+                path: "/tmp/app.py".to_string(),
+                content: "def hello():\n    pass\n".to_string(),
+                size: 21,
+                language: SupportedLanguage::Python,
+                hash: "h2".to_string(),
+            },
+        ];
+
+        let parsed = parse_files(files, &parser).await;
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].functions.iter().any(|f| f.name == "add"));
+        assert!(parsed[1].functions.iter().any(|f| f.name == "hello"));
+    }
+
+    #[test]
+    fn test_chunk_preserves_all_files() {
+        use crate::parser::SupportedLanguage;
+
+        // Ensure total file count across chunks equals input
+        let files: Vec<FileContent> = (0..17)
+            .map(|i| FileContent {
+                path: format!("/tmp/f{}.rs", i),
+                content: format!("fn f{}() {{}}", i),
+                size: 3 * 1024 * 1024, // 3MB each
+                language: SupportedLanguage::Rust,
+                hash: format!("h{}", i),
+            })
+            .collect();
+
+        let chunks = chunk_by_size(files, CHUNK_BYTE_BUDGET);
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        assert_eq!(total, 17, "all files must be present across chunks");
+
+        // Each chunk should be ≤ 20MB
+        for (i, chunk) in chunks.iter().enumerate() {
+            let chunk_size: u64 = chunk.iter().map(|f| f.size).sum();
+            assert!(
+                chunk_size <= CHUNK_BYTE_BUDGET || chunk.len() == 1,
+                "chunk {} exceeds budget: {} bytes (files: {})",
+                i,
+                chunk_size,
+                chunk.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_with_chunking_produces_same_results() {
+        use crate::parser::SupportedLanguage;
+
+        // Verify that chunked parsing produces the same results
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+
+        let files: Vec<FileContent> = vec![
+            FileContent {
+                path: "/tmp/a.rs".to_string(),
+                content: "pub fn alpha() {} pub fn beta() {}".to_string(),
+                size: 34,
+                language: SupportedLanguage::Rust,
+                hash: "h1".to_string(),
+            },
+            FileContent {
+                path: "/tmp/b.py".to_string(),
+                content: "def gamma():\n    pass\n".to_string(),
+                size: 21,
+                language: SupportedLanguage::Python,
+                hash: "h2".to_string(),
+            },
+        ];
+
+        let parsed = parse_files(files, &parser).await;
+        assert_eq!(parsed.len(), 2);
+
+        // All functions should be present regardless of chunking
+        let all_fns: Vec<&str> = parsed
+            .iter()
+            .flat_map(|p| p.functions.iter().map(|f| f.name.as_str()))
+            .collect();
+        assert!(all_fns.contains(&"alpha"));
+        assert!(all_fns.contains(&"beta"));
+        assert!(all_fns.contains(&"gamma"));
+    }
+
+    #[test]
+    fn test_import_resolution_context_cross_file() {
+        // Verify ImportResolutionContext works across all files
+        let all_paths = vec![
+            "src/main.rs".to_string(),
+            "src/api/handlers.rs".to_string(),
+            "src/neo4j/client.rs".to_string(),
+        ];
+
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
+
+        // SuffixIndex should find all files
+        assert_eq!(
+            ctx.suffix_index.get("handlers.rs"),
+            Some("src/api/handlers.rs")
+        );
+        assert_eq!(
+            ctx.suffix_index.get("client.rs"),
+            Some("src/neo4j/client.rs")
+        );
+
+        // SymbolTable starts empty, populated incrementally
+        assert_eq!(ctx.symbol_table.stats().total_definitions, 0);
+
+        // Simulate populating from parsed files
+        use crate::resolver::symbol_table::SymbolType;
+        ctx.symbol_table.add(
+            "handle_request",
+            "src/api/handlers.rs::handle_request",
+            "src/api/handlers.rs",
+            SymbolType::Function,
+            1,
+        );
+        ctx.symbol_table.add(
+            "query",
+            "src/neo4j/client.rs::query",
+            "src/neo4j/client.rs",
+            SymbolType::Function,
+            1,
+        );
+
+        // Now lookups work
+        let defs = ctx.symbol_table.lookup_fuzzy("handle_request");
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].file_path, "src/api/handlers.rs");
+    }
+
+    #[tokio::test]
+    async fn test_store_parsed_files_batch_accumulates() {
+        // Verify that batch store accumulates all entities across files
+        let (orch, _rx) = orch_with_bus().await;
+        let mock = orch.neo4j();
+
+        let parsed_files = vec![
+            ParsedFile {
+                path: "/tmp/batch_a.rs".to_string(),
+                language: "rust".to_string(),
+                hash: "ha".to_string(),
+                functions: vec![FunctionNode {
+                    name: "fn_a".to_string(),
+                    file_path: "/tmp/batch_a.rs".to_string(),
+                    line_start: 1,
+                    line_end: 3,
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    docstring: None,
+                }],
+                structs: vec![],
+                traits: vec![],
+                enums: vec![],
+                imports: vec![],
+                impl_blocks: vec![],
+                function_calls: vec![],
+                symbols: vec![],
+            },
+            ParsedFile {
+                path: "/tmp/batch_b.rs".to_string(),
+                language: "rust".to_string(),
+                hash: "hb".to_string(),
+                functions: vec![FunctionNode {
+                    name: "fn_b".to_string(),
+                    file_path: "/tmp/batch_b.rs".to_string(),
+                    line_start: 1,
+                    line_end: 3,
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    docstring: None,
+                }],
+                structs: vec![],
+                traits: vec![],
+                enums: vec![],
+                imports: vec![],
+                impl_blocks: vec![],
+                function_calls: vec![],
+                symbols: vec![],
+            },
+        ];
+
+        let all_paths = vec!["/tmp/batch_a.rs".to_string(), "/tmp/batch_b.rs".to_string()];
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
+        ctx.populate_symbols(&parsed_files);
+
+        let stored = orch
+            .store_parsed_files_batch(&parsed_files, None, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(stored, 2);
+
+        // Both files should exist
+        let file_a: Option<FileNode> = mock.get_file("/tmp/batch_a.rs").await.unwrap();
+        let file_b: Option<FileNode> = mock.get_file("/tmp/batch_b.rs").await.unwrap();
+        assert!(file_a.is_some(), "file_a should be stored");
+        assert!(file_b.is_some(), "file_b should be stored");
+
+        // Both functions should exist (check via get_file_symbol_names)
+        let symbols_a = mock.get_file_symbol_names("/tmp/batch_a.rs").await.unwrap();
+        assert!(
+            symbols_a.functions.contains(&"fn_a".to_string()),
+            "fn_a should be stored, got: {:?}",
+            symbols_a.functions
+        );
+        let symbols_b = mock.get_file_symbol_names("/tmp/batch_b.rs").await.unwrap();
+        assert!(
+            symbols_b.functions.contains(&"fn_b".to_string()),
+            "fn_b should be stored, got: {:?}",
+            symbols_b.functions
+        );
+    }
+
+    #[tokio::test]
+    async fn test_store_parsed_files_batch_empty() {
+        let (orch, _rx) = orch_with_bus().await;
+        let all_paths: Vec<String> = vec![];
+        let mut ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
+
+        let stored = orch
+            .store_parsed_files_batch(&[], None, &mut ctx)
+            .await
+            .unwrap();
+        assert_eq!(stored, 0);
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_with_cache_hit() {
+        use crate::parser::ast_cache::AstCache;
+        use crate::parser::SupportedLanguage;
+
+        let mut cache = AstCache::new();
+
+        let files = vec![FileContent {
+            path: "/tmp/cached.rs".to_string(),
+            content: "pub fn cached_fn() {}".to_string(),
+            size: 21,
+            language: SupportedLanguage::Rust,
+            hash: "hash_v1".to_string(),
+        }];
+
+        // First parse — cache miss
+        let parsed1 = parse_files_with_cache(files.clone(), Some(&mut cache)).await;
+        assert_eq!(parsed1.len(), 1);
+        let stats1 = cache.stats();
+        assert_eq!(stats1.misses, 1);
+        assert_eq!(stats1.hits, 0);
+        assert_eq!(stats1.size, 1);
+
+        // Second parse with same content — cache hit
+        let parsed2 = parse_files_with_cache(files, Some(&mut cache)).await;
+        assert_eq!(parsed2.len(), 1);
+        let stats2 = cache.stats();
+        assert_eq!(stats2.hits, 1);
+        assert_eq!(stats2.misses, 1);
+
+        // Results should be identical
+        assert_eq!(parsed1[0].path, parsed2[0].path);
+        assert_eq!(parsed1[0].functions.len(), parsed2[0].functions.len());
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_with_cache_miss_on_changed_content() {
+        use crate::parser::ast_cache::AstCache;
+        use crate::parser::SupportedLanguage;
+
+        let mut cache = AstCache::new();
+
+        // First version
+        let files_v1 = vec![FileContent {
+            path: "/tmp/changing.rs".to_string(),
+            content: "pub fn version_one() {}".to_string(),
+            size: 23,
+            language: SupportedLanguage::Rust,
+            hash: "hash_v1".to_string(),
+        }];
+        let p1 = parse_files_with_cache(files_v1, Some(&mut cache)).await;
+        assert_eq!(p1.len(), 1);
+
+        // Second version — different hash → cache miss
+        let files_v2 = vec![FileContent {
+            path: "/tmp/changing.rs".to_string(),
+            content: "pub fn version_two() {}".to_string(),
+            size: 23,
+            language: SupportedLanguage::Rust,
+            hash: "hash_v2".to_string(),
+        }];
+        let p2 = parse_files_with_cache(files_v2, Some(&mut cache)).await;
+        assert_eq!(p2.len(), 1);
+
+        let stats = cache.stats();
+        assert_eq!(stats.misses, 2); // both were misses (different hashes)
+        assert_eq!(stats.hits, 0);
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_without_cache_still_works() {
+        use crate::parser::SupportedLanguage;
+
+        let files = vec![FileContent {
+            path: "/tmp/no_cache.rs".to_string(),
+            content: "pub fn no_cache() {}".to_string(),
+            size: 20,
+            language: SupportedLanguage::Rust,
+            hash: "h".to_string(),
+        }];
+
+        // None cache — should still parse
+        let parsed = parse_files_with_cache(files, None).await;
+        assert_eq!(parsed.len(), 1);
+    }
+
+    /// Test that consecutive syncs with the AST cache only re-parse changed files.
+    ///
+    /// 1. Create 10 .rs files in a temp dir
+    /// 2. First sync (force=true) → all 10 are cache misses (parsed fresh)
+    /// 3. Modify 3 of the 10 files
+    /// 4. Second sync (force=true) → 7 cache hits + 3 misses
+    #[tokio::test]
+    async fn test_sync_ast_cache_skips_unchanged_files() {
+        use crate::test_helpers::mock_app_state_with_stores;
+        use std::fs;
+
+        // ── Setup: temp dir with 10 .rs files ──────────────────────
+        let tmp = tempfile::tempdir().unwrap();
+        let src_dir = tmp.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+
+        for i in 0..10 {
+            let file_path = src_dir.join(format!("file_{}.rs", i));
+            fs::write(&file_path, format!("pub fn func_{}() {{}}", i)).unwrap();
+        }
+
+        let (state, _neo4j, _meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        // ── First sync: all 10 files are cache misses ──────────────
+        let result1 = orch
+            .sync_directory_for_project_with_options(tmp.path(), None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result1.files_synced, 10,
+            "First sync should parse all 10 files"
+        );
+
+        let stats1 = orch.ast_cache_stats().await;
+        assert_eq!(stats1.misses, 10, "All 10 files should be cache misses");
+        assert_eq!(stats1.hits, 0, "No cache hits on first sync");
+        assert_eq!(stats1.size, 10, "Cache should hold all 10 entries");
+
+        // ── Modify 3 files ─────────────────────────────────────────
+        for i in 0..3 {
+            let file_path = src_dir.join(format!("file_{}.rs", i));
+            fs::write(
+                &file_path,
+                format!("pub fn func_{}_v2() {{ /* updated */ }}", i),
+            )
+            .unwrap();
+        }
+
+        // Reset counters to isolate second sync stats
+        orch.reset_ast_cache_stats().await;
+
+        // ── Second sync: 7 cache hits + 3 misses ──────────────────
+        let result2 = orch
+            .sync_directory_for_project_with_options(tmp.path(), None, None, true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result2.files_synced, 10,
+            "All 10 files should be stored (force=true)"
+        );
+
+        let stats2 = orch.ast_cache_stats().await;
+        assert_eq!(stats2.hits, 7, "7 unchanged files should be cache hits");
+        assert_eq!(stats2.misses, 3, "3 modified files should be cache misses");
+        // Cache has 13 entries: 10 original + 3 new (old entries have different hashes
+        // and will be evicted naturally via LRU when capacity is reached)
+        assert_eq!(
+            stats2.size, 13,
+            "Cache should hold 10 + 3 entries (old + new hashes)"
+        );
+    }
+
+    #[test]
+    fn test_rayon_pool_init_idempotent() {
+        // Calling init_rayon_pool multiple times should not panic
+        init_rayon_pool();
+        init_rayon_pool(); // second call is a no-op
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_parallel_correctness() {
+        use crate::parser::SupportedLanguage;
+
+        // Parse 20 files in parallel and verify all are parsed correctly
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+        let files: Vec<FileContent> = (0..20)
+            .map(|i| FileContent {
+                path: format!("/tmp/par_test_{}.rs", i),
+                content: format!("pub fn func_{}() -> i32 {{ {} }}", i, i),
+                size: 40,
+                language: SupportedLanguage::Rust,
+                hash: format!("h{}", i),
+            })
+            .collect();
+
+        let parsed = parse_files(files, &parser).await;
+        assert_eq!(parsed.len(), 20, "all 20 files should be parsed");
+
+        // Verify each file has exactly one function with the correct name
+        for i in 0..20 {
+            let expected_name = format!("func_{}", i);
+            let found = parsed.iter().any(|p| {
+                p.path == format!("/tmp/par_test_{}.rs", i)
+                    && p.functions.iter().any(|f| f.name == expected_name)
+            });
+            assert!(found, "should find func_{} in parsed results", i);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_parallel_multi_language() {
+        use crate::parser::SupportedLanguage;
+
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+        let files = vec![
+            FileContent {
+                path: "/tmp/a.rs".to_string(),
+                content: "pub fn rust_fn() {}".to_string(),
+                size: 19,
+                language: SupportedLanguage::Rust,
+                hash: "h1".to_string(),
+            },
+            FileContent {
+                path: "/tmp/b.py".to_string(),
+                content: "def python_fn():\n    pass\n".to_string(),
+                size: 25,
+                language: SupportedLanguage::Python,
+                hash: "h2".to_string(),
+            },
+            FileContent {
+                path: "/tmp/c.ts".to_string(),
+                content: "export function ts_fn() {}".to_string(),
+                size: 26,
+                language: SupportedLanguage::TypeScript,
+                hash: "h3".to_string(),
+            },
+            FileContent {
+                path: "/tmp/d.go".to_string(),
+                content: "package main\nfunc go_fn() {}".to_string(),
+                size: 28,
+                language: SupportedLanguage::Go,
+                hash: "h4".to_string(),
+            },
+        ];
+
+        let parsed = parse_files(files, &parser).await;
+        assert_eq!(parsed.len(), 4, "all 4 language files should parse");
+
+        let fn_names: Vec<&str> = parsed
+            .iter()
+            .flat_map(|p| p.functions.iter().map(|f| f.name.as_str()))
+            .collect();
+        assert!(fn_names.contains(&"rust_fn"));
+        assert!(fn_names.contains(&"python_fn"));
+        assert!(fn_names.contains(&"ts_fn"));
+        assert!(fn_names.contains(&"go_fn"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_files_parallel_no_data_race() {
+        use crate::parser::SupportedLanguage;
+
+        // Run parsing 5 times to catch any potential data races
+        for iteration in 0..5 {
+            let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+            let files: Vec<FileContent> = (0..50)
+                .map(|i| FileContent {
+                    path: format!("/tmp/race_test_{}_{}.rs", iteration, i),
+                    content: format!(
+                        "pub fn check_{}_{i}(x: i32) -> bool {{ x > {i} }}",
+                        iteration,
+                        i = i
+                    ),
+                    size: 50,
+                    language: SupportedLanguage::Rust,
+                    hash: format!("h{}", i),
+                })
+                .collect();
+
+            let parsed = parse_files(files, &parser).await;
+            assert_eq!(
+                parsed.len(),
+                50,
+                "iteration {}: all 50 files should parse without data race",
+                iteration
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_full_pipeline_scan_read_parse() {
+        // End-to-end test: scan → read → parse on real temp files
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        std::fs::write(
+            root.join("math.rs"),
+            "pub fn multiply(a: i32, b: i32) -> i32 { a * b }",
+        )
+        .unwrap();
+        std::fs::write(root.join("utils.py"), "def square(x):\n    return x * x\n").unwrap();
+        std::fs::write(root.join("readme.md"), "# Skip me").unwrap();
+
+        // Phase 1: Scan
+        let entries = scan_files(root);
+        assert_eq!(entries.len(), 2, "scan should find .rs and .py");
+
+        // Phase 2: Read
+        let file_contents = read_files(entries).await;
+        assert_eq!(file_contents.len(), 2, "read should load both files");
+        for fc in &file_contents {
+            assert!(!fc.content.is_empty());
+            assert!(!fc.hash.is_empty());
+        }
+
+        // Phase 3: Parse
+        let parser = Arc::new(RwLock::new(CodeParser::new().unwrap()));
+        let parsed = parse_files(file_contents, &parser).await;
+        assert_eq!(parsed.len(), 2, "parse should handle both files");
+
+        // Verify Rust file parsed correctly
+        let rs = parsed.iter().find(|p| p.path.ends_with("math.rs")).unwrap();
+        assert!(rs.functions.iter().any(|f| f.name == "multiply"));
+
+        // Verify Python file parsed correctly
+        let py = parsed
+            .iter()
+            .find(|p| p.path.ends_with("utils.py"))
+            .unwrap();
+        assert!(py.functions.iter().any(|f| f.name == "square"));
+    }
+
+    // ── T8.6: Sync consistency integration tests ──────────────────
+
+    /// Scenario 1: Add a file → verify File + symbols + IMPORTS created in Neo4j AND MeiliSearch
+    #[tokio::test]
+    async fn test_sync_add_file_creates_all_entities() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let file_path = "/tmp/sync-test/src/lib.rs".to_string();
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "rust".to_string(),
+            hash: "add-test-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "handler".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: Some("Response".to_string()),
+                generics: vec![],
+                is_async: true,
+                is_unsafe: false,
+                complexity: 3,
+                file_path: file_path.clone(),
+                line_start: 10,
+                line_end: 30,
+                docstring: Some("Handle request".to_string()),
+            }],
+            structs: vec![StructNode {
+                name: "Config".to_string(),
+                visibility: Visibility::Public,
+                generics: vec![],
+                file_path: file_path.clone(),
+                line_start: 1,
+                line_end: 8,
+                docstring: None,
+                parent_class: None,
+                interfaces: vec![],
+            }],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![ImportNode {
+                path: "serde::Deserialize".to_string(),
+                alias: None,
+                items: vec!["Deserialize".to_string()],
+                file_path: file_path.clone(),
+                line: 1,
+            }],
+            function_calls: vec![],
+            symbols: vec!["handler".to_string(), "Config".to_string()],
+        };
+
+        // Store with project context so MeiliSearch gets indexed
+        let project_id = uuid::Uuid::new_v4();
+        orch.store_parsed_file_for_project(&parsed, Some(project_id))
+            .await
+            .unwrap();
+
+        // Also manually index in MeiliSearch (normally done by sync_file_for_project)
+        let doc = crate::parser::CodeParser::to_code_document(
+            &parsed,
+            &project_id.to_string(),
+            "test-project",
+        );
+        orch.meili().index_code(&doc).await.unwrap();
+
+        // ── Verify Neo4j ──
+        assert_eq!(neo4j.functions.read().await.len(), 1, "1 function expected");
+        assert_eq!(neo4j.structs_map.read().await.len(), 1, "1 struct expected");
+        assert_eq!(neo4j.imports.read().await.len(), 1, "1 import expected");
+        let file = neo4j.get_file(&file_path).await.unwrap();
+        assert!(file.is_some(), "File node should exist in Neo4j");
+
+        // ── Verify MeiliSearch ──
+        let code_docs = meili.code_documents.read().await;
+        assert_eq!(code_docs.len(), 1, "1 code document in MeiliSearch");
+        assert_eq!(code_docs[0].path, file_path);
+        assert!(code_docs[0].symbols.contains(&"handler".to_string()));
+        assert!(code_docs[0].symbols.contains(&"Config".to_string()));
+    }
+
+    /// Scenario 2: Delete a file (< 50 threshold) → verify everything cleaned in Neo4j AND MeiliSearch
+    #[tokio::test]
+    async fn test_sync_delete_file_cleans_all() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let file_path = "/tmp/sync-test/src/delete_me.rs".to_string();
+
+        // Step 1: Add the file
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "rust".to_string(),
+            hash: "delete-test-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "temp_func".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: file_path.clone(),
+                line_start: 1,
+                line_end: 5,
+                docstring: None,
+            }],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec!["temp_func".to_string()],
+        };
+
+        orch.store_parsed_file_for_project(&parsed, Some(project_id))
+            .await
+            .unwrap();
+        let doc = crate::parser::CodeParser::to_code_document(
+            &parsed,
+            &project_id.to_string(),
+            "test-project",
+        );
+        orch.meili().index_code(&doc).await.unwrap();
+
+        // Verify file exists
+        assert_eq!(neo4j.functions.read().await.len(), 1);
+        assert_eq!(meili.code_documents.read().await.len(), 1);
+
+        // Step 2: Delete the file (simulating what watcher does)
+        GraphStore::delete_file(neo4j.as_ref(), &file_path)
+            .await
+            .unwrap();
+        orch.meili().delete_code(&file_path).await.unwrap();
+
+        // ── Verify Neo4j cleaned ──
+        let file = neo4j.get_file(&file_path).await.unwrap();
+        assert!(file.is_none(), "File node should be deleted from Neo4j");
+        // Functions are cleaned via DETACH DELETE in the mock
+        assert_eq!(
+            neo4j.functions.read().await.len(),
+            0,
+            "Functions should be deleted"
+        );
+
+        // ── Verify MeiliSearch cleaned ──
+        assert_eq!(
+            meili.code_documents.read().await.len(),
+            0,
+            "MeiliSearch documents should be deleted"
+        );
+    }
+
+    /// Scenario 3: Rename a file → old node deleted, new created with correct relations
+    #[tokio::test]
+    async fn test_sync_rename_file_old_deleted_new_created() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let old_path = "/tmp/sync-test/src/old_name.rs".to_string();
+        let new_path = "/tmp/sync-test/src/new_name.rs".to_string();
+
+        // Step 1: Create file with old name
+        let old_parsed = ParsedFile {
+            path: old_path.clone(),
+            language: "rust".to_string(),
+            hash: "old-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "my_fn".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: old_path.clone(),
+                line_start: 1,
+                line_end: 5,
+                docstring: None,
+            }],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec!["my_fn".to_string()],
+        };
+
+        orch.store_parsed_file_for_project(&old_parsed, Some(project_id))
+            .await
+            .unwrap();
+        let doc = crate::parser::CodeParser::to_code_document(
+            &old_parsed,
+            &project_id.to_string(),
+            "test",
+        );
+        orch.meili().index_code(&doc).await.unwrap();
+
+        // Step 2: Simulate rename = delete old + create new
+        GraphStore::delete_file(neo4j.as_ref(), &old_path)
+            .await
+            .unwrap();
+        orch.meili().delete_code(&old_path).await.unwrap();
+
+        let new_parsed = ParsedFile {
+            path: new_path.clone(),
+            language: "rust".to_string(),
+            hash: "new-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "my_fn".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: new_path.clone(),
+                line_start: 1,
+                line_end: 5,
+                docstring: None,
+            }],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec!["my_fn".to_string()],
+        };
+
+        orch.store_parsed_file_for_project(&new_parsed, Some(project_id))
+            .await
+            .unwrap();
+        let doc = crate::parser::CodeParser::to_code_document(
+            &new_parsed,
+            &project_id.to_string(),
+            "test",
+        );
+        orch.meili().index_code(&doc).await.unwrap();
+
+        // ── Verify old gone, new exists ──
+        let old_file = neo4j.get_file(&old_path).await.unwrap();
+        assert!(old_file.is_none(), "Old file should be deleted");
+
+        let new_file = neo4j.get_file(&new_path).await.unwrap();
+        assert!(new_file.is_some(), "New file should exist");
+
+        // Function with new file_path should exist
+        let funcs = neo4j.functions.read().await;
+        assert_eq!(funcs.len(), 1, "Should have exactly 1 function");
+        let func = funcs.values().next().unwrap();
+        assert_eq!(
+            func.file_path, new_path,
+            "Function should reference new path"
+        );
+
+        // MeiliSearch: only new file
+        let code_docs = meili.code_documents.read().await;
+        assert_eq!(code_docs.len(), 1);
+        assert_eq!(code_docs[0].path, new_path);
+    }
+
+    /// Scenario 4: Modify hierarchy (EXTENDS change) — forward-compatible validation
+    #[tokio::test]
+    async fn test_sync_heritage_change_forward_compatible() {
+        // EXTENDS/IMPLEMENTS don't exist yet (Plans 5/6).
+        // This test validates that the cleanup_sync_data handles them as no-ops
+        // and that the pattern documentation exists for future implementation.
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let _orch = Orchestrator::new(state).await.unwrap();
+
+        // cleanup_sync_data should handle EXTENDS/IMPLEMENTS without error
+        // (forward-compatible no-ops)
+        let deleted = GraphStore::cleanup_sync_data(neo4j.as_ref()).await.unwrap();
+        assert_eq!(deleted, 0, "Empty store cleanup should delete 0 entities");
+
+        // Verify the Plans 5/6 cleanup pattern documentation exists
+        let source = include_str!("runner.rs");
+        assert!(
+            source.contains("Plans 5 & 6: Heritage & Process relations"),
+            "Heritage cleanup pattern documentation must exist"
+        );
+    }
+
+    /// Scenario 5: Bulk delete (>= BULK_SYNC_THRESHOLD files) → full sync path
+    #[tokio::test]
+    async fn test_sync_bulk_delete_triggers_full_sync_path() {
+        use crate::meilisearch::traits::SearchStore;
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let _orch = Orchestrator::new(state).await.unwrap();
+        let project_id = uuid::Uuid::new_v4();
+
+        // Create 60 files (> BULK_SYNC_THRESHOLD = 50)
+        for i in 0..60 {
+            let path = format!("/tmp/bulk-test/src/file_{}.rs", i);
+            GraphStore::upsert_file(
+                neo4j.as_ref(),
+                &FileNode {
+                    path: path.clone(),
+                    language: "rust".to_string(),
+                    hash: format!("hash_{}", i),
+                    last_parsed: chrono::Utc::now(),
+                    project_id: Some(project_id),
+                },
+            )
+            .await
+            .unwrap();
+            // Link to project (mock uses project_files for delete_stale_files)
+            GraphStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(neo4j.files.read().await.len(), 60);
+
+        // Simulate keeping only 10 files (50 deletions) via delete_stale_files
+        let valid_paths: Vec<String> = (0..10)
+            .map(|i| format!("/tmp/bulk-test/src/file_{}.rs", i))
+            .collect();
+
+        let (files_deleted, _symbols_deleted, stale_paths) =
+            GraphStore::delete_stale_files(neo4j.as_ref(), project_id, &valid_paths)
+                .await
+                .unwrap();
+
+        assert_eq!(files_deleted, 50, "Should delete 50 stale files");
+        assert_eq!(stale_paths.len(), 50, "Should return 50 deleted paths");
+        assert_eq!(neo4j.files.read().await.len(), 10, "10 files should remain");
+
+        // Simulate MeiliSearch cleanup for each stale path
+        for path in &stale_paths {
+            meili.delete_code(path).await.unwrap();
+        }
+    }
+
+    /// Scenario 6: Add + delete simultaneously in debounce window → consistency
+    #[tokio::test]
+    async fn test_sync_add_delete_same_window_consistent() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let project_id = uuid::Uuid::new_v4();
+
+        let file_a = "/tmp/simul-test/src/file_a.rs".to_string();
+        let file_b = "/tmp/simul-test/src/file_b.rs".to_string();
+
+        // Create file_a and file_b
+        for path in [&file_a, &file_b] {
+            let parsed = ParsedFile {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: "hash".to_string(),
+                functions: vec![FunctionNode {
+                    name: format!("fn_{}", path.split('/').next_back().unwrap()),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: path.clone(),
+                    line_start: 1,
+                    line_end: 5,
+                    docstring: None,
+                }],
+                structs: vec![],
+                traits: vec![],
+                enums: vec![],
+                impl_blocks: vec![],
+                imports: vec![],
+                function_calls: vec![],
+                symbols: vec![],
+            };
+            orch.store_parsed_file_for_project(&parsed, Some(project_id))
+                .await
+                .unwrap();
+            let doc = crate::parser::CodeParser::to_code_document(
+                &parsed,
+                &project_id.to_string(),
+                "test",
+            );
+            orch.meili().index_code(&doc).await.unwrap();
+        }
+
+        assert_eq!(neo4j.functions.read().await.len(), 2);
+        assert_eq!(meili.code_documents.read().await.len(), 2);
+
+        // Simulate: delete file_a + modify file_b in same window
+        GraphStore::delete_file(neo4j.as_ref(), &file_a)
+            .await
+            .unwrap();
+        orch.meili().delete_code(&file_a).await.unwrap();
+
+        let parsed_b_modified = ParsedFile {
+            path: file_b.clone(),
+            language: "rust".to_string(),
+            hash: "new-hash".to_string(),
+            functions: vec![
+                FunctionNode {
+                    name: "fn_file_b.rs".to_string(),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: file_b.clone(),
+                    line_start: 1,
+                    line_end: 5,
+                    docstring: None,
+                },
+                FunctionNode {
+                    name: "new_func".to_string(),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: file_b.clone(),
+                    line_start: 10,
+                    line_end: 15,
+                    docstring: None,
+                },
+            ],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        };
+        orch.store_parsed_file_for_project(&parsed_b_modified, Some(project_id))
+            .await
+            .unwrap();
+
+        // ── Verify consistency ──
+        let file_a_node = neo4j.get_file(&file_a).await.unwrap();
+        assert!(file_a_node.is_none(), "file_a should be gone");
+
+        let file_b_node = neo4j.get_file(&file_b).await.unwrap();
+        assert!(file_b_node.is_some(), "file_b should exist");
+
+        // file_b should have 2 functions now
+        let funcs = neo4j.functions.read().await;
+        let file_b_funcs: Vec<_> = funcs.values().filter(|f| f.file_path == file_b).collect();
+        assert_eq!(file_b_funcs.len(), 2, "file_b should have 2 functions");
+
+        // MeiliSearch: only file_b
+        let code_docs = meili.code_documents.read().await;
+        assert_eq!(code_docs.len(), 1);
+        assert_eq!(code_docs[0].path, file_b);
+    }
+
+    /// Scenario 7: Delete file that is source of IMPORTS → IMPORTS relations cleaned
+    #[tokio::test]
+    async fn test_sync_delete_import_source_cleans_relations() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let importer = "/tmp/import-test/src/main.rs".to_string();
+        let imported = "/tmp/import-test/src/utils.rs".to_string();
+
+        // Create both files with an import relationship
+        let parsed_importer = ParsedFile {
+            path: importer.clone(),
+            language: "rust".to_string(),
+            hash: "importer-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "main".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: importer.clone(),
+                line_start: 1,
+                line_end: 10,
+                docstring: None,
+            }],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![ImportNode {
+                path: "utils".to_string(),
+                alias: None,
+                items: vec![],
+                file_path: importer.clone(),
+                line: 1,
+            }],
+            function_calls: vec![],
+            symbols: vec!["main".to_string()],
+        };
+
+        let parsed_imported = ParsedFile {
+            path: imported.clone(),
+            language: "rust".to_string(),
+            hash: "imported-hash".to_string(),
+            functions: vec![FunctionNode {
+                name: "helper".to_string(),
+                visibility: Visibility::Public,
+                params: vec![],
+                return_type: None,
+                generics: vec![],
+                is_async: false,
+                is_unsafe: false,
+                complexity: 1,
+                file_path: imported.clone(),
+                line_start: 1,
+                line_end: 5,
+                docstring: None,
+            }],
+            structs: vec![],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec!["helper".to_string()],
+        };
+
+        orch.store_parsed_file_for_project(&parsed_importer, None)
+            .await
+            .unwrap();
+        orch.store_parsed_file_for_project(&parsed_imported, None)
+            .await
+            .unwrap();
+
+        assert_eq!(neo4j.functions.read().await.len(), 2);
+        assert_eq!(neo4j.imports.read().await.len(), 1);
+
+        // Delete the imported file — DETACH DELETE should clean relations
+        GraphStore::delete_file(neo4j.as_ref(), &imported)
+            .await
+            .unwrap();
+
+        // ── Verify ──
+        let imported_node = neo4j.get_file(&imported).await.unwrap();
+        assert!(imported_node.is_none(), "Imported file should be deleted");
+
+        // The importer file and its import node should still exist
+        // (the import statement in main.rs still references utils)
+        let importer_node = neo4j.get_file(&importer).await.unwrap();
+        assert!(importer_node.is_some(), "Importer file should still exist");
+    }
+
+    /// Scenario 8: MeiliSearch post-deletion → search returns no phantom results
+    #[tokio::test]
+    async fn test_sync_meilisearch_no_phantom_after_deletion() {
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::ParsedFile;
+        use crate::test_helpers::mock_app_state_with_stores;
+
+        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let orch = Orchestrator::new(state).await.unwrap();
+        let project_id = uuid::Uuid::new_v4();
+
+        // Create 3 files
+        for i in 0..3 {
+            let path = format!("/tmp/phantom-test/src/file_{}.rs", i);
+            let parsed = ParsedFile {
+                path: path.clone(),
+                language: "rust".to_string(),
+                hash: format!("hash_{}", i),
+                functions: vec![FunctionNode {
+                    name: format!("func_{}", i),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: path.clone(),
+                    line_start: 1,
+                    line_end: 5,
+                    docstring: None,
+                }],
+                structs: vec![],
+                traits: vec![],
+                enums: vec![],
+                impl_blocks: vec![],
+                imports: vec![],
+                function_calls: vec![],
+                symbols: vec![format!("func_{}", i)],
+            };
+            orch.store_parsed_file_for_project(&parsed, Some(project_id))
+                .await
+                .unwrap();
+            let doc = crate::parser::CodeParser::to_code_document(
+                &parsed,
+                &project_id.to_string(),
+                "test",
+            );
+            orch.meili().index_code(&doc).await.unwrap();
+        }
+
+        assert_eq!(meili.code_documents.read().await.len(), 3);
+
+        // Delete file_1 from both Neo4j and MeiliSearch
+        let deleted_path = "/tmp/phantom-test/src/file_1.rs";
+        neo4j.delete_file(deleted_path).await.unwrap();
+        orch.meili().delete_code(deleted_path).await.unwrap();
+
+        // ── Verify no phantom documents ──
+        let code_docs = meili.code_documents.read().await;
+        assert_eq!(code_docs.len(), 2, "Should have 2 documents after deletion");
+
+        // Verify deleted file is not in results
+        let phantom = code_docs.iter().find(|d| d.path == deleted_path);
+        assert!(
+            phantom.is_none(),
+            "Deleted file should not be in MeiliSearch"
+        );
+
+        // Verify remaining files are correct
+        let paths: Vec<&str> = code_docs.iter().map(|d| d.path.as_str()).collect();
+        assert!(paths.contains(&"/tmp/phantom-test/src/file_0.rs"));
+        assert!(paths.contains(&"/tmp/phantom-test/src/file_2.rs"));
+
+        // Search should not find the deleted file
+        let results = orch.meili().search_code("func_1", 10, None).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "Search for deleted file's function should return empty"
+        );
+    }
+
+    // ── Stress tests ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_batch_stress_150k() {
+        // Stress test: 150K total items (50K functions + 50K calls + 50K imports)
+        // Validates that the mock store handles large volumes without OOM
+        // and completes within a reasonable time.
+        //
+        // This tests the DATA PREPARATION path (Vec allocation, HashMap building,
+        // chunking logic). The actual Neo4j UNWIND is tested via integration tests.
+        use crate::neo4j::batch::{BoltMap, BATCH_SIZE};
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+        use crate::parser::FunctionCall;
+
+        let start = std::time::Instant::now();
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(mock_store.clone());
+        let _orch = Orchestrator::new(state).await.unwrap();
+
+        let file_base = "/tmp/stress-test/src";
+
+        // ── Phase 1: Generate and store 50K functions across 500 files ──
+        // (100 functions per file × 500 files = 50,000 functions)
+        for file_idx in 0..500 {
+            let file_path = format!("{}/file_{}.rs", file_base, file_idx);
+            let functions: Vec<FunctionNode> = (0..100)
+                .map(|func_idx| FunctionNode {
+                    name: format!("func_{}_{}", file_idx, func_idx),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: file_path.clone(),
+                    line_start: func_idx * 10 + 1,
+                    line_end: func_idx * 10 + 9,
+                    docstring: None,
+                })
+                .collect();
+
+            GraphStore::batch_upsert_functions(mock_store.as_ref(), &functions)
+                .await
+                .unwrap();
+        }
+
+        let func_count = mock_store.functions.read().await.len();
+        assert_eq!(func_count, 50_000, "Should have 50K functions");
+        let phase1_time = start.elapsed();
+        eprintln!(
+            "Phase 1 (50K functions): {:?} — {} stored",
+            phase1_time, func_count
+        );
+
+        // ── Phase 2: Generate and store 50K call relationships ──
+        // (100 calls per file × 500 files = 50,000 calls)
+        for file_idx in 0..500 {
+            let file_path = format!("{}/file_{}.rs", file_base, file_idx);
+            let calls: Vec<FunctionCall> = (0..100)
+                .map(|func_idx| {
+                    let caller_id = format!(
+                        "{}:func_{}_{}:{}",
+                        file_path,
+                        file_idx,
+                        func_idx,
+                        func_idx * 10 + 1
+                    );
+                    let callee_name = format!("func_{}_{}", file_idx, (func_idx + 1) % 100);
+                    FunctionCall {
+                        caller_id,
+                        callee_name,
+                        line: func_idx * 10 + 5,
+                        confidence: 0.8,
+                        reason: "same_file".to_string(),
+                    }
+                })
+                .collect();
+
+            GraphStore::batch_create_call_relationships(mock_store.as_ref(), &calls, None)
+                .await
+                .unwrap();
+        }
+
+        let call_count = mock_store.call_relationships.read().await.len();
+        assert!(call_count > 0, "Should have call relationships");
+        let phase2_time = start.elapsed();
+        eprintln!(
+            "Phase 2 (50K calls): {:?} — {} stored",
+            phase2_time - phase1_time,
+            call_count
+        );
+
+        // ── Phase 3: Generate and store 50K import relationships ──
+        for file_idx in 0..500 {
+            let source_path = format!("{}/file_{}.rs", file_base, file_idx);
+            let rels: Vec<(String, String, String)> = (0..100)
+                .map(|imp_idx| {
+                    let target_path =
+                        format!("{}/file_{}.rs", file_base, (file_idx + imp_idx + 1) % 500);
+                    (
+                        source_path.clone(),
+                        target_path,
+                        format!("import_{}", imp_idx),
+                    )
+                })
+                .collect();
+
+            GraphStore::batch_create_import_relationships(mock_store.as_ref(), &rels)
+                .await
+                .unwrap();
+        }
+
+        let import_count = mock_store.import_relationships.read().await.len();
+        assert!(import_count > 0, "Should have import relationships");
+        let phase3_time = start.elapsed();
+        eprintln!(
+            "Phase 3 (50K imports): {:?} — {} stored",
+            phase3_time - phase2_time,
+            import_count
+        );
+
+        // ── Phase 4: Validate BoltMap construction at scale ──
+        // Simulate what run_unwind_in_chunks does: build 150K BoltMaps
+        let items: Vec<BoltMap> = (0..150_000)
+            .map(|i| {
+                let mut m = BoltMap::new();
+                m.insert("id".into(), format!("item-{}", i).into());
+                m.insert("name".into(), format!("name-{}", i).into());
+                m.insert("value".into(), (i as i64).into());
+                m
+            })
+            .collect();
+
+        // Verify chunking
+        let chunks: Vec<&[BoltMap]> = items.chunks(BATCH_SIZE).collect();
+        assert_eq!(chunks.len(), 15, "150K items / 10K = 15 chunks");
+        assert_eq!(chunks[0].len(), 10_000);
+        assert_eq!(chunks[14].len(), 10_000);
+
+        let total_time = start.elapsed();
+        eprintln!("Total stress test time: {:?}", total_time);
+        eprintln!(
+            "Total items: {} functions + {} calls + {} imports + 150K BoltMaps",
+            func_count, call_count, import_count
+        );
+
+        // Must complete within 30s (typically < 2s on modern hardware)
+        assert!(
+            total_time.as_secs() < 30,
+            "Stress test took too long: {:?} (limit: 30s)",
+            total_time
+        );
+    }
+
+    #[tokio::test]
+    async fn test_batch_stress_cleanup_pattern() {
+        // Validates that the cleanup LIMIT loop pattern scales correctly
+        // with the mock store's cleanup_sync_data implementation.
+        use crate::neo4j::models::*;
+        use crate::neo4j::traits::GraphStore;
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+
+        let file_base = "/tmp/stress-cleanup/src";
+
+        // Create 1000 functions across 10 files
+        for file_idx in 0..10 {
+            let file_path = format!("{}/file_{}.rs", file_base, file_idx);
+
+            // First create the file node
+            GraphStore::upsert_file(
+                mock_store.as_ref(),
+                &FileNode {
+                    path: file_path.clone(),
+                    language: "rust".to_string(),
+                    hash: format!("hash_{}", file_idx),
+                    last_parsed: chrono::Utc::now(),
+                    project_id: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            let functions: Vec<FunctionNode> = (0..100)
+                .map(|func_idx| FunctionNode {
+                    name: format!("func_{}_{}", file_idx, func_idx),
+                    visibility: Visibility::Public,
+                    params: vec![],
+                    return_type: None,
+                    generics: vec![],
+                    is_async: false,
+                    is_unsafe: false,
+                    complexity: 1,
+                    file_path: file_path.clone(),
+                    line_start: func_idx * 10 + 1,
+                    line_end: func_idx * 10 + 9,
+                    docstring: None,
+                })
+                .collect();
+
+            GraphStore::batch_upsert_functions(mock_store.as_ref(), &functions)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(mock_store.functions.read().await.len(), 1000);
+        assert_eq!(mock_store.files.read().await.len(), 10);
+
+        // cleanup_sync_data should remove everything
+        let deleted = GraphStore::cleanup_sync_data(mock_store.as_ref())
+            .await
+            .unwrap();
+        assert!(deleted > 0, "Should have deleted entities");
+
+        // All code entities should be gone
+        assert_eq!(
+            mock_store.functions.read().await.len(),
+            0,
+            "All functions should be deleted"
+        );
+        assert_eq!(
+            mock_store.files.read().await.len(),
+            0,
+            "All files should be deleted"
+        );
+    }
+
+    // ── Heritage pipeline integration tests ─────────────────────────
+
+    #[tokio::test]
+    async fn test_heritage_extends_implements_wired_in_pipeline() {
+        use crate::neo4j::models::*;
+        use crate::parser::ParsedFile;
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(mock_store.clone());
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let file_path = "/tmp/test-heritage/src/models.java".to_string();
+
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "java".to_string(),
+            hash: "heritage123".to_string(),
+            functions: vec![],
+            structs: vec![
+                // Dog extends Animal
+                StructNode {
+                    name: "Dog".to_string(),
+                    visibility: Visibility::Public,
+                    generics: vec![],
+                    file_path: file_path.clone(),
+                    line_start: 1,
+                    line_end: 20,
+                    docstring: None,
+                    parent_class: Some("Animal".to_string()),
+                    interfaces: vec!["Serializable".to_string(), "Comparable".to_string()],
+                },
+                // Cat extends Animal implements Serializable
+                StructNode {
+                    name: "Cat".to_string(),
+                    visibility: Visibility::Public,
+                    generics: vec![],
+                    file_path: file_path.clone(),
+                    line_start: 30,
+                    line_end: 50,
+                    docstring: None,
+                    parent_class: Some("Animal".to_string()),
+                    interfaces: vec!["Serializable".to_string()],
+                },
+                // Animal — no parent, no interfaces
+                StructNode {
+                    name: "Animal".to_string(),
+                    visibility: Visibility::Public,
+                    generics: vec![],
+                    file_path: file_path.clone(),
+                    line_start: 60,
+                    line_end: 80,
+                    docstring: None,
+                    parent_class: None,
+                    interfaces: vec![],
+                },
+            ],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        };
+
+        orch.store_parsed_file_for_project(&parsed, None)
+            .await
+            .unwrap();
+
+        // Verify EXTENDS relationships
+        let cr = mock_store.call_relationships.read().await;
+
+        let dog_extends = cr
+            .get("extends:Dog")
+            .expect("Dog should have an extends edge");
+        assert_eq!(
+            dog_extends,
+            &vec!["Animal".to_string()],
+            "Dog extends Animal"
+        );
+
+        let cat_extends = cr
+            .get("extends:Cat")
+            .expect("Cat should have an extends edge");
+        assert_eq!(
+            cat_extends,
+            &vec!["Animal".to_string()],
+            "Cat extends Animal"
+        );
+
+        assert!(
+            cr.get("extends:Animal").is_none(),
+            "Animal has no parent class"
+        );
+
+        // Verify IMPLEMENTS relationships
+        let dog_implements = cr
+            .get("implements:Dog")
+            .expect("Dog should have implements edges");
+        assert_eq!(
+            dog_implements,
+            &vec!["Serializable".to_string(), "Comparable".to_string()],
+            "Dog implements Serializable and Comparable"
+        );
+
+        let cat_implements = cr
+            .get("implements:Cat")
+            .expect("Cat should have implements edges");
+        assert_eq!(
+            cat_implements,
+            &vec!["Serializable".to_string()],
+            "Cat implements Serializable"
+        );
+
+        assert!(
+            cr.get("implements:Animal").is_none(),
+            "Animal implements nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_heritage_no_edges_when_no_inheritance() {
+        use crate::neo4j::models::*;
+        use crate::parser::ParsedFile;
+
+        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let state = mock_app_state_with_graph(mock_store.clone());
+        let orch = Orchestrator::new(state).await.unwrap();
+
+        let file_path = "/tmp/test-heritage-empty/src/plain.rs".to_string();
+
+        let parsed = ParsedFile {
+            path: file_path.clone(),
+            language: "rust".to_string(),
+            hash: "noinherit".to_string(),
+            functions: vec![],
+            structs: vec![StructNode {
+                name: "PlainStruct".to_string(),
+                visibility: Visibility::Public,
+                generics: vec![],
+                file_path: file_path.clone(),
+                line_start: 1,
+                line_end: 10,
+                docstring: None,
+                parent_class: None,
+                interfaces: vec![],
+            }],
+            traits: vec![],
+            enums: vec![],
+            impl_blocks: vec![],
+            imports: vec![],
+            function_calls: vec![],
+            symbols: vec![],
+        };
+
+        orch.store_parsed_file_for_project(&parsed, None)
+            .await
+            .unwrap();
+
+        // No heritage relationships should exist
+        let cr = mock_store.call_relationships.read().await;
+        let has_extends = cr.keys().any(|k| k.starts_with("extends:"));
+        let has_implements = cr.keys().any(|k| k.starts_with("implements:"));
+        assert!(!has_extends, "No extends edges for struct without parent");
+        assert!(
+            !has_implements,
+            "No implements edges for struct without interfaces"
+        );
     }
 }

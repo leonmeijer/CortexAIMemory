@@ -1092,3 +1092,615 @@ greet "World"
     assert_eq!(parsed.language, "bash");
     assert!(!parsed.functions.is_empty(), "Should find functions");
 }
+
+// =========================================================================
+// Noise Filter Integration Tests
+// =========================================================================
+
+#[test]
+fn test_noise_filter_rust_builtin_calls() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+fn process_data(items: Vec<String>) -> Vec<String> {
+    println!("Starting processing");
+    let result = items.iter()
+        .filter(|x| !x.is_empty())
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>();
+    dbg!(&result);
+    transform_items(result)
+}
+
+fn transform_items(items: Vec<String>) -> Vec<String> {
+    items
+}
+"#;
+
+    let path = Path::new("test.rs");
+    let parsed = parser.parse_file(path, code).unwrap();
+
+    let call_names: Vec<&str> = parsed
+        .function_calls
+        .iter()
+        .map(|c| c.callee_name.as_str())
+        .collect();
+
+    // Real function calls should be present
+    assert!(
+        call_names.contains(&"transform_items"),
+        "Should keep real function call 'transform_items', got: {:?}",
+        call_names
+    );
+
+    // Built-in calls should be filtered out
+    assert!(
+        !call_names.contains(&"println"),
+        "Should filter out 'println', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"dbg"),
+        "Should filter out 'dbg', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"collect"),
+        "Should filter out 'collect', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"is_empty"),
+        "Should filter out 'is_empty', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"to_string"),
+        "Should filter out 'to_string', got: {:?}",
+        call_names
+    );
+}
+
+#[test]
+fn test_noise_filter_typescript_builtin_calls() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+function processUsers(users: User[]): string[] {
+    console.log("Processing users");
+    const filtered = users.filter(u => u.active);
+    const names = filtered.map(u => u.name);
+    const result = fetchUserDetails(names);
+    JSON.stringify(result);
+    return result;
+}
+
+function fetchUserDetails(names: string[]): string[] {
+    return names;
+}
+"#;
+
+    let path = Path::new("test.ts");
+    let parsed = parser.parse_file(path, code).unwrap();
+
+    let call_names: Vec<&str> = parsed
+        .function_calls
+        .iter()
+        .map(|c| c.callee_name.as_str())
+        .collect();
+
+    // Real function calls should be present
+    assert!(
+        call_names.contains(&"fetchUserDetails"),
+        "Should keep 'fetchUserDetails', got: {:?}",
+        call_names
+    );
+
+    // Built-ins should be filtered
+    assert!(
+        !call_names.contains(&"log"),
+        "Should filter out 'log' (console.log), got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"filter"),
+        "Should filter out 'filter', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"map"),
+        "Should filter out 'map', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"stringify"),
+        "Should filter out 'stringify', got: {:?}",
+        call_names
+    );
+}
+
+#[test]
+fn test_noise_filter_python_builtin_calls() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+def analyze_data(data):
+    print("Analyzing...")
+    length = len(data)
+    sorted_data = sorted(data)
+    result = compute_statistics(sorted_data)
+    for i, item in enumerate(result):
+        validate_item(item)
+    return result
+
+def compute_statistics(data):
+    return data
+
+def validate_item(item):
+    pass
+"#;
+
+    let path = Path::new("test.py");
+    let parsed = parser.parse_file(path, code).unwrap();
+
+    let call_names: Vec<&str> = parsed
+        .function_calls
+        .iter()
+        .map(|c| c.callee_name.as_str())
+        .collect();
+
+    // Real function calls should be present
+    assert!(
+        call_names.contains(&"compute_statistics"),
+        "Should keep 'compute_statistics', got: {:?}",
+        call_names
+    );
+    assert!(
+        call_names.contains(&"validate_item"),
+        "Should keep 'validate_item', got: {:?}",
+        call_names
+    );
+
+    // Built-ins should be filtered
+    assert!(
+        !call_names.contains(&"print"),
+        "Should filter out 'print', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"len"),
+        "Should filter out 'len', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"sorted"),
+        "Should filter out 'sorted', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"enumerate"),
+        "Should filter out 'enumerate', got: {:?}",
+        call_names
+    );
+}
+
+#[test]
+fn test_noise_filter_go_builtin_calls() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+package main
+
+import "fmt"
+
+func processItems(items []string) []string {
+    fmt.Println("Processing")
+    result := make([]string, 0)
+    for _, item := range items {
+        processed := transformItem(item)
+        result = append(result, processed)
+    }
+    return result
+}
+
+func transformItem(item string) string {
+    return item
+}
+"#;
+
+    let path = Path::new("test.go");
+    let parsed = parser.parse_file(path, code).unwrap();
+
+    let call_names: Vec<&str> = parsed
+        .function_calls
+        .iter()
+        .map(|c| c.callee_name.as_str())
+        .collect();
+
+    // Real function calls should be present
+    assert!(
+        call_names.contains(&"transformItem"),
+        "Should keep 'transformItem', got: {:?}",
+        call_names
+    );
+
+    // Built-ins should be filtered
+    assert!(
+        !call_names.contains(&"Println"),
+        "Should filter out 'Println', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"make"),
+        "Should filter out 'make', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"append"),
+        "Should filter out 'append', got: {:?}",
+        call_names
+    );
+}
+
+#[test]
+fn test_noise_filter_java_builtin_calls() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+public class UserService {
+    public void processUser(User user) {
+        System.out.println("Processing user");
+        String name = user.getName();
+        String result = user.toString();
+        boolean valid = validateUser(user);
+        List<String> items = new ArrayList<>();
+        items.add(name);
+    }
+
+    private boolean validateUser(User user) {
+        return true;
+    }
+}
+"#;
+
+    let path = Path::new("test.java");
+    let parsed = parser.parse_file(path, code).unwrap();
+
+    let call_names: Vec<&str> = parsed
+        .function_calls
+        .iter()
+        .map(|c| c.callee_name.as_str())
+        .collect();
+
+    // Real function calls should be present
+    assert!(
+        call_names.contains(&"validateUser"),
+        "Should keep 'validateUser', got: {:?}",
+        call_names
+    );
+
+    // Built-ins should be filtered
+    assert!(
+        !call_names.contains(&"println"),
+        "Should filter out 'println', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"toString"),
+        "Should filter out 'toString', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"getName"),
+        "Should filter out 'getName', got: {:?}",
+        call_names
+    );
+}
+
+#[test]
+fn test_noise_filter_php_builtin_calls() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"<?php
+function processData($data) {
+    var_dump($data);
+    $count = count($data);
+    $encoded = json_encode($data);
+    $result = transformData($data);
+    echo $result;
+    return $result;
+}
+
+function transformData($data) {
+    return $data;
+}
+"#;
+
+    let path = Path::new("test.php");
+    let parsed = parser.parse_file(path, code).unwrap();
+
+    let call_names: Vec<&str> = parsed
+        .function_calls
+        .iter()
+        .map(|c| c.callee_name.as_str())
+        .collect();
+
+    // Real function calls should be present
+    assert!(
+        call_names.contains(&"transformData"),
+        "Should keep 'transformData', got: {:?}",
+        call_names
+    );
+
+    // Built-ins should be filtered
+    assert!(
+        !call_names.contains(&"var_dump"),
+        "Should filter out 'var_dump', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"count"),
+        "Should filter out 'count', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"json_encode"),
+        "Should filter out 'json_encode', got: {:?}",
+        call_names
+    );
+}
+
+#[test]
+fn test_noise_filter_c_builtin_calls() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+#include <stdio.h>
+#include <stdlib.h>
+
+void process_buffer(char* buf, int size) {
+    printf("Processing %d bytes\n", size);
+    char* copy = malloc(size);
+    memcpy(copy, buf, size);
+    transform_buffer(copy, size);
+    free(copy);
+}
+
+void transform_buffer(char* buf, int size) {
+}
+"#;
+
+    let path = Path::new("test.c");
+    let parsed = parser.parse_file(path, code).unwrap();
+
+    let call_names: Vec<&str> = parsed
+        .function_calls
+        .iter()
+        .map(|c| c.callee_name.as_str())
+        .collect();
+
+    // Real function calls should be present
+    assert!(
+        call_names.contains(&"transform_buffer"),
+        "Should keep 'transform_buffer', got: {:?}",
+        call_names
+    );
+
+    // Built-ins should be filtered
+    assert!(
+        !call_names.contains(&"printf"),
+        "Should filter out 'printf', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"malloc"),
+        "Should filter out 'malloc', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"memcpy"),
+        "Should filter out 'memcpy', got: {:?}",
+        call_names
+    );
+    assert!(
+        !call_names.contains(&"free"),
+        "Should filter out 'free', got: {:?}",
+        call_names
+    );
+}
+
+// =========================================================================
+// Parser Integration Tests: Zig, Scala, C#
+// =========================================================================
+
+#[test]
+fn test_parse_zig() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+const std = @import("std");
+
+pub fn main() void {
+    std.debug.print("hello", .{});
+}
+
+const Point = struct {
+    x: f32,
+    y: f32,
+};
+"#;
+
+    let path = Path::new("test.zig");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse Zig code: {:?}", result.err());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "zig");
+
+    // At least 1 function extracted with name "main"
+    let main_fn = parsed.functions.iter().find(|f| f.name == "main");
+    assert!(
+        main_fn.is_some(),
+        "Should find 'main' function, got functions: {:?}",
+        parsed.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+
+    // At least 1 struct with name "Point"
+    let point_struct = parsed.structs.iter().find(|s| s.name == "Point");
+    assert!(
+        point_struct.is_some(),
+        "Should find 'Point' struct, got structs: {:?}",
+        parsed.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // At least 1 import for "std"
+    assert!(
+        !parsed.imports.is_empty(),
+        "Should find at least one import"
+    );
+    let std_import = parsed.imports.iter().find(|i| i.path == "std");
+    assert!(
+        std_import.is_some(),
+        "Should find import for 'std', got imports: {:?}",
+        parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_parse_scala() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+import scala.collection.mutable.{ArrayBuffer, ListBuffer}
+import java.io.File
+
+class UserService(db: Database) {
+  def findUser(id: String): Option[User] = {
+    db.query(id)
+  }
+}
+"#;
+
+    let path = Path::new("UserService.scala");
+    let result = parser.parse_file(path, code);
+
+    assert!(
+        result.is_ok(),
+        "Should parse Scala code: {:?}",
+        result.err()
+    );
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "scala");
+
+    // Imports extracted (with items for selective)
+    assert!(
+        parsed.imports.len() >= 2,
+        "Should find at least 2 imports, got {}",
+        parsed.imports.len()
+    );
+
+    // Selective import should have items
+    let selective_import = parsed.imports.iter().find(|i| i.path.contains("mutable"));
+    assert!(
+        selective_import.is_some(),
+        "Should find selective import for scala.collection.mutable, got imports: {:?}",
+        parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+    let selective = selective_import.unwrap();
+    assert!(
+        !selective.items.is_empty(),
+        "Selective import should have items, got: {:?}",
+        selective
+    );
+
+    // Class "UserService" extracted
+    let user_service = parsed.structs.iter().find(|s| s.name == "UserService");
+    assert!(
+        user_service.is_some(),
+        "Should find 'UserService' class, got structs: {:?}",
+        parsed.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+
+    // Method "findUser" extracted
+    let find_user = parsed.functions.iter().find(|f| f.name == "findUser");
+    assert!(
+        find_user.is_some(),
+        "Should find 'findUser' method, got functions: {:?}",
+        parsed.functions.iter().map(|f| &f.name).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn test_parse_csharp() {
+    let mut parser = CodeParser::new().unwrap();
+
+    let code = r#"
+using System;
+using static System.Math;
+using JsonAlias = Newtonsoft.Json.JsonConvert;
+
+public class Calculator {
+    public double Calculate(double x) {
+        return Abs(x);
+    }
+}
+"#;
+
+    let path = Path::new("Calculator.cs");
+    let result = parser.parse_file(path, code);
+
+    assert!(result.is_ok(), "Should parse C# code: {:?}", result.err());
+
+    let parsed = result.unwrap();
+    assert_eq!(parsed.language, "csharp");
+
+    // 3 using statements extracted
+    assert_eq!(
+        parsed.imports.len(),
+        3,
+        "Should find 3 using statements, got {}: {:?}",
+        parsed.imports.len(),
+        parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+
+    // "using static System.Math" — path should be "System.Math" (without "static")
+    let static_import = parsed
+        .imports
+        .iter()
+        .find(|i| i.path.contains("System.Math"));
+    assert!(
+        static_import.is_some(),
+        "Should find 'using static System.Math' with path 'System.Math', got: {:?}",
+        parsed.imports.iter().map(|i| &i.path).collect::<Vec<_>>()
+    );
+
+    // "using JsonAlias = Newtonsoft.Json.JsonConvert" — alias "JsonAlias" extracted
+    let alias_import = parsed
+        .imports
+        .iter()
+        .find(|i| i.alias.as_deref() == Some("JsonAlias"));
+    assert!(
+        alias_import.is_some(),
+        "Should find using alias 'JsonAlias', got: {:?}",
+        parsed
+            .imports
+            .iter()
+            .map(|i| (&i.path, &i.alias))
+            .collect::<Vec<_>>()
+    );
+    let alias = alias_import.unwrap();
+    assert_eq!(
+        alias.path, "Newtonsoft.Json.JsonConvert",
+        "Alias import path should be 'Newtonsoft.Json.JsonConvert'"
+    );
+
+    // Class "Calculator" extracted
+    let calculator = parsed.structs.iter().find(|s| s.name == "Calculator");
+    assert!(
+        calculator.is_some(),
+        "Should find 'Calculator' class, got structs: {:?}",
+        parsed.structs.iter().map(|s| &s.name).collect::<Vec<_>>()
+    );
+}

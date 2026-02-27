@@ -357,12 +357,28 @@ pub struct CallGraphQuery {
 }
 
 #[derive(Serialize)]
+pub struct CallGraphEdge {
+    pub name: String,
+    pub file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct CallGraphNode {
     pub name: String,
     pub file_path: String,
     pub line: u32,
     pub callers: Vec<String>,
     pub callees: Vec<String>,
+    /// Detailed caller info including confidence scores (when available)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub caller_details: Vec<CallGraphEdge>,
+    /// Detailed callee info including confidence scores (when available)
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub callee_details: Vec<CallGraphEdge>,
 }
 
 /// Get call graph for a function
@@ -370,7 +386,7 @@ pub async fn get_call_graph(
     State(state): State<OrchestratorState>,
     Query(query): Query<CallGraphQuery>,
 ) -> Result<Json<CallGraphNode>, AppError> {
-    let depth = query.depth.unwrap_or(2);
+    let depth = query.depth.unwrap_or(2).clamp(1, 20);
     let direction = query.direction.as_deref().unwrap_or("both");
 
     let project_id = if let Some(ref slug) = query.project_slug {
@@ -389,6 +405,8 @@ pub async fn get_call_graph(
 
     let mut callers = vec![];
     let mut callees = vec![];
+    let mut caller_details = vec![];
+    let mut callee_details = vec![];
 
     if direction == "callers" || direction == "both" {
         callers = state
@@ -396,6 +414,23 @@ pub async fn get_call_graph(
             .neo4j()
             .get_function_callers_by_name(&query.function, depth, project_id)
             .await?;
+        // Also get direct callers with confidence (depth 1)
+        if let Ok(details) = state
+            .orchestrator
+            .neo4j()
+            .get_callers_with_confidence(&query.function, project_id)
+            .await
+        {
+            caller_details = details
+                .into_iter()
+                .map(|(name, file, conf, reason)| CallGraphEdge {
+                    name,
+                    file_path: file,
+                    confidence: Some(conf),
+                    reason: Some(reason),
+                })
+                .collect();
+        }
     }
 
     if direction == "callees" || direction == "both" {
@@ -404,6 +439,22 @@ pub async fn get_call_graph(
             .neo4j()
             .get_function_callees_by_name(&query.function, depth, project_id)
             .await?;
+        if let Ok(details) = state
+            .orchestrator
+            .neo4j()
+            .get_callees_with_confidence(&query.function, project_id)
+            .await
+        {
+            callee_details = details
+                .into_iter()
+                .map(|(name, file, conf, reason)| CallGraphEdge {
+                    name,
+                    file_path: file,
+                    confidence: Some(conf),
+                    reason: Some(reason),
+                })
+                .collect();
+        }
     }
 
     Ok(Json(CallGraphNode {
@@ -412,6 +463,8 @@ pub async fn get_call_graph(
         line: 0,
         callers,
         callees,
+        caller_details,
+        callee_details,
     }))
 }
 
@@ -1795,6 +1848,275 @@ pub async fn get_risk_assessment(
     })))
 }
 
+// ============================================================================
+// Process Detection
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectSlugBody {
+    pub project_slug: String,
+}
+
+/// POST /api/code/processes/detect
+///
+/// Detect business processes by scoring entry points, BFS traversal through
+/// the CALLS graph, deduplication, and classification.
+pub async fn detect_processes(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<ProjectSlugBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
+
+    let processes = state
+        .orchestrator
+        .analytics()
+        .detect_processes(project.id)
+        .await?;
+
+    let processes_json: Vec<serde_json::Value> = processes
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.id,
+                "label": p.label,
+                "process_type": p.process_type.to_string(),
+                "step_count": p.steps.len(),
+                "entry_point": p.entry_point_id,
+                "terminal": p.terminal_id,
+                "steps": p.steps,
+                "communities": p.communities.iter().collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "processes": processes_json,
+        "total": processes.len(),
+    })))
+}
+
+// ============================================================================
+// Heritage navigation handlers
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct ClassHierarchyQuery {
+    pub type_name: String,
+    pub max_depth: Option<u32>,
+}
+
+/// GET /api/code/class-hierarchy
+///
+/// Get the full class hierarchy (parents + children) for a type.
+pub async fn get_class_hierarchy(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<ClassHierarchyQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let max_depth = params.max_depth.unwrap_or(10).clamp(1, 20);
+    let hierarchy = state
+        .orchestrator
+        .neo4j()
+        .get_class_hierarchy(&params.type_name, max_depth)
+        .await?;
+
+    Ok(Json(hierarchy))
+}
+
+#[derive(Deserialize)]
+pub struct SubclassesQuery {
+    pub class_name: String,
+}
+
+/// GET /api/code/subclasses
+///
+/// Find all subclasses (direct + transitive) of a given class.
+pub async fn find_subclasses(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<SubclassesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let subclasses = state
+        .orchestrator
+        .neo4j()
+        .find_subclasses(&params.class_name)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "class_name": params.class_name,
+        "subclasses": subclasses,
+        "total": subclasses.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct InterfaceImplementorsQuery {
+    pub interface_name: String,
+}
+
+/// GET /api/code/interface-implementors
+///
+/// Find all types that implement a given interface.
+pub async fn find_interface_implementors(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<InterfaceImplementorsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let implementors = state
+        .orchestrator
+        .neo4j()
+        .find_interface_implementors(&params.interface_name)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "interface_name": params.interface_name,
+        "implementors": implementors,
+        "total": implementors.len(),
+    })))
+}
+
+// ============================================================================
+// Process navigation handlers
+// ============================================================================
+
+#[derive(Deserialize)]
+pub struct ListProcessesQuery {
+    pub project_slug: String,
+}
+
+/// GET /api/code/processes
+///
+/// List all detected processes for a project.
+pub async fn list_processes(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<ListProcessesQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let processes = state
+        .orchestrator
+        .neo4j()
+        .list_processes(project.id)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "processes": processes,
+        "total": processes.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+pub struct GetProcessQuery {
+    pub process_id: String,
+}
+
+/// GET /api/code/processes/detail
+///
+/// Get details of a specific process including ordered steps.
+pub async fn get_process_detail(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<GetProcessQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let process = state
+        .orchestrator
+        .neo4j()
+        .get_process_detail(&params.process_id)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Process '{}' not found", params.process_id)))?;
+
+    Ok(Json(process))
+}
+
+#[derive(Deserialize)]
+pub struct EntryPointsQuery {
+    pub project_slug: String,
+    pub limit: Option<usize>,
+}
+
+/// GET /api/code/entry-points
+///
+/// Get scored entry points for a project.
+pub async fn get_entry_points(
+    State(state): State<OrchestratorState>,
+    Query(params): Query<EntryPointsQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&params.project_slug)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!("Project '{}' not found", params.project_slug))
+        })?;
+
+    let limit = params.limit.unwrap_or(50);
+    let entry_points = state
+        .orchestrator
+        .neo4j()
+        .get_entry_points(project.id, limit)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "entry_points": entry_points,
+        "total": entry_points.len(),
+    })))
+}
+
+// ============================================================================
+// Community enrichment handler
+// ============================================================================
+
+/// POST /api/code/communities/enrich
+///
+/// Trigger LLM enrichment of community labels.
+pub async fn enrich_communities(
+    State(state): State<OrchestratorState>,
+    Json(body): Json<ProjectSlugBody>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let project = state
+        .orchestrator
+        .neo4j()
+        .get_project_by_slug(&body.project_slug)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
+
+    // Run file graph analysis which includes enrichment
+    let analytics = state
+        .orchestrator
+        .analytics()
+        .analyze_file_graph(project.id)
+        .await?;
+
+    let communities_json: Vec<serde_json::Value> = analytics
+        .communities
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id,
+                "label": c.label,
+                "size": c.size,
+                "cohesion": c.cohesion,
+                "enriched_by": c.enriched_by,
+                "members": c.members,
+            })
+        })
+        .collect();
+
+    Ok(Json(serde_json::json!({
+        "communities": communities_json,
+        "total": communities_json.len(),
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3112,6 +3434,8 @@ mod tests {
             line_start: 5,
             line_end: 8,
             docstring: Some("App config".to_string()),
+            parent_class: None,
+            interfaces: vec![],
         };
         graph.upsert_struct(&s).await.unwrap();
 
@@ -4025,5 +4349,59 @@ mod tests {
         assert_eq!(q.project_slug, "my-proj");
         assert_eq!(q.node_path, "src/main.rs");
         assert_eq!(q.node_type, Some("file".to_string()));
+    }
+
+    // ====================================================================
+    // POST /api/code/processes/detect — nonexistent project
+    // ====================================================================
+
+    /// Create an authenticated POST request with JSON body
+    fn auth_post(uri: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", test_bearer_token())
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_detect_processes_404() {
+        let app = test_app().await;
+        let body = serde_json::json!({ "project_slug": "nonexistent-project" });
+        let resp = app
+            .oneshot(auth_post("/api/code/processes/detect", body))
+            .await
+            .unwrap();
+
+        // Project not found should return 404
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ====================================================================
+    // GET /api/code/class-hierarchy — max_depth clamping
+    // ====================================================================
+
+    #[tokio::test]
+    async fn test_get_class_hierarchy_max_depth_clamp() {
+        // Verify the handler doesn't panic when max_depth=100.
+        // The handler clamps max_depth to 20 via .clamp(1, 20).
+        let app = test_app().await;
+        let resp = app
+            .oneshot(auth_get(
+                "/api/code/class-hierarchy?type_name=SomeClass&max_depth=100",
+            ))
+            .await
+            .unwrap();
+
+        // The handler should succeed (200) — the mock graph store returns an
+        // empty hierarchy, so we just verify it doesn't panic or error out
+        // due to the extreme max_depth value.
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "Handler should succeed even with max_depth=100 (clamped to 20)"
+        );
     }
 }

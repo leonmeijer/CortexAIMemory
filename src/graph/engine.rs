@@ -18,6 +18,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use super::algorithms::compute_all;
+use super::enrichment::{CommunityEnricher, NoopCommunityEnricher};
 use super::extraction::GraphExtractor;
 use super::models::{AnalyticsConfig, FabricWeights, GraphAnalytics};
 use super::writer::AnalyticsWriter;
@@ -78,6 +79,16 @@ pub trait AnalyticsEngine: Send + Sync {
         project_id: Uuid,
         weights: &FabricWeights,
     ) -> Result<GraphAnalytics>;
+
+    /// Detect business processes by scoring entry points, BFS traversal,
+    /// deduplication, and classification.
+    ///
+    /// Pipeline: extract function graph → compute_all → score entry points →
+    /// BFS trace → deduplicate → classify → persist Process nodes + STEP_IN_PROCESS edges.
+    async fn detect_processes(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<crate::graph::process::Process>>;
 }
 
 // ============================================================================
@@ -87,20 +98,42 @@ pub trait AnalyticsEngine: Send + Sync {
 /// Real analytics engine backed by a `GraphStore`.
 ///
 /// Composes `GraphExtractor` (extraction), `compute_all` (algorithms),
+/// `CommunityEnricher` (optional LLM label enrichment),
 /// and `AnalyticsWriter` (persistence) into a single pipeline.
 pub struct GraphAnalyticsEngine {
+    store: Arc<dyn GraphStore>,
     extractor: GraphExtractor,
     writer: AnalyticsWriter,
     config: AnalyticsConfig,
+    enricher: Arc<dyn CommunityEnricher>,
 }
 
 impl GraphAnalyticsEngine {
     /// Create a new engine backed by the given GraphStore.
+    ///
+    /// Uses `NoopCommunityEnricher` by default (heuristic labels only).
     pub fn new(store: Arc<dyn GraphStore>, config: AnalyticsConfig) -> Self {
         Self {
+            store: store.clone(),
             extractor: GraphExtractor::new(store.clone()),
             writer: AnalyticsWriter::new(store),
             config,
+            enricher: Arc::new(NoopCommunityEnricher),
+        }
+    }
+
+    /// Create a new engine with a custom community enricher.
+    pub fn with_enricher(
+        store: Arc<dyn GraphStore>,
+        config: AnalyticsConfig,
+        enricher: Arc<dyn CommunityEnricher>,
+    ) -> Self {
+        Self {
+            store: store.clone(),
+            extractor: GraphExtractor::new(store.clone()),
+            writer: AnalyticsWriter::new(store),
+            config,
+            enricher,
         }
     }
 }
@@ -112,7 +145,19 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         let graph = self.extractor.extract_file_graph(project_id).await?;
 
         // 2. Compute
-        let analytics = compute_all(&graph, &self.config);
+        let mut analytics = compute_all(&graph, &self.config);
+
+        // 2b. Enrich community labels (LLM or noop)
+        if let Err(e) = self
+            .enricher
+            .enrich_labels(&mut analytics.communities, &graph, &analytics.metrics)
+            .await
+        {
+            tracing::warn!(
+                "Community enrichment failed, keeping heuristic labels: {}",
+                e
+            );
+        }
 
         // 3. Persist
         self.writer.write_analytics(&analytics, &graph).await?;
@@ -125,7 +170,19 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         let graph = self.extractor.extract_function_graph(project_id).await?;
 
         // 2. Compute
-        let analytics = compute_all(&graph, &self.config);
+        let mut analytics = compute_all(&graph, &self.config);
+
+        // 2b. Enrich community labels (LLM or noop)
+        if let Err(e) = self
+            .enricher
+            .enrich_labels(&mut analytics.communities, &graph, &analytics.metrics)
+            .await
+        {
+            tracing::warn!(
+                "Community enrichment failed, keeping heuristic labels: {}",
+                e
+            );
+        }
 
         // 3. Persist
         self.writer.write_analytics(&analytics, &graph).await?;
@@ -156,7 +213,19 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             .await?;
 
         // 2. Compute analytics (PageRank, Louvain, Betweenness all use edge weights)
-        let analytics = compute_all(&graph, &self.config);
+        let mut analytics = compute_all(&graph, &self.config);
+
+        // 2b. Enrich community labels (LLM or noop)
+        if let Err(e) = self
+            .enricher
+            .enrich_labels(&mut analytics.communities, &graph, &analytics.metrics)
+            .await
+        {
+            tracing::warn!(
+                "Community enrichment failed, keeping heuristic labels: {}",
+                e
+            );
+        }
 
         // 3. Persist to fabric_* properties (NOT the code-only properties)
         self.writer
@@ -164,6 +233,79 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
             .await?;
 
         Ok(analytics)
+    }
+
+    async fn detect_processes(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Vec<crate::graph::process::Process>> {
+        use crate::graph::process::{self, ProcessConfig};
+        use crate::neo4j::models::ProcessNode;
+
+        // 1. Extract function CALLS graph
+        let graph = self.extractor.extract_function_graph(project_id).await?;
+        if graph.node_count() == 0 {
+            return Ok(Vec::new());
+        }
+
+        // 2. Compute metrics (PageRank, communities, in/out degree)
+        let analytics = compute_all(&graph, &self.config);
+
+        // 3. Run process detection pipeline
+        let config = ProcessConfig::default();
+        let processes = process::detect_processes(&graph, &analytics.metrics, &config);
+
+        if processes.is_empty() {
+            return Ok(processes);
+        }
+
+        // 4. Persist: delete old processes, then upsert new ones
+        if let Err(e) = self.store.delete_project_processes(project_id).await {
+            tracing::warn!(
+                "Failed to delete old processes for project {}: {}",
+                project_id,
+                e
+            );
+        }
+
+        let process_nodes: Vec<ProcessNode> = processes
+            .iter()
+            .map(|p| ProcessNode {
+                id: p.id.clone(),
+                label: p.label.clone(),
+                process_type: p.process_type.to_string(),
+                step_count: p.steps.len() as u32,
+                entry_point_id: p.entry_point_id.clone(),
+                terminal_id: p.terminal_id.clone(),
+                communities: p.communities.iter().copied().collect(),
+                project_id: Some(project_id),
+            })
+            .collect();
+
+        self.store.batch_upsert_processes(&process_nodes).await?;
+
+        // 5. Create STEP_IN_PROCESS relationships
+        let step_rels: Vec<(String, String, u32)> = processes
+            .iter()
+            .flat_map(|p| {
+                p.steps
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, step_id)| (p.id.clone(), step_id.clone(), (i + 1) as u32))
+            })
+            .collect();
+
+        self.store
+            .batch_create_step_relationships(&step_rels)
+            .await?;
+
+        tracing::info!(
+            project_id = %project_id,
+            count = processes.len(),
+            "Process detection complete"
+        );
+
+        Ok(processes)
     }
 }
 

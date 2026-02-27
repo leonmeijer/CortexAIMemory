@@ -131,6 +131,36 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
     let docstring = get_kdoc(node, source);
     let generics = extract_kotlin_type_params(node, source);
 
+    // Extract supertypes from delegation_specifiers (class Foo : Bar(), Baz)
+    // First is parent class, rest are interfaces
+    let supertypes: Vec<String> = node
+        .children(&mut node.walk())
+        .find(|c| c.kind() == "delegation_specifiers")
+        .map(|specs| {
+            specs
+                .children(&mut specs.walk())
+                .filter(|c| {
+                    matches!(
+                        c.kind(),
+                        "delegation_specifier"
+                            | "user_type"
+                            | "constructor_invocation"
+                            | "explicit_delegation"
+                    )
+                })
+                .filter_map(|c| {
+                    // Get the type name, stripping constructor call parens and generics
+                    get_text(&c, source)
+                        .map(|s| s.split(['(', '<']).next().unwrap_or(s).trim().to_string())
+                })
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let parent_class = supertypes.first().cloned();
+    let interfaces: Vec<String> = supertypes.into_iter().skip(1).collect();
+
     Some(StructNode {
         name,
         visibility,
@@ -139,6 +169,8 @@ fn extract_class(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opt
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        parent_class,
+        interfaces,
     })
 }
 
@@ -174,6 +206,8 @@ fn extract_object(node: &tree_sitter::Node, source: &str, file_path: &str) -> Op
         line_start: node.start_position().row as u32 + 1,
         line_end: node.end_position().row as u32 + 1,
         docstring,
+        parent_class: None,
+        interfaces: vec![],
     })
 }
 
@@ -205,11 +239,21 @@ fn extract_enum(node: &tree_sitter::Node, source: &str, file_path: &str) -> Opti
 
 fn extract_import(node: &tree_sitter::Node, source: &str, file_path: &str) -> Option<ImportNode> {
     let text = get_text(node, source)?;
-    let path = text.trim_start_matches("import ").trim().to_string();
+    let raw = text.trim_start_matches("import ").trim();
+
+    if raw.is_empty() {
+        return None;
+    }
+
+    let (path, alias) = if let Some((p, a)) = raw.split_once(" as ") {
+        (p.trim().to_string(), Some(a.trim().to_string()))
+    } else {
+        (raw.to_string(), None)
+    };
 
     Some(ImportNode {
         path,
-        alias: None,
+        alias,
         items: vec![],
         file_path: file_path.to_string(),
         line: node.start_position().row as u32 + 1,

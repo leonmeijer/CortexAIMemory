@@ -524,6 +524,41 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(code_handlers::get_risk_assessment),
         )
         // ================================================================
+        // Heritage Navigation
+        // ================================================================
+        .route(
+            "/api/code/class-hierarchy",
+            get(code_handlers::get_class_hierarchy),
+        )
+        .route("/api/code/subclasses", get(code_handlers::find_subclasses))
+        .route(
+            "/api/code/interface-implementors",
+            get(code_handlers::find_interface_implementors),
+        )
+        // ================================================================
+        // Process Detection & Navigation
+        // ================================================================
+        .route(
+            "/api/code/processes/detect",
+            post(code_handlers::detect_processes),
+        )
+        .route("/api/code/processes", get(code_handlers::list_processes))
+        .route(
+            "/api/code/processes/detail",
+            get(code_handlers::get_process_detail),
+        )
+        .route(
+            "/api/code/entry-points",
+            get(code_handlers::get_entry_points),
+        )
+        // ================================================================
+        // Community Enrichment
+        // ================================================================
+        .route(
+            "/api/code/communities/enrich",
+            post(code_handlers::enrich_communities),
+        )
+        // ================================================================
         // Implementation Planner
         // ================================================================
         .route(
@@ -677,6 +712,14 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/admin/cleanup-cross-project-calls",
             post(handlers::cleanup_cross_project_calls),
+        )
+        .route(
+            "/api/admin/cleanup-builtin-calls",
+            post(handlers::cleanup_builtin_calls),
+        )
+        .route(
+            "/api/admin/migrate-calls-confidence",
+            post(handlers::migrate_calls_confidence),
         )
         .route(
             "/api/admin/cleanup-sync-data",

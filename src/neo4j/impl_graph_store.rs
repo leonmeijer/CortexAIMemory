@@ -402,7 +402,7 @@ impl GraphStore for Neo4jClient {
         &self,
         project_id: Uuid,
         valid_paths: &[String],
-    ) -> anyhow::Result<(usize, usize)> {
+    ) -> anyhow::Result<(usize, usize, Vec<String>)> {
         self.delete_stale_files(project_id, valid_paths).await
     }
 
@@ -412,6 +412,10 @@ impl GraphStore for Neo4jClient {
 
     async fn upsert_file(&self, file: &FileNode) -> anyhow::Result<()> {
         self.upsert_file(file).await
+    }
+
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> anyhow::Result<()> {
+        self.batch_upsert_files(files).await
     }
 
     async fn get_file(&self, path: &str) -> anyhow::Result<Option<FileNode>> {
@@ -483,8 +487,10 @@ impl GraphStore for Neo4jClient {
         caller_id: &str,
         callee_name: &str,
         project_id: Option<Uuid>,
+        confidence: f64,
+        reason: &str,
     ) -> anyhow::Result<()> {
-        self.create_call_relationship(caller_id, callee_name, project_id)
+        self.create_call_relationship(caller_id, callee_name, project_id, confidence, reason)
             .await
     }
 
@@ -540,8 +546,30 @@ impl GraphStore for Neo4jClient {
             .await
     }
 
+    async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_extends_relationships(rels).await
+    }
+
+    async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_implements_relationships(rels).await
+    }
+
     async fn cleanup_cross_project_calls(&self) -> anyhow::Result<i64> {
         self.cleanup_cross_project_calls().await
+    }
+
+    async fn cleanup_builtin_calls(&self) -> anyhow::Result<i64> {
+        self.cleanup_builtin_calls().await
+    }
+
+    async fn migrate_calls_confidence(&self) -> anyhow::Result<i64> {
+        self.migrate_calls_confidence().await
     }
 
     async fn cleanup_sync_data(&self) -> anyhow::Result<i64> {
@@ -575,6 +603,55 @@ impl GraphStore for Neo4jClient {
 
     async fn get_impl_blocks(&self, type_name: &str) -> anyhow::Result<Vec<serde_json::Value>> {
         self.get_impl_blocks(type_name).await
+    }
+
+    // ========================================================================
+    // Heritage navigation queries
+    // ========================================================================
+
+    async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        max_depth: u32,
+    ) -> anyhow::Result<serde_json::Value> {
+        self.get_class_hierarchy(type_name, max_depth).await
+    }
+
+    async fn find_subclasses(&self, class_name: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.find_subclasses(class_name).await
+    }
+
+    async fn find_interface_implementors(
+        &self,
+        interface_name: &str,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.find_interface_implementors(interface_name).await
+    }
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    async fn list_processes(
+        &self,
+        project_id: uuid::Uuid,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.list_processes(project_id).await
+    }
+
+    async fn get_process_detail(
+        &self,
+        process_id: &str,
+    ) -> anyhow::Result<Option<serde_json::Value>> {
+        self.get_process_detail(process_id).await
+    }
+
+    async fn get_entry_points(
+        &self,
+        project_id: uuid::Uuid,
+        limit: usize,
+    ) -> anyhow::Result<Vec<serde_json::Value>> {
+        self.get_entry_points(project_id, limit).await
     }
 
     // ========================================================================
@@ -630,6 +707,24 @@ impl GraphStore for Neo4jClient {
         project_id: Option<Uuid>,
     ) -> anyhow::Result<Vec<String>> {
         self.get_function_callees_by_name(function_name, depth, project_id)
+            .await
+    }
+
+    async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<(String, String, f64, String)>> {
+        self.get_callers_with_confidence(function_name, project_id)
+            .await
+    }
+
+    async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> anyhow::Result<Vec<(String, String, f64, String)>> {
+        self.get_callees_with_confidence(function_name, project_id)
             .await
     }
 
@@ -2060,6 +2155,20 @@ impl GraphStore for Neo4jClient {
         self.get_project_call_edges(project_id).await
     }
 
+    async fn get_project_extends_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.get_project_extends_edges(project_id).await
+    }
+
+    async fn get_project_implements_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        self.get_project_implements_edges(project_id).await
+    }
+
     async fn batch_update_file_analytics(
         &self,
         updates: &[crate::graph::models::FileAnalyticsUpdate],
@@ -2158,6 +2267,21 @@ impl GraphStore for Neo4jClient {
 
     async fn get_risk_summary(&self, project_id: Uuid) -> anyhow::Result<serde_json::Value> {
         self.get_risk_summary(project_id).await
+    }
+
+    async fn batch_upsert_processes(&self, processes: &[ProcessNode]) -> anyhow::Result<()> {
+        self.batch_upsert_processes(processes).await
+    }
+
+    async fn batch_create_step_relationships(
+        &self,
+        steps: &[(String, String, u32)],
+    ) -> anyhow::Result<()> {
+        self.batch_create_step_relationships(steps).await
+    }
+
+    async fn delete_project_processes(&self, project_id: Uuid) -> anyhow::Result<u64> {
+        self.delete_project_processes(project_id).await
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {

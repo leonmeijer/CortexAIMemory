@@ -80,6 +80,10 @@ pub enum CodeEdgeType {
     Affects,
     /// Neural synapse — weighted connection between notes (Knowledge Fabric P3)
     Synapse,
+    /// Class inheritance — child class extends parent class (Heritage Plan 5)
+    Extends,
+    /// Interface implementation — class implements interface/protocol (Heritage Plan 5)
+    Implements,
 }
 
 impl std::fmt::Display for CodeEdgeType {
@@ -95,6 +99,8 @@ impl std::fmt::Display for CodeEdgeType {
             Self::Discussed => write!(f, "DISCUSSED"),
             Self::Affects => write!(f, "AFFECTS"),
             Self::Synapse => write!(f, "SYNAPSE"),
+            Self::Extends => write!(f, "EXTENDS"),
+            Self::Implements => write!(f, "IMPLEMENTS"),
         }
     }
 }
@@ -252,6 +258,13 @@ pub struct CommunityInfo {
     pub members: Vec<String>,
     /// Auto-generated label (e.g. top file or function names)
     pub label: String,
+    /// Cohesion ratio: internal_edges / (internal_edges + external_edges).
+    /// 1.0 = perfectly isolated community, 0.0 = no internal edges.
+    #[serde(default)]
+    pub cohesion: f64,
+    /// How the label was generated: "heuristic" (path prefix) or "llm" (LLM-enriched).
+    #[serde(default)]
+    pub enriched_by: Option<String>,
 }
 
 /// Metadata about a weakly connected component.
@@ -372,6 +385,38 @@ pub struct FunctionAnalyticsUpdate {
 // Configuration
 // ============================================================================
 
+/// Configuration for large-graph adaptive mode in Louvain community detection.
+///
+/// When enabled AND the graph exceeds `max_nodes_full` nodes, the algorithm
+/// applies optimizations:
+/// - **Edge filtering**: edges with weight < `min_confidence` are excluded
+/// - **Degree-1 pre-assignment**: leaf nodes are assigned to their sole neighbor's
+///   community without participating in Louvain iterations
+/// - **Timeout**: the iterative loop aborts after `max_duration_ms` and returns
+///   a partial (but valid) result
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LargeGraphConfig {
+    /// Node count threshold to activate large-graph mode (default: 10_000)
+    pub max_nodes_full: usize,
+    /// Minimum edge weight to keep in the adjacency list (default: 0.5)
+    pub min_confidence: f64,
+    /// Pre-assign degree-1 nodes to their neighbor's community (default: true)
+    pub skip_degree_one: bool,
+    /// Maximum wall-clock time for the Louvain loop in ms (default: 60_000)
+    pub max_duration_ms: u64,
+}
+
+impl Default for LargeGraphConfig {
+    fn default() -> Self {
+        Self {
+            max_nodes_full: 10_000,
+            min_confidence: 0.5,
+            skip_degree_one: true,
+            max_duration_ms: 60_000,
+        }
+    }
+}
+
 /// Tuning parameters for graph analytics algorithms.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalyticsConfig {
@@ -387,6 +432,9 @@ pub struct AnalyticsConfig {
     pub louvain_max_iterations: usize,
     /// Percentile threshold for "god function" detection (default: 0.95)
     pub god_function_percentile: f64,
+    /// Optional large-graph mode for Louvain (None = classic mode, Some = adaptive)
+    #[serde(default)]
+    pub large_graph: Option<LargeGraphConfig>,
 }
 
 impl Default for AnalyticsConfig {
@@ -398,6 +446,7 @@ impl Default for AnalyticsConfig {
             louvain_resolution: 1.0,
             louvain_max_iterations: 100,
             god_function_percentile: 0.95,
+            large_graph: None,
         }
     }
 }
@@ -450,6 +499,10 @@ pub struct FabricWeights {
     pub synapse: f64,
     /// Weight for DEFINES/CONTAINS edges (structural, default: 1.0)
     pub defines: f64,
+    /// Weight for EXTENDS edges (class inheritance, default: 0.95)
+    pub extends: f64,
+    /// Weight for IMPLEMENTS edges (interface implementation, default: 0.85)
+    pub implements: f64,
     /// Minimum CO_CHANGED count to include an edge (filters noise)
     pub co_changed_min_count: i64,
 }
@@ -465,6 +518,8 @@ impl Default for FabricWeights {
             discussed: 0.3,
             synapse: 0.6,
             defines: 1.0,
+            extends: 0.95,
+            implements: 0.85,
             co_changed_min_count: 2,
         }
     }
@@ -554,6 +609,8 @@ mod tests {
         assert_eq!(CodeEdgeType::Discussed.to_string(), "DISCUSSED");
         assert_eq!(CodeEdgeType::Affects.to_string(), "AFFECTS");
         assert_eq!(CodeEdgeType::Synapse.to_string(), "SYNAPSE");
+        assert_eq!(CodeEdgeType::Extends.to_string(), "EXTENDS");
+        assert_eq!(CodeEdgeType::Implements.to_string(), "IMPLEMENTS");
     }
 
     #[test]
@@ -567,6 +624,8 @@ mod tests {
         assert!((w.discussed - 0.3).abs() < f64::EPSILON);
         assert!((w.synapse - 0.6).abs() < f64::EPSILON);
         assert!((w.defines - 1.0).abs() < f64::EPSILON);
+        assert!((w.extends - 0.95).abs() < f64::EPSILON);
+        assert!((w.implements - 0.85).abs() < f64::EPSILON);
         assert_eq!(w.co_changed_min_count, 2);
     }
 

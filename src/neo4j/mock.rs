@@ -1150,9 +1150,44 @@ impl GraphStore for MockGraphStore {
         for paths in pf.values_mut() {
             paths.retain(|p| p != path);
         }
-        // Remove symbols linked to this file
+        // Remove symbols linked to this file (mirrors DETACH DELETE in Neo4j)
         self.file_symbols.write().await.remove(path);
         self.import_relationships.write().await.remove(path);
+        // Remove all entities whose file_path matches (DETACH DELETE cascade)
+        self.functions
+            .write()
+            .await
+            .retain(|_, f| f.file_path != path);
+        self.structs_map
+            .write()
+            .await
+            .retain(|_, s| s.file_path != path);
+        self.traits_map
+            .write()
+            .await
+            .retain(|_, t| t.file_path != path);
+        self.enums_map
+            .write()
+            .await
+            .retain(|_, e| e.file_path != path);
+        self.impls_map
+            .write()
+            .await
+            .retain(|_, i| i.file_path != path);
+        self.imports
+            .write()
+            .await
+            .retain(|_, i| i.file_path != path);
+        // Remove call relationships from deleted functions
+        {
+            let funcs = self.functions.read().await;
+            let valid_ids: std::collections::HashSet<&str> =
+                funcs.keys().map(|s| s.as_str()).collect();
+            self.call_relationships
+                .write()
+                .await
+                .retain(|caller, _| valid_ids.contains(caller.as_str()));
+        }
         Ok(())
     }
 
@@ -1160,7 +1195,7 @@ impl GraphStore for MockGraphStore {
         &self,
         project_id: Uuid,
         valid_paths: &[String],
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, usize, Vec<String>)> {
         let current_paths = self
             .project_files
             .read()
@@ -1170,19 +1205,21 @@ impl GraphStore for MockGraphStore {
             .unwrap_or_default();
         let mut files_deleted = 0usize;
         let mut symbols_deleted = 0usize;
+        let mut deleted_paths = Vec::new();
         for path in &current_paths {
             if !valid_paths.contains(path) {
                 self.files.write().await.remove(path);
                 if let Some(syms) = self.file_symbols.write().await.remove(path) {
                     symbols_deleted += syms.len();
                 }
+                deleted_paths.push(path.clone());
                 files_deleted += 1;
             }
         }
         if let Some(paths) = self.project_files.write().await.get_mut(&project_id) {
             paths.retain(|p| valid_paths.contains(p));
         }
-        Ok((files_deleted, symbols_deleted))
+        Ok((files_deleted, symbols_deleted, deleted_paths))
     }
 
     async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()> {
@@ -1200,6 +1237,14 @@ impl GraphStore for MockGraphStore {
             .write()
             .await
             .insert(file.path.clone(), file.clone());
+        Ok(())
+    }
+
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()> {
+        let mut store = self.files.write().await;
+        for file in files {
+            store.insert(file.path.clone(), file.clone());
+        }
         Ok(())
     }
 
@@ -1332,6 +1377,8 @@ impl GraphStore for MockGraphStore {
         caller_id: &str,
         callee_name: &str,
         project_id: Option<Uuid>,
+        _confidence: f64,
+        _reason: &str,
     ) -> Result<()> {
         // When project_id is provided, only create the relationship if the callee
         // belongs to a file in the same project (mirrors the Cypher join via File→Project)
@@ -1438,8 +1485,40 @@ impl GraphStore for MockGraphStore {
         project_id: Option<Uuid>,
     ) -> Result<()> {
         for call in calls {
-            self.create_call_relationship(&call.caller_id, &call.callee_name, project_id)
-                .await?;
+            self.create_call_relationship(
+                &call.caller_id,
+                &call.callee_name,
+                project_id,
+                call.confidence,
+                &call.reason,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()> {
+        let mut cr = self.call_relationships.write().await;
+        for (child_name, _child_file, parent_name, _pid) in rels {
+            cr.entry(format!("extends:{}", child_name))
+                .or_default()
+                .push(parent_name.clone());
+        }
+        Ok(())
+    }
+
+    async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()> {
+        let mut cr = self.call_relationships.write().await;
+        for (struct_name, _struct_file, iface_name, _pid) in rels {
+            cr.entry(format!("implements:{}", struct_name))
+                .or_default()
+                .push(iface_name.clone());
         }
         Ok(())
     }
@@ -1506,8 +1585,30 @@ impl GraphStore for MockGraphStore {
         Ok(deleted)
     }
 
+    async fn cleanup_builtin_calls(&self) -> Result<i64> {
+        use crate::parser::noise_filter;
+
+        let builtins = noise_filter::builtin_names();
+        let mut cr = self.call_relationships.write().await;
+        let mut deleted = 0i64;
+
+        for (_caller_id, callees) in cr.iter_mut() {
+            let before = callees.len();
+            callees.retain(|callee_name| !builtins.contains(callee_name.as_str()));
+            deleted += (before - callees.len()) as i64;
+        }
+
+        Ok(deleted)
+    }
+
+    async fn migrate_calls_confidence(&self) -> Result<i64> {
+        // Mock: no-op, confidence is always set at creation time in tests
+        Ok(0)
+    }
+
     async fn cleanup_sync_data(&self) -> Result<i64> {
         let mut total = 0i64;
+        total += self.files.write().await.drain().count() as i64;
         total += self.functions.write().await.drain().count() as i64;
         total += self.structs_map.write().await.drain().count() as i64;
         total += self.traits_map.write().await.drain().count() as i64;
@@ -1583,6 +1684,53 @@ impl GraphStore for MockGraphStore {
             }
         }
         Ok(result)
+    }
+
+    // ========================================================================
+    // Heritage navigation queries
+    // ========================================================================
+
+    async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        _max_depth: u32,
+    ) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "type_name": type_name,
+            "parents": [],
+            "children": [],
+        }))
+    }
+
+    async fn find_subclasses(&self, _class_name: &str) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn find_interface_implementors(
+        &self,
+        _interface_name: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    async fn list_processes(&self, _project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_process_detail(&self, _process_id: &str) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+
+    async fn get_entry_points(
+        &self,
+        _project_id: uuid::Uuid,
+        _limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        Ok(Vec::new())
     }
 
     // ========================================================================
@@ -1816,6 +1964,47 @@ impl GraphStore for MockGraphStore {
             }
         }
         Ok(callees_result)
+    }
+
+    async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        _project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        // Mock: return callers with default confidence
+        let cr = self.call_relationships.read().await;
+        let mut result = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            if callees.iter().any(|c| c == function_name) {
+                let file = caller_id.rsplitn(3, ':').last().unwrap_or(caller_id);
+                result.push((
+                    caller_id.clone(),
+                    file.to_string(),
+                    0.50,
+                    "unscored".to_string(),
+                ));
+            }
+        }
+        Ok(result)
+    }
+
+    async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        _project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>> {
+        let cr = self.call_relationships.read().await;
+        let mut result = Vec::new();
+        for (caller_id, callees) in cr.iter() {
+            if caller_id.ends_with(&format!("::{}", function_name))
+                || caller_id.ends_with(&format!(":{}", function_name))
+            {
+                for callee in callees {
+                    result.push((callee.clone(), String::new(), 0.50, "unscored".to_string()));
+                }
+            }
+        }
+        Ok(result)
     }
 
     async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>> {
@@ -6350,6 +6539,98 @@ impl GraphStore for MockGraphStore {
         Ok(edges)
     }
 
+    async fn get_project_extends_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cr = self.call_relationships.read().await;
+        let structs = self.structs_map.read().await;
+        let mut edges = Vec::new();
+
+        for (key, parents) in cr.iter() {
+            if let Some(child_name) = key.strip_prefix("extends:") {
+                // Find the child struct's file
+                if let Some(child_struct) = structs
+                    .values()
+                    .find(|s| s.name == child_name && project_paths.contains(&s.file_path))
+                {
+                    for parent_name in parents {
+                        // Find the parent struct's file
+                        if let Some(parent_struct) = structs.values().find(|s| {
+                            s.name == *parent_name && project_paths.contains(&s.file_path)
+                        }) {
+                            if child_struct.file_path != parent_struct.file_path {
+                                edges.push((
+                                    child_struct.file_path.clone(),
+                                    parent_struct.file_path.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
+    async fn get_project_implements_edges(
+        &self,
+        project_id: Uuid,
+    ) -> anyhow::Result<Vec<(String, String)>> {
+        let pf = self.project_files.read().await;
+        let project_paths: std::collections::HashSet<&String> = pf
+            .get(&project_id)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+
+        if project_paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let cr = self.call_relationships.read().await;
+        let structs = self.structs_map.read().await;
+        let traits = self.traits_map.read().await;
+        let mut edges = Vec::new();
+
+        for (key, ifaces) in cr.iter() {
+            if let Some(struct_name) = key.strip_prefix("implements:") {
+                // Find the struct's file
+                if let Some(struct_node) = structs
+                    .values()
+                    .find(|s| s.name == struct_name && project_paths.contains(&s.file_path))
+                {
+                    for iface_name in ifaces {
+                        // Find the trait's file
+                        if let Some(trait_node) = traits
+                            .values()
+                            .find(|t| t.name == *iface_name && project_paths.contains(&t.file_path))
+                        {
+                            if struct_node.file_path != trait_node.file_path {
+                                edges.push((
+                                    struct_node.file_path.clone(),
+                                    trait_node.file_path.clone(),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(edges)
+    }
+
     async fn batch_update_file_analytics(
         &self,
         updates: &[crate::graph::models::FileAnalyticsUpdate],
@@ -6463,6 +6744,22 @@ impl GraphStore for MockGraphStore {
 
     async fn get_risk_summary(&self, _project_id: Uuid) -> anyhow::Result<serde_json::Value> {
         Ok(serde_json::json!(null))
+    }
+
+    async fn batch_upsert_processes(&self, _processes: &[ProcessNode]) -> anyhow::Result<()> {
+        // No-op in mock — process persistence is tested via integration tests
+        Ok(())
+    }
+
+    async fn batch_create_step_relationships(
+        &self,
+        _steps: &[(String, String, u32)],
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn delete_project_processes(&self, _project_id: Uuid) -> anyhow::Result<u64> {
+        Ok(0)
     }
 
     async fn health_check(&self) -> anyhow::Result<bool> {
@@ -6986,7 +7283,13 @@ mod tests {
 
         // Create a call: main -> helper
         store
-            .create_call_relationship("src/main.rs::main", "helper", Some(project.id))
+            .create_call_relationship(
+                "src/main.rs::main",
+                "helper",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7016,7 +7319,13 @@ mod tests {
 
         // Try to create a call from project_a::process -> transform (which only exists in project_b)
         store
-            .create_call_relationship("a/src/main.rs::process", "transform", Some(project_a.id))
+            .create_call_relationship(
+                "a/src/main.rs::process",
+                "transform",
+                Some(project_a.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7039,7 +7348,13 @@ mod tests {
 
         // Without project_id (None), cross-project call is allowed (backward compat)
         store
-            .create_call_relationship("a/src/main.rs::process", "transform", None)
+            .create_call_relationship(
+                "a/src/main.rs::process",
+                "transform",
+                None,
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7060,11 +7375,23 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("src/lib.rs::caller_a", "target", Some(project.id))
+            .create_call_relationship(
+                "src/lib.rs::caller_a",
+                "target",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
         store
-            .create_call_relationship("src/lib.rs::caller_b", "target", Some(project.id))
+            .create_call_relationship(
+                "src/lib.rs::caller_b",
+                "target",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7100,11 +7427,11 @@ mod tests {
 
         // Both call "target" but via None (unscoped create)
         store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7144,11 +7471,11 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7188,11 +7515,11 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("a/src/lib.rs::process", "helper", None)
+            .create_call_relationship("a/src/lib.rs::process", "helper", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::process", "other", None)
+            .create_call_relationship("b/src/lib.rs::process", "other", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7232,15 +7559,15 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::caller_b1", "target", None)
+            .create_call_relationship("b/src/lib.rs::caller_b1", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::caller_b2", "target", None)
+            .create_call_relationship("b/src/lib.rs::caller_b2", "target", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7273,7 +7600,13 @@ mod tests {
         seed_project(&store, &project, &[("src/lib.rs", &["caller", "target"])]).await;
 
         store
-            .create_call_relationship("src/lib.rs::caller", "target", Some(project.id))
+            .create_call_relationship(
+                "src/lib.rs::caller",
+                "target",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7307,11 +7640,11 @@ mod tests {
         .await;
 
         store
-            .create_call_relationship("a/src/lib.rs::caller_a", "target", None)
+            .create_call_relationship("a/src/lib.rs::caller_a", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/lib.rs::caller_b", "target", None)
+            .create_call_relationship("b/src/lib.rs::caller_b", "target", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -7358,6 +7691,8 @@ mod tests {
                 "a/src/handler.rs::handle_request",
                 "validate",
                 Some(project_a.id),
+                0.50,
+                "unscored",
             )
             .await
             .unwrap();
@@ -7368,6 +7703,8 @@ mod tests {
                 "b/src/handler.rs::handle_request",
                 "validate",
                 Some(project_b.id),
+                0.50,
+                "unscored",
             )
             .await
             .unwrap();
@@ -7548,7 +7885,13 @@ mod tests {
 
         // service.rs::do_work calls lib.rs::execute (CALLS axis)
         store
-            .create_call_relationship("src/service.rs::do_work", "execute", Some(project.id))
+            .create_call_relationship(
+                "src/service.rs::do_work",
+                "execute",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7577,7 +7920,13 @@ mod tests {
         seed_project(&store, &project, &[("src/lib.rs", &["fn_a", "fn_b"])]).await;
 
         store
-            .create_call_relationship("src/lib.rs::fn_a", "fn_b", Some(project.id))
+            .create_call_relationship(
+                "src/lib.rs::fn_a",
+                "fn_b",
+                Some(project.id),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7611,11 +7960,17 @@ mod tests {
 
         // Both projects' functions call target in project_a
         store
-            .create_call_relationship("a/src/caller.rs::call_it", "target", None)
+            .create_call_relationship("a/src/caller.rs::call_it", "target", None, 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("b/src/caller.rs::call_it_b", "target", None)
+            .create_call_relationship(
+                "b/src/caller.rs::call_it_b",
+                "target",
+                None,
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -7648,6 +8003,8 @@ mod tests {
             line_start: 1,
             line_end: 10,
             docstring: None,
+            parent_class: None,
+            interfaces: vec![],
         }
     }
 
@@ -7888,7 +8245,13 @@ mod tests {
         let callee_func = make_function("process_data", "src/processor.rs", 1);
         store.upsert_function(&callee_func).await.unwrap();
         store
-            .create_call_relationship("handle_request", "process_data", Some(pid))
+            .create_call_relationship(
+                "handle_request",
+                "process_data",
+                Some(pid),
+                0.50,
+                "unscored",
+            )
             .await
             .unwrap();
 
@@ -8105,11 +8468,11 @@ mod tests {
 
         // Chain: entry_fn → direct_fn → transitive_fn
         store
-            .create_call_relationship("entry_fn", "direct_fn", Some(pid))
+            .create_call_relationship("entry_fn", "direct_fn", Some(pid), 0.50, "unscored")
             .await
             .unwrap();
         store
-            .create_call_relationship("direct_fn", "transitive_fn", Some(pid))
+            .create_call_relationship("direct_fn", "transitive_fn", Some(pid), 0.50, "unscored")
             .await
             .unwrap();
 
@@ -8534,7 +8897,7 @@ mod tests {
 
         // entry_fn calls helper_fn (call graph link)
         store
-            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None)
+            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -8764,7 +9127,7 @@ mod tests {
 
         // entry_fn calls helper_fn
         store
-            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None)
+            .create_call_relationship("src/main.rs::entry_fn", "helper_fn", None, 0.50, "unscored")
             .await
             .unwrap();
 
@@ -9001,6 +9364,8 @@ mod tests {
             line_start: 1,
             line_end: 10,
             docstring: None,
+            parent_class: None,
+            interfaces: vec![],
         }
     }
 
@@ -9158,11 +9523,15 @@ mod tests {
                 caller_id: "src/lib.rs:foo:1".to_string(),
                 callee_name: "bar".to_string(),
                 line: 5,
+                confidence: 0.85,
+                reason: "same-file".to_string(),
             },
             crate::parser::FunctionCall {
                 caller_id: "src/lib.rs:foo:1".to_string(),
                 callee_name: "baz".to_string(),
                 line: 6,
+                confidence: 0.50,
+                reason: "fuzzy-unique".to_string(),
             },
         ];
 
@@ -9346,6 +9715,102 @@ mod tests {
         assert_eq!(
             count, 2,
             "Should count Draft + InProgress, exclude Completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_builtin_calls() {
+        let store = MockGraphStore::new();
+        let project = test_project();
+        store.create_project(&project).await.unwrap();
+
+        // Create caller and callee functions
+        let caller = FunctionNode {
+            name: "process".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 1,
+            line_end: 10,
+            docstring: None,
+        };
+        store.upsert_function(&caller).await.unwrap();
+
+        let real_callee = FunctionNode {
+            name: "transform_data".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 12,
+            line_end: 20,
+            docstring: None,
+        };
+        store.upsert_function(&real_callee).await.unwrap();
+
+        let builtin_callee = FunctionNode {
+            name: "println".to_string(),
+            visibility: Visibility::Public,
+            params: vec![],
+            return_type: None,
+            generics: vec![],
+            is_async: false,
+            is_unsafe: false,
+            complexity: 1,
+            file_path: "src/main.rs".to_string(),
+            line_start: 22,
+            line_end: 24,
+            docstring: None,
+        };
+        store.upsert_function(&builtin_callee).await.unwrap();
+
+        // Create CALLS: process -> transform_data (real) and process -> println (built-in)
+        // Use None for project_id to skip project-file scoping in mock
+        store
+            .create_call_relationship(
+                "src/main.rs::process",
+                "transform_data",
+                None,
+                0.50,
+                "unscored",
+            )
+            .await
+            .unwrap();
+        store
+            .create_call_relationship("src/main.rs::process", "println", None, 0.50, "unscored")
+            .await
+            .unwrap();
+
+        // Verify both calls exist
+        let cr = store.call_relationships.read().await;
+        let calls = cr.get("src/main.rs::process").unwrap();
+        assert_eq!(calls.len(), 2, "Should have 2 calls before cleanup");
+        drop(cr);
+
+        // Run cleanup
+        let deleted = store.cleanup_builtin_calls().await.unwrap();
+        assert_eq!(deleted, 1, "Should delete 1 built-in call (println)");
+
+        // Verify only real call remains
+        let cr = store.call_relationships.read().await;
+        let calls = cr.get("src/main.rs::process").unwrap();
+        assert_eq!(calls.len(), 1, "Should have 1 call after cleanup");
+        assert!(
+            calls.contains(&"transform_data".to_string()),
+            "Should keep real call 'transform_data'"
+        );
+        assert!(
+            !calls.contains(&"println".to_string()),
+            "Should remove built-in call 'println'"
         );
     }
 }

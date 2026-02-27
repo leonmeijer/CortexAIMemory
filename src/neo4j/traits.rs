@@ -308,19 +308,22 @@ pub trait GraphStore: Send + Sync {
     /// Delete a file and all its symbols
     async fn delete_file(&self, path: &str) -> Result<()>;
 
-    /// Delete files that are no longer on the filesystem
-    /// Returns the number of files and symbols deleted
+    /// Delete files that are no longer on the filesystem.
+    /// Returns `(files_deleted, symbols_deleted, deleted_paths)`.
     async fn delete_stale_files(
         &self,
         project_id: Uuid,
         valid_paths: &[String],
-    ) -> Result<(usize, usize)>;
+    ) -> Result<(usize, usize, Vec<String>)>;
 
     /// Link a file to a project (create CONTAINS relationship)
     async fn link_file_to_project(&self, file_path: &str, project_id: Uuid) -> Result<()>;
 
     /// Create or update a file node
     async fn upsert_file(&self, file: &FileNode) -> Result<()>;
+
+    /// Batch create or update file nodes (UNWIND)
+    async fn batch_upsert_files(&self, files: &[FileNode]) -> Result<()>;
 
     /// Get a file by path
     async fn get_file(&self, path: &str) -> Result<Option<FileNode>>;
@@ -375,11 +378,14 @@ pub trait GraphStore: Send + Sync {
     /// Create a CALLS relationship between functions, scoped to the same project.
     /// When project_id is provided, the callee is matched only within the same project
     /// to prevent cross-project CALLS pollution.
+    /// Sets `confidence` (0.0-1.0) and `reason` properties on the CALLS relationship.
     async fn create_call_relationship(
         &self,
         caller_id: &str,
         callee_name: &str,
         project_id: Option<Uuid>,
+        confidence: f64,
+        reason: &str,
     ) -> Result<()>;
 
     // ========================================================================
@@ -423,9 +429,32 @@ pub trait GraphStore: Send + Sync {
         project_id: Option<Uuid>,
     ) -> Result<()>;
 
+    /// Batch create EXTENDS relationships (class inheritance) using UNWIND.
+    /// Takes (child_name, child_file_path, parent_name, project_id) tuples.
+    /// Phase 1: same-file match. Phase 2: project-scoped fallback.
+    async fn batch_create_extends_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()>;
+
+    /// Batch create IMPLEMENTS relationships (interface/protocol implementation) using UNWIND.
+    /// Takes (struct_name, struct_file_path, interface_name, project_id) tuples.
+    async fn batch_create_implements_relationships(
+        &self,
+        rels: &[(String, String, String, String)],
+    ) -> Result<()>;
+
     /// Delete all CALLS relationships where caller and callee belong to different projects.
     /// Returns the number of deleted relationships.
     async fn cleanup_cross_project_calls(&self) -> Result<i64>;
+
+    /// Delete all CALLS relationships where the callee function name is a known built-in.
+    /// Returns the number of deleted relationships.
+    async fn cleanup_builtin_calls(&self) -> Result<i64>;
+
+    /// Migrate existing CALLS: set default confidence=0.50 and reason='fuzzy-global'
+    /// for relationships missing these properties.
+    async fn migrate_calls_confidence(&self) -> Result<i64>;
 
     /// Clean up ALL sync-generated data (File, Function, Struct, Trait, Enum, Impl, Import, FeatureGraph).
     /// Returns the total number of deleted entities/relationships.
@@ -446,6 +475,43 @@ pub trait GraphStore: Send + Sync {
 
     /// Get all impl blocks for a type
     async fn get_impl_blocks(&self, type_name: &str) -> Result<Vec<serde_json::Value>>;
+
+    // ========================================================================
+    // Heritage navigation queries (EXTENDS + IMPLEMENTS)
+    // ========================================================================
+
+    /// Get the full class hierarchy (parents + children) for a type
+    async fn get_class_hierarchy(
+        &self,
+        type_name: &str,
+        max_depth: u32,
+    ) -> Result<serde_json::Value>;
+
+    /// Find all subclasses of a given class (via EXTENDS)
+    async fn find_subclasses(&self, class_name: &str) -> Result<Vec<serde_json::Value>>;
+
+    /// Find all classes that implement a given interface (via IMPLEMENTS)
+    async fn find_interface_implementors(
+        &self,
+        interface_name: &str,
+    ) -> Result<Vec<serde_json::Value>>;
+
+    // ========================================================================
+    // Process queries
+    // ========================================================================
+
+    /// List all detected processes for a project
+    async fn list_processes(&self, project_id: uuid::Uuid) -> Result<Vec<serde_json::Value>>;
+
+    /// Get details of a specific process including ordered steps
+    async fn get_process_detail(&self, process_id: &str) -> Result<Option<serde_json::Value>>;
+
+    /// Get scored entry points for a project
+    async fn get_entry_points(
+        &self,
+        project_id: uuid::Uuid,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>>;
 
     // ========================================================================
     // Code exploration queries
@@ -492,6 +558,21 @@ pub trait GraphStore: Send + Sync {
         depth: u32,
         project_id: Option<Uuid>,
     ) -> Result<Vec<String>>;
+
+    /// Get direct callers with confidence scores (depth 1 only).
+    /// Returns (name, file_path, confidence, reason) tuples.
+    async fn get_callers_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>>;
+
+    /// Get direct callees with confidence scores (depth 1 only).
+    async fn get_callees_with_confidence(
+        &self,
+        function_name: &str,
+        project_id: Option<Uuid>,
+    ) -> Result<Vec<(String, String, f64, String)>>;
 
     /// Get language statistics across all files
     async fn get_language_stats(&self) -> Result<Vec<LanguageStatsNode>>;
@@ -1679,6 +1760,15 @@ pub trait GraphStore: Send + Sync {
     /// Single bulk query — used by the graph analytics engine for extraction.
     async fn get_project_call_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
 
+    /// Get all EXTENDS edges between structs/classes in a project as (child_file, parent_file) pairs.
+    /// Returns file-level edges for the graph analytics engine.
+    async fn get_project_extends_edges(&self, project_id: Uuid) -> Result<Vec<(String, String)>>;
+
+    /// Get all IMPLEMENTS edges between structs and traits in a project as (struct_file, trait_file) pairs.
+    /// Returns file-level edges for the graph analytics engine.
+    async fn get_project_implements_edges(&self, project_id: Uuid)
+        -> Result<Vec<(String, String)>>;
+
     /// Batch-update analytics scores on File nodes.
     /// Uses UNWIND for single-query efficiency.
     async fn batch_update_file_analytics(&self, updates: &[FileAnalyticsUpdate]) -> Result<()>;
@@ -1761,6 +1851,21 @@ pub trait GraphStore: Send + Sync {
 
     /// Get risk assessment summary stats for a project.
     async fn get_risk_summary(&self, project_id: Uuid) -> Result<serde_json::Value>;
+
+    // ========================================================================
+    // Process detection
+    // ========================================================================
+
+    /// Batch upsert Process nodes using UNWIND.
+    async fn batch_upsert_processes(&self, processes: &[ProcessNode]) -> Result<()>;
+
+    /// Batch create STEP_IN_PROCESS relationships.
+    /// Takes (process_id, function_id, step_number) tuples.
+    async fn batch_create_step_relationships(&self, steps: &[(String, String, u32)]) -> Result<()>;
+
+    /// Delete all Process nodes and their STEP_IN_PROCESS relationships for a project.
+    /// Returns the number of deleted entities.
+    async fn delete_project_processes(&self, project_id: Uuid) -> Result<u64>;
 
     // ========================================================================
     // Health check

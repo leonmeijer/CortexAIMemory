@@ -5,6 +5,7 @@
 pub mod bash;
 pub mod c;
 pub mod cpp;
+pub mod csharp;
 pub mod go;
 pub mod java;
 pub mod kotlin;
@@ -12,8 +13,10 @@ pub mod php;
 pub mod python;
 pub mod ruby;
 pub mod rust;
+pub mod scala;
 pub mod swift;
 pub mod typescript;
+pub mod zig;
 
 /// Tree-sitter query patterns for different languages (kept for reference)
 pub mod queries {
