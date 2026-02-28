@@ -776,6 +776,12 @@ pub trait GraphStore: Send + Sync {
     /// Delete a task and all its related data (steps, decisions)
     async fn delete_task(&self, task_id: Uuid) -> Result<()>;
 
+    /// Get the project that owns a task (via Task→Plan→Project chain).
+    ///
+    /// Traverses: `(Task)-[:PART_OF]->(Plan)-[:BELONGS_TO]->(Project)`
+    /// Returns `None` if the task doesn't exist or has no linked project.
+    async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>>;
+
     // ========================================================================
     // Step operations
     // ========================================================================
@@ -864,6 +870,9 @@ pub trait GraphStore: Send + Sync {
 
     /// Retrieve the stored vector embedding for a Decision node
     async fn get_decision_embedding(&self, decision_id: Uuid) -> Result<Option<Vec<f32>>>;
+
+    /// Get all decisions with their linked task_id (for MeiliSearch reindex)
+    async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>>;
 
     /// Get all Decision IDs that have no embedding yet (for backfill)
     async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>>;
@@ -1351,6 +1360,7 @@ pub trait GraphStore: Send + Sync {
         limit: usize,
         project_id: Option<Uuid>,
         workspace_slug: Option<&str>,
+        min_similarity: Option<f64>,
     ) -> Result<Vec<(Note, f64)>>;
 
     /// List notes that don't have an embedding yet.

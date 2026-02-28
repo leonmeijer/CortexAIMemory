@@ -994,6 +994,10 @@ impl GraphStore for Neo4jClient {
         self.delete_task(task_id).await
     }
 
+    async fn get_project_for_task(&self, task_id: Uuid) -> anyhow::Result<Option<ProjectNode>> {
+        self.get_project_for_task(task_id).await
+    }
+
     // ========================================================================
     // Step operations
     // ========================================================================
@@ -1107,6 +1111,10 @@ impl GraphStore for Neo4jClient {
 
     async fn get_decision_embedding(&self, decision_id: Uuid) -> anyhow::Result<Option<Vec<f32>>> {
         self.get_decision_embedding(decision_id).await
+    }
+
+    async fn get_all_decisions_with_task_id(&self) -> anyhow::Result<Vec<(DecisionNode, Uuid)>> {
+        self.get_all_decisions_with_task_id().await
     }
 
     async fn get_decisions_without_embedding(&self) -> anyhow::Result<Vec<(Uuid, String, String)>> {
@@ -1722,8 +1730,9 @@ impl GraphStore for Neo4jClient {
         limit: usize,
         project_id: Option<Uuid>,
         workspace_slug: Option<&str>,
+        min_similarity: Option<f64>,
     ) -> anyhow::Result<Vec<(Note, f64)>> {
-        self.vector_search_notes(embedding, limit, project_id, workspace_slug)
+        self.vector_search_notes(embedding, limit, project_id, workspace_slug, min_similarity)
             .await
     }
 

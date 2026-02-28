@@ -308,8 +308,13 @@ impl PlanManager {
 
         self.neo4j.create_decision(task_id, &decision).await?;
 
+        // Resolve project_id and project_slug via Task → Plan → Project chain
+        let (project_id, project_slug) = match self.neo4j.get_project_for_task(task_id).await {
+            Ok(Some(project)) => (Some(project.id.to_string()), Some(project.slug.clone())),
+            _ => (None, None),
+        };
+
         // Index in Meilisearch for search
-        // TODO: Get project_id and project_slug from the task's plan
         let doc = DecisionDocument {
             id: decision.id.to_string(),
             description: decision.description.clone(),
@@ -318,8 +323,8 @@ impl PlanManager {
             agent: decided_by.to_string(),
             timestamp: decision.decided_at.to_rfc3339(),
             tags: vec![],
-            project_id: None,
-            project_slug: None,
+            project_id,
+            project_slug,
         };
         self.meili.index_decision(&doc).await?;
 
@@ -409,6 +414,125 @@ impl PlanManager {
         Ok((total, created))
     }
 
+    /// Reindex all decisions from Neo4j into MeiliSearch.
+    ///
+    /// Reads every Decision node (with its linked Task), resolves the project
+    /// via Task → Plan → Project, and upserts the corresponding DecisionDocument
+    /// into MeiliSearch. Useful after MeiliSearch data loss or rebuild.
+    ///
+    /// Returns `(total_decisions, indexed_count)`.
+    pub async fn reindex_decisions(&self) -> Result<(usize, usize)> {
+        let decisions = self.neo4j.get_all_decisions_with_task_id().await?;
+        let total = decisions.len();
+        let mut indexed = 0;
+
+        for (decision, task_id) in &decisions {
+            // Resolve project info via Task → Plan → Project
+            let (project_id, project_slug) = match self.neo4j.get_project_for_task(*task_id).await {
+                Ok(Some(project)) => (Some(project.id.to_string()), Some(project.slug.clone())),
+                _ => (None, None),
+            };
+
+            let doc = DecisionDocument {
+                id: decision.id.to_string(),
+                description: decision.description.clone(),
+                rationale: decision.rationale.clone(),
+                task_id: task_id.to_string(),
+                agent: decision.decided_by.clone(),
+                timestamp: decision.decided_at.to_rfc3339(),
+                tags: vec![],
+                project_id,
+                project_slug,
+            };
+
+            match self.meili.index_decision(&doc).await {
+                Ok(()) => indexed += 1,
+                Err(e) => {
+                    tracing::warn!(
+                        decision_id = %decision.id,
+                        error = %e,
+                        "Failed to reindex decision into MeiliSearch"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(total, indexed, "Decision MeiliSearch reindex complete");
+        Ok((total, indexed))
+    }
+
+    /// Backfill `project_id` and `project_slug` for all DecisionDocuments in Meilisearch.
+    ///
+    /// Fetches all decisions from the Meilisearch index, resolves each one's project
+    /// via the `Task → Plan → Project` chain in Neo4j, and re-indexes documents
+    /// that were missing project info.
+    ///
+    /// Idempotent: re-running updates documents with the same values (Meilisearch upsert).
+    /// Returns `(total_decisions, updated_count)`.
+    pub async fn backfill_decision_project_slugs(&self) -> Result<(usize, usize)> {
+        // Fetch all decisions from Meilisearch (broad search)
+        let all_docs = self.meili.search_decisions("*", 10000).await?;
+        let total = all_docs.len();
+        let mut updated = 0;
+
+        for doc in all_docs {
+            // Skip if already has project_slug populated
+            if doc.project_slug.is_some() {
+                continue;
+            }
+
+            // Parse task_id and resolve project
+            let task_id: Uuid = match doc.task_id.parse() {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        decision_id = %doc.id,
+                        task_id = %doc.task_id,
+                        error = %e,
+                        "Failed to parse task_id during backfill, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            match self.neo4j.get_project_for_task(task_id).await {
+                Ok(Some(project)) => {
+                    let updated_doc = DecisionDocument {
+                        project_id: Some(project.id.to_string()),
+                        project_slug: Some(project.slug.clone()),
+                        ..doc
+                    };
+                    if let Err(e) = self.meili.index_decision(&updated_doc).await {
+                        tracing::warn!(
+                            decision_id = %updated_doc.id,
+                            error = %e,
+                            "Failed to re-index decision during backfill"
+                        );
+                    } else {
+                        updated += 1;
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!(
+                        decision_id = %doc.id,
+                        task_id = %doc.task_id,
+                        "No project found for decision's task, skipping"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        decision_id = %doc.id,
+                        error = %e,
+                        "Failed to resolve project for decision during backfill"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(total, updated, "Decision project_slug backfill complete");
+        Ok((total, updated))
+    }
+
     /// Search for related decisions
     pub async fn search_decisions(
         &self,
@@ -422,6 +546,37 @@ impl PlanManager {
             .await?;
 
         // Convert documents to nodes
+        let decisions = docs
+            .into_iter()
+            .map(|doc| DecisionNode {
+                id: doc.id.parse().unwrap_or_else(|_| Uuid::new_v4()),
+                description: doc.description,
+                rationale: doc.rationale,
+                alternatives: vec![],
+                chosen_option: None,
+                decided_by: doc.agent,
+                decided_at: doc.timestamp.parse().unwrap_or_else(|_| chrono::Utc::now()),
+                status: DecisionStatus::Accepted,
+                embedding: None,
+                embedding_model: None,
+            })
+            .collect();
+
+        Ok(decisions)
+    }
+
+    /// Search decisions across multiple projects (workspace-level).
+    pub async fn search_decisions_in_workspace(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slugs: &[String],
+    ) -> Result<Vec<DecisionNode>> {
+        let docs = self
+            .meili
+            .search_decisions_in_projects(query, limit, project_slugs)
+            .await?;
+
         let decisions = docs
             .into_iter()
             .map(|doc| DecisionNode {
@@ -1280,6 +1435,177 @@ mod tests {
         let details = pm.get_task_details(task.id).await.unwrap().unwrap();
         assert_eq!(details.decisions.len(), 1);
         assert_eq!(details.decisions[0].id, decision.id);
+    }
+
+    #[tokio::test]
+    async fn test_add_decision_populates_project_slug() {
+        let state = mock_app_state();
+        let pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
+
+        // Create a project and link a plan to it
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan with project".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: Some(project.id),
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+
+        // Link plan to project (for the mock's reverse lookup)
+        state
+            .neo4j
+            .link_plan_to_project(plan.id, project.id)
+            .await
+            .unwrap();
+
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task".to_string()),
+                    description: "Task desc".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let _decision = pm
+            .add_decision(
+                task.id,
+                CreateDecisionRequest {
+                    description: "Use Axum framework".to_string(),
+                    rationale: "Best web framework for Rust".to_string(),
+                    alternatives: None,
+                    chosen_option: Some("axum".to_string()),
+                },
+                "engineer",
+            )
+            .await
+            .unwrap();
+
+        // Verify that the decision was indexed in Meilisearch WITH project_slug
+        let docs = state
+            .meili
+            .search_decisions_in_project("Axum", 10, Some(&project.slug))
+            .await
+            .unwrap();
+        assert!(
+            !docs.is_empty(),
+            "Decision should be findable by project_slug filter"
+        );
+        assert_eq!(docs[0].project_slug.as_deref(), Some(project.slug.as_str()));
+        assert_eq!(
+            docs[0].project_id.as_deref(),
+            Some(project.id.to_string().as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backfill_decision_project_slugs() {
+        let state = mock_app_state();
+        let pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
+
+        // Create a project
+        let project = test_project();
+        state.neo4j.create_project(&project).await.unwrap();
+
+        // Create a plan linked to the project
+        let plan = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: Some(project.id),
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+        state
+            .neo4j
+            .link_plan_to_project(plan.id, project.id)
+            .await
+            .unwrap();
+
+        let task = pm
+            .add_task(
+                plan.id,
+                CreateTaskRequest {
+                    title: Some("Task".to_string()),
+                    description: "Task desc".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        // Manually index a decision WITHOUT project_slug (simulates the old behavior)
+        let doc = crate::meilisearch::indexes::DecisionDocument {
+            id: uuid::Uuid::new_v4().to_string(),
+            description: "Old decision without project".to_string(),
+            rationale: "Some rationale".to_string(),
+            task_id: task.id.to_string(),
+            agent: "old-agent".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            tags: vec![],
+            project_id: None,
+            project_slug: None,
+        };
+        state.meili.index_decision(&doc).await.unwrap();
+
+        // Verify it's indexed without project_slug
+        let before = state
+            .meili
+            .search_decisions("Old decision", 10)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert!(before[0].project_slug.is_none());
+
+        // Run backfill
+        let (total, updated) = pm.backfill_decision_project_slugs().await.unwrap();
+        assert!(total >= 1, "Should have at least 1 decision");
+        assert_eq!(updated, 1, "Should have updated exactly 1 decision");
+
+        // Verify the decision now has project_slug
+        let after = state
+            .meili
+            .search_decisions("Old decision", 10)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].project_slug.as_deref(),
+            Some(project.slug.as_str())
+        );
+        assert_eq!(
+            after[0].project_id.as_deref(),
+            Some(project.id.to_string().as_str())
+        );
     }
 
     #[tokio::test]

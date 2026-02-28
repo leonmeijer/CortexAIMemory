@@ -3327,6 +3327,38 @@ impl GraphStore for MockGraphStore {
         Ok(())
     }
 
+    async fn get_project_for_task(&self, task_id: Uuid) -> Result<Option<ProjectNode>> {
+        // Reverse lookup: task_id → plan_id (via plan_tasks)
+        let plan_tasks = self.plan_tasks.read().await;
+        let plan_id = plan_tasks
+            .iter()
+            .find(|(_, tasks)| tasks.contains(&task_id))
+            .map(|(plan_id, _)| *plan_id);
+
+        let plan_id = match plan_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        drop(plan_tasks);
+
+        // Reverse lookup: plan_id → project_id (via project_plans)
+        let project_plans = self.project_plans.read().await;
+        let project_id = project_plans
+            .iter()
+            .find(|(_, plans)| plans.contains(&plan_id))
+            .map(|(project_id, _)| *project_id);
+
+        let project_id = match project_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+        drop(project_plans);
+
+        // Get the project
+        let projects = self.projects.read().await;
+        Ok(projects.get(&project_id).cloned())
+    }
+
     // ========================================================================
     // Step operations
     // ========================================================================
@@ -3532,6 +3564,20 @@ impl GraphStore for MockGraphStore {
             .get(&decision_id)
             .and_then(|d| d.embedding.as_ref())
             .map(|emb| emb.iter().map(|&x| x as f32).collect()))
+    }
+
+    async fn get_all_decisions_with_task_id(&self) -> Result<Vec<(DecisionNode, Uuid)>> {
+        let decisions = self.decisions.read().await;
+        let td = self.task_decisions.read().await;
+        let mut result = Vec::new();
+        for (&task_id, decision_ids) in td.iter() {
+            for did in decision_ids {
+                if let Some(d) = decisions.get(did) {
+                    result.push((d.clone(), task_id));
+                }
+            }
+        }
+        Ok(result)
     }
 
     async fn get_decisions_without_embedding(&self) -> Result<Vec<(Uuid, String, String)>> {
@@ -4867,6 +4913,7 @@ impl GraphStore for MockGraphStore {
         limit: usize,
         project_id: Option<Uuid>,
         workspace_slug: Option<&str>,
+        min_similarity: Option<f64>,
     ) -> Result<Vec<(Note, f64)>> {
         let notes = self.notes.read().await;
         let embeddings = self.note_embeddings.read().await;
@@ -4919,6 +4966,12 @@ impl GraphStore for MockGraphStore {
 
         // Sort by score descending
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Filter by minimum cosine similarity threshold
+        if let Some(min_sim) = min_similarity {
+            scored.retain(|(_, score)| *score >= min_sim);
+        }
+
         scored.truncate(limit);
 
         Ok(scored)
@@ -5754,6 +5807,7 @@ impl GraphStore for MockGraphStore {
         Ok(Some(FeatureGraphDetail {
             graph: fg,
             entities,
+            relations: vec![],
         }))
     }
 
@@ -6179,6 +6233,7 @@ impl GraphStore for MockGraphStore {
         Ok(FeatureGraphDetail {
             graph: fg,
             entities,
+            relations: vec![],
         })
     }
 

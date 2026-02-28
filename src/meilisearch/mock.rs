@@ -49,7 +49,11 @@ fn match_score(text: &str, query: &str) -> f64 {
 }
 
 /// Check if any of the given fields contain the query as a substring (case-insensitive).
+/// A query of "*" matches everything (Meilisearch convention for "all documents").
 fn any_field_matches(fields: &[&str], query: &str) -> bool {
+    if query == "*" {
+        return true;
+    }
     let query_lower = query.to_lowercase();
     fields
         .iter()
@@ -265,6 +269,31 @@ impl SearchStore for MockSearchStore {
                     if d.project_slug.as_deref() != Some(slug) {
                         return false;
                     }
+                }
+                any_field_matches(&[&d.description, &d.rationale], query)
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        Ok(results)
+    }
+
+    async fn search_decisions_in_projects(
+        &self,
+        query: &str,
+        limit: usize,
+        project_slugs: &[String],
+    ) -> Result<Vec<DecisionDocument>> {
+        let docs = self.decision_documents.read().await;
+        let results: Vec<DecisionDocument> = docs
+            .iter()
+            .filter(|d| {
+                if let Some(ref slug) = d.project_slug {
+                    if !project_slugs.iter().any(|s| s == slug) {
+                        return false;
+                    }
+                } else {
+                    return false; // No project_slug means not in any project
                 }
                 any_field_matches(&[&d.description, &d.rationale], query)
             })
