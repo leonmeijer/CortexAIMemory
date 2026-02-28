@@ -218,6 +218,55 @@ impl NoteManager {
         });
     }
 
+    /// Automatically create LINKED_TO anchors from file paths mentioned in note content.
+    ///
+    /// Fire-and-forget: extracts file paths from the note's content and links
+    /// them via LINKED_TO relations. This enables the contextual scoring system
+    /// to use anchor-based signals for better relevance ranking.
+    fn spawn_auto_anchor(&self, note: &Note) {
+        let neo4j = self.neo4j.clone();
+        let note_clone = note.clone();
+
+        tokio::spawn(async move {
+            // Resolve project root_path for absolute file path matching.
+            // File nodes use absolute paths, but extract_file_paths_from_content
+            // returns relative — we need root_path to bridge the gap.
+            let root_path = if let Some(pid) = note_clone.project_id {
+                match neo4j.get_project(pid).await {
+                    Ok(Some(proj)) => Some(proj.root_path),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            match crate::skills::activation::auto_anchor_note(
+                &*neo4j,
+                &note_clone,
+                root_path.as_deref(),
+            )
+            .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::debug!(
+                            note_id = %note_clone.id,
+                            anchors = count,
+                            "Auto-anchor: created file anchors from content"
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        note_id = %note_clone.id,
+                        error = %e,
+                        "Auto-anchor: failed to anchor note to files"
+                    );
+                }
+            }
+        });
+    }
+
     // ========================================================================
     // CRUD Operations
     // ========================================================================
@@ -261,6 +310,9 @@ impl NoteManager {
 
         // Auto-connect synapses to semantically similar notes (fire-and-forget)
         self.spawn_auto_connect_synapses(note.id, &note.content, note.project_id);
+
+        // Auto-anchor to files mentioned in content (fire-and-forget)
+        self.spawn_auto_anchor(&note);
 
         self.emit(
             CrudEvent::new(
@@ -325,6 +377,9 @@ impl NoteManager {
                     }
                     self.spawn_auto_connect_synapses(id, &note.content, note.project_id);
                 }
+
+                // Re-anchor to files mentioned in updated content (fire-and-forget)
+                self.spawn_auto_anchor(note);
             }
 
             self.emit(

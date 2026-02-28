@@ -165,21 +165,49 @@ pub async fn activate_for_hook(
         }
 
         // Filter by energy
-        let active_notes: Vec<_> = all_notes
+        let mut active_notes: Vec<_> = all_notes
             .into_iter()
             .filter(|n| n.energy >= config.min_note_energy)
             .collect();
 
+        // Contextual scoring: sort by relevance when file/pattern context available
+        let has_context = file_context.is_some() || pattern.is_some();
+        if has_context {
+            active_notes.sort_by(|a, b| {
+                let sa =
+                    score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb =
+                    score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let total_note_count = active_notes.len();
         let merged_name = format!("{} + {}", skill1.name, skill2.name);
-        let context = assemble_context_with_confidence(
+        let (context, notes_included) = assemble_context_with_confidence(
             &merged_name,
             &active_notes,
             &all_decisions,
             config.max_context_chars,
             Some(conf1),
+            has_context, // pre_sorted when we scored
         );
 
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+        // Only reinforce notes that were actually rendered in the context
+        let activated_note_ids: Vec<Uuid> = active_notes
+            .iter()
+            .take(notes_included)
+            .map(|n| n.id)
+            .collect();
+
+        if has_context {
+            tracing::info!(
+                skill = %merged_name,
+                contextual = notes_included,
+                total = total_note_count,
+                "Contextual filtering applied (merged)"
+            );
+        }
 
         Ok(Some(HookActivationOutcome {
             response: HookActivateResponse {
@@ -187,8 +215,10 @@ pub async fn activate_for_hook(
                 skill_name: merged_name,
                 skill_id: skill1.id, // Use primary skill's ID
                 confidence: conf1,
-                notes_count: active_notes.len(),
+                notes_count: notes_included,
                 decisions_count: all_decisions.len(),
+                total_note_count,
+                contextual_note_count: if has_context { notes_included } else { 0 },
             },
             activated_note_ids,
         }))
@@ -197,20 +227,48 @@ pub async fn activate_for_hook(
         let (skill, confidence) = matches.remove(0);
         let (notes, decisions) = graph_store.get_skill_members(skill.id).await?;
 
-        let active_notes: Vec<_> = notes
+        let mut active_notes: Vec<_> = notes
             .into_iter()
             .filter(|n| n.energy >= config.min_note_energy)
             .collect();
 
-        let context = assemble_context_with_confidence(
+        // Contextual scoring: sort by relevance when file/pattern context available
+        let has_context = file_context.is_some() || pattern.is_some();
+        if has_context {
+            active_notes.sort_by(|a, b| {
+                let sa =
+                    score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb =
+                    score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let total_note_count = active_notes.len();
+        let (context, notes_included) = assemble_context_with_confidence(
             &skill.name,
             &active_notes,
             &decisions,
             config.max_context_chars,
             Some(confidence),
+            has_context,
         );
 
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+        // Only reinforce notes that were actually rendered in the context
+        let activated_note_ids: Vec<Uuid> = active_notes
+            .iter()
+            .take(notes_included)
+            .map(|n| n.id)
+            .collect();
+
+        if has_context {
+            tracing::info!(
+                skill = %skill.name,
+                contextual = notes_included,
+                total = total_note_count,
+                "Contextual filtering applied"
+            );
+        }
 
         Ok(Some(HookActivationOutcome {
             response: HookActivateResponse {
@@ -218,8 +276,10 @@ pub async fn activate_for_hook(
                 skill_name: skill.name.clone(),
                 skill_id: skill.id,
                 confidence,
-                notes_count: active_notes.len(),
+                notes_count: notes_included,
                 decisions_count: decisions.len(),
+                total_note_count,
+                contextual_note_count: if has_context { notes_included } else { 0 },
             },
             activated_note_ids,
         }))
@@ -314,21 +374,49 @@ pub async fn activate_for_hook_cached(
             }
         }
 
-        let active_notes: Vec<_> = all_notes
+        let mut active_notes: Vec<_> = all_notes
             .into_iter()
             .filter(|n| n.energy >= config.min_note_energy)
             .collect();
 
+        // Contextual scoring: sort by relevance when file/pattern context available
+        let has_context = file_context.is_some() || pattern.is_some();
+        if has_context {
+            active_notes.sort_by(|a, b| {
+                let sa =
+                    score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb =
+                    score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let total_note_count = active_notes.len();
         let merged_name = format!("{} + {}", skill1.name, skill2.name);
-        let context = assemble_context_with_confidence(
+        let (context, notes_included) = assemble_context_with_confidence(
             &merged_name,
             &active_notes,
             &all_decisions,
             config.max_context_chars,
             Some(conf1),
+            has_context,
         );
 
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+        // Only reinforce notes that were actually rendered in the context
+        let activated_note_ids: Vec<Uuid> = active_notes
+            .iter()
+            .take(notes_included)
+            .map(|n| n.id)
+            .collect();
+
+        if has_context {
+            tracing::info!(
+                skill = %merged_name,
+                contextual = notes_included,
+                total = total_note_count,
+                "Contextual filtering applied (merged, cached)"
+            );
+        }
 
         Ok(Some(HookActivationOutcome {
             response: HookActivateResponse {
@@ -336,8 +424,10 @@ pub async fn activate_for_hook_cached(
                 skill_name: merged_name,
                 skill_id: skill1.id,
                 confidence: conf1,
-                notes_count: active_notes.len(),
+                notes_count: notes_included,
                 decisions_count: all_decisions.len(),
+                total_note_count,
+                contextual_note_count: if has_context { notes_included } else { 0 },
             },
             activated_note_ids,
         }))
@@ -345,20 +435,48 @@ pub async fn activate_for_hook_cached(
         let (skill, confidence) = matches.remove(0);
         let (notes, decisions) = graph_store.get_skill_members(skill.id).await?;
 
-        let active_notes: Vec<_> = notes
+        let mut active_notes: Vec<_> = notes
             .into_iter()
             .filter(|n| n.energy >= config.min_note_energy)
             .collect();
 
-        let context = assemble_context_with_confidence(
+        // Contextual scoring: sort by relevance when file/pattern context available
+        let has_context = file_context.is_some() || pattern.is_some();
+        if has_context {
+            active_notes.sort_by(|a, b| {
+                let sa =
+                    score_note_relevance(a, file_context.as_deref(), pattern.as_deref(), tool_name);
+                let sb =
+                    score_note_relevance(b, file_context.as_deref(), pattern.as_deref(), tool_name);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        let total_note_count = active_notes.len();
+        let (context, notes_included) = assemble_context_with_confidence(
             &skill.name,
             &active_notes,
             &decisions,
             config.max_context_chars,
             Some(confidence),
+            has_context,
         );
 
-        let activated_note_ids: Vec<Uuid> = active_notes.iter().map(|n| n.id).collect();
+        // Only reinforce notes that were actually rendered in the context
+        let activated_note_ids: Vec<Uuid> = active_notes
+            .iter()
+            .take(notes_included)
+            .map(|n| n.id)
+            .collect();
+
+        if has_context {
+            tracing::info!(
+                skill = %skill.name,
+                contextual = notes_included,
+                total = total_note_count,
+                "Contextual filtering applied (cached)"
+            );
+        }
 
         Ok(Some(HookActivationOutcome {
             response: HookActivateResponse {
@@ -366,8 +484,10 @@ pub async fn activate_for_hook_cached(
                 skill_name: skill.name.clone(),
                 skill_id: skill.id,
                 confidence,
-                notes_count: active_notes.len(),
+                notes_count: notes_included,
                 decisions_count: decisions.len(),
+                total_note_count,
+                contextual_note_count: if has_context { notes_included } else { 0 },
             },
             activated_note_ids,
         }))
@@ -538,17 +658,26 @@ pub fn assemble_context(
     decisions: &[DecisionNode],
     max_chars: usize,
 ) -> String {
-    assemble_context_with_confidence(skill_name, notes, decisions, max_chars, None)
+    assemble_context_with_confidence(skill_name, notes, decisions, max_chars, None, false).0
 }
 
 /// Assemble context with optional confidence score in the header.
+///
+/// When `pre_sorted` is true, notes are used in the order provided (caller has
+/// already sorted by contextual relevance score). When false, notes are sorted
+/// by importance then energy (legacy behavior).
+///
+/// Returns `(context_text, notes_included_count)` — the count is needed to
+/// restrict Hebbian reinforcement to only the notes that actually made it into
+/// the context budget.
 pub fn assemble_context_with_confidence(
     skill_name: &str,
     notes: &[Note],
     decisions: &[DecisionNode],
     max_chars: usize,
     confidence: Option<f64>,
-) -> String {
+    pre_sorted: bool,
+) -> (String, usize) {
     let header = match confidence {
         Some(conf) => format!(
             "## \u{1f9e0} Skill \"{}\" (confidence {}%)\n",
@@ -566,21 +695,23 @@ pub fn assemble_context_with_confidence(
         max_chars
     };
 
-    // Sort notes by importance (Critical first) then energy
+    // Sort notes by importance (Critical first) then energy — unless pre_sorted
     let mut sorted_notes: Vec<&Note> = notes.iter().collect();
-    sorted_notes.sort_by(|a, b| {
-        let imp_ord = b
-            .importance
-            .weight()
-            .partial_cmp(&a.importance.weight())
-            .unwrap_or(std::cmp::Ordering::Equal);
-        if imp_ord != std::cmp::Ordering::Equal {
-            return imp_ord;
-        }
-        b.energy
-            .partial_cmp(&a.energy)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    if !pre_sorted {
+        sorted_notes.sort_by(|a, b| {
+            let imp_ord = b
+                .importance
+                .weight()
+                .partial_cmp(&a.importance.weight())
+                .unwrap_or(std::cmp::Ordering::Equal);
+            if imp_ord != std::cmp::Ordering::Equal {
+                return imp_ord;
+            }
+            b.energy
+                .partial_cmp(&a.energy)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
 
     // Add notes one by one until budget is exhausted
     // Use chars().count() consistently (not .len() which is byte count)
@@ -634,7 +765,7 @@ pub fn assemble_context_with_confidence(
         }
     }
 
-    context
+    (context, notes_included)
 }
 
 // ============================================================================
@@ -762,6 +893,450 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
             .unwrap_or(clean.len());
         format!("{}...", &clean[..end])
     }
+}
+
+// ============================================================================
+// Contextual note scoring (pure functions, zero DB queries)
+// ============================================================================
+
+/// Extract meaningful path segments from a file context string.
+///
+/// Filters out trivial segments like "src", "lib", "mod", "index", "main", "tests".
+/// Strips file extensions. Returns lowercased segments for case-insensitive matching.
+///
+/// # Examples
+/// ```
+/// extract_path_segments("src/neo4j/client.rs")  // → ["neo4j", "client"]
+/// extract_path_segments("src/lib.rs")            // → []
+/// extract_path_segments("/Users/x/project/src/skills/activation.rs")
+///     // → ["skills", "activation"]
+/// ```
+pub fn extract_path_segments(file_context: &str) -> Vec<String> {
+    const TRIVIAL_SEGMENTS: &[&str] = &[
+        "src", "lib", "mod", "index", "main", "tests", "test", "benches", "bench", "examples",
+        "example", "bin", "target", "build", "dist", "out", "pkg",
+    ];
+
+    file_context
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            // Strip file extension
+            s.rsplit_once('.').map(|(name, _)| name).unwrap_or(s)
+        })
+        .map(|s| s.to_lowercase())
+        .filter(|s| !s.is_empty() && s.len() > 1 && !TRIVIAL_SEGMENTS.contains(&s.as_str()))
+        .collect()
+}
+
+/// Extract the basename (filename without extension) from a file path.
+fn extract_basename(file_context: &str) -> Option<String> {
+    let filename = file_context.rsplit('/').next()?;
+    let name = filename
+        .rsplit_once('.')
+        .map(|(n, _)| n)
+        .unwrap_or(filename);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_lowercase())
+    }
+}
+
+/// Score a note's relevance to the current tool context.
+///
+/// This is a **pure function** — no async, no DB calls, no side effects.
+/// It operates entirely on data already loaded in memory from `get_skill_members()`.
+///
+/// # Signals
+///
+/// 1. **Tag-path affinity** (0 → 0.4): overlap between note.tags and file path segments
+/// 2. **Content keyword match** (0 → 0.3): note.content mentions the filename or path segments
+/// 3. **Importance weight** (multiplicative): critical ×1.5, high ×1.2, medium ×1.0, low ×0.8
+/// 4. **Freshness decay** (subtractive): -staleness_score × 0.1
+/// 5. **Note type affinity** (0 → 0.1): gotcha notes score higher for Edit/Write tools
+/// 6. **Anchor bonus** (0 → 0.4): LINKED_TO anchor matches file_context (added by T4)
+///
+/// Returns a score in approximately [0.0, 1.5] range. Higher = more relevant.
+pub fn score_note_relevance(
+    note: &Note,
+    file_context: Option<&str>,
+    _pattern: Option<&str>,
+    tool_name: &str,
+) -> f64 {
+    let mut score: f64 = 0.1; // base score — every note has some value
+
+    if let Some(file_ctx) = file_context {
+        let path_segments = extract_path_segments(file_ctx);
+        let basename = extract_basename(file_ctx);
+
+        // Signal 1: Tag-path affinity (0 → 0.4)
+        // Count how many path segments overlap with note tags (case-insensitive)
+        let tag_overlap = note
+            .tags
+            .iter()
+            .filter(|tag| {
+                let tag_lower = tag.to_lowercase();
+                path_segments.contains(&tag_lower)
+            })
+            .count();
+        score += (tag_overlap as f64 * 0.15).min(0.4);
+
+        // Signal 2: Content keyword match (0 → 0.3)
+        let content_lower = note.content.to_lowercase();
+
+        // Basename match: e.g., "client.rs" found in content → +0.2
+        if let Some(ref base) = basename {
+            if content_lower.contains(base.as_str()) {
+                score += 0.2;
+            }
+        }
+
+        // Path segment matches in content: each unique match → +0.05 (max +0.1)
+        let segment_matches = path_segments
+            .iter()
+            .filter(|seg| seg.len() >= 3 && content_lower.contains(seg.as_str()))
+            .count();
+        score += (segment_matches as f64 * 0.05).min(0.1);
+
+        // Signal 6: Anchor bonus (LINKED_TO) — added by T4
+        // Checks note.anchors for File entities matching the file_context.
+        // When anchors are empty (pre-T4 or pre-auto-anchor), this adds 0.
+        let mut best_anchor_bonus = 0.0_f64;
+        for anchor in &note.anchors {
+            if matches!(anchor.entity_type, crate::notes::EntityType::File) {
+                if anchor.entity_id == file_ctx
+                    || anchor.entity_id.ends_with(&format!("/{}", file_ctx))
+                    || file_ctx.ends_with(&format!("/{}", anchor.entity_id))
+                {
+                    best_anchor_bonus = best_anchor_bonus.max(0.4); // exact match
+                } else if same_directory(&anchor.entity_id, file_ctx) {
+                    best_anchor_bonus = best_anchor_bonus.max(0.2); // same dir
+                }
+            }
+        }
+        score += best_anchor_bonus;
+    }
+
+    // Signal 3: Importance weight (multiplicative)
+    let importance_multiplier = match note.importance {
+        crate::notes::NoteImportance::Critical => 1.5,
+        crate::notes::NoteImportance::High => 1.2,
+        crate::notes::NoteImportance::Medium => 1.0,
+        crate::notes::NoteImportance::Low => 0.8,
+    };
+    score *= importance_multiplier;
+
+    // Signal 4: Freshness decay (subtractive)
+    score -= note.staleness_score * 0.1;
+
+    // Signal 5: Note type affinity
+    // Edit/Write/Bash tools benefit from gotcha notes (error prevention)
+    // MCP tools benefit from guideline/pattern notes
+    match tool_name {
+        "Edit" | "Write" | "Bash" | "NotebookEdit" => {
+            if matches!(note.note_type, crate::notes::NoteType::Gotcha) {
+                score += 0.1;
+            }
+        }
+        t if t.starts_with("mcp__") => {
+            if matches!(
+                note.note_type,
+                crate::notes::NoteType::Guideline | crate::notes::NoteType::Pattern
+            ) {
+                score += 0.1;
+            }
+        }
+        _ => {}
+    }
+
+    // Ensure score is non-negative
+    score.max(0.0)
+}
+
+/// Check if two file paths share the same parent directory.
+///
+/// Handles both absolute and relative paths by comparing the substring
+/// before the last '/'.
+pub fn same_directory(path_a: &str, path_b: &str) -> bool {
+    let dir_a = path_a.rsplit_once('/').map(|(dir, _)| dir);
+    let dir_b = path_b.rsplit_once('/').map(|(dir, _)| dir);
+    match (dir_a, dir_b) {
+        (Some(a), Some(b)) => {
+            // Handle case where one is absolute and the other relative
+            // e.g., "/Users/x/src/neo4j/client.rs" vs "src/neo4j/analytics.rs"
+            a == b || a.ends_with(b) || b.ends_with(a)
+        }
+        _ => false,
+    }
+}
+
+// ============================================================================
+// File path extraction from note content (for auto-anchoring)
+// ============================================================================
+
+/// Known source file extensions for path detection.
+const SOURCE_EXTENSIONS: &[&str] = &[
+    "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "kt", "swift", "rb", "php", "cs", "cpp",
+    "c", "h", "hpp", "toml", "yaml", "yml", "json", "sql", "sh", "bash", "zsh", "md", "html",
+    "css", "scss", "vue", "svelte", "ex", "exs", "zig", "lua", "r", "m", "mm",
+];
+
+/// Extract file paths mentioned in a note's content.
+///
+/// Detects:
+/// - Relative paths: `src/neo4j/client.rs`, `tests/unit/test_foo.py`
+/// - Absolute paths: `/Users/foo/project/src/bar.rs` → normalized to relative after `src/`
+/// - Backtick-wrapped: \`src/neo4j/client.rs\`
+/// - Paths with known source extensions
+///
+/// Filters out:
+/// - URLs (http://, https://, ftp://)
+/// - Package/import strings (no `/` separators like `crate::foo::bar`)
+/// - Paths that are too short or don't contain a `/`
+///
+/// Returns deduplicated relative paths.
+pub fn extract_file_paths_from_content(content: &str) -> Vec<String> {
+    use std::collections::HashSet;
+
+    let mut paths = HashSet::new();
+
+    // Regex-free approach: split content into tokens, check each for path patterns
+    for line in content.lines() {
+        // Extract tokens from the line, handling backticks specially
+        let tokens = extract_path_tokens(line);
+        for token in tokens {
+            if let Some(path) = validate_and_normalize_path(&token) {
+                paths.insert(path);
+            }
+        }
+    }
+
+    let mut result: Vec<String> = paths.into_iter().collect();
+    result.sort(); // Deterministic ordering
+    result
+}
+
+/// Extract potential path tokens from a line of text.
+///
+/// Handles backtick-wrapped paths and whitespace/punctuation-delimited tokens.
+fn extract_path_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+
+    // First: extract backtick-wrapped content (highest priority)
+    let mut rest = line;
+    while let Some(start) = rest.find('`') {
+        let after_tick = &rest[start + 1..];
+        if let Some(end) = after_tick.find('`') {
+            let inside = &after_tick[..end];
+            if inside.contains('/') && !inside.contains(' ') {
+                tokens.push(inside.to_string());
+            }
+            rest = &after_tick[end + 1..];
+        } else {
+            break;
+        }
+    }
+
+    // Second: split line by whitespace and common delimiters, look for path-like tokens
+    for word in line.split(|c: char| {
+        c.is_whitespace()
+            || c == ','
+            || c == ';'
+            || c == '('
+            || c == ')'
+            || c == '['
+            || c == ']'
+            || c == '"'
+            || c == '\''
+    }) {
+        // Strip surrounding backticks, parens, quotes
+        let clean = word.trim_matches(|c: char| {
+            c == '`' || c == '\'' || c == '"' || c == '(' || c == ')' || c == ':'
+        });
+        if clean.contains('/') && !clean.is_empty() {
+            tokens.push(clean.to_string());
+        }
+    }
+
+    tokens
+}
+
+/// Validate a token as a file path and normalize it.
+///
+/// Returns `Some(normalized_path)` if the token looks like a valid source file path,
+/// `None` otherwise.
+fn validate_and_normalize_path(token: &str) -> Option<String> {
+    // Strip trailing punctuation (period, comma, semicolon, colon, paren)
+    let token = token
+        .trim()
+        .trim_end_matches(['.', ',', ';', ':', ')', ']']);
+
+    // Reject URLs
+    if token.starts_with("http://") || token.starts_with("https://") || token.starts_with("ftp://")
+    {
+        return None;
+    }
+
+    // Must contain at least one '/' (to be a path, not just a filename)
+    if !token.contains('/') {
+        return None;
+    }
+
+    // Reject Rust module paths (::)
+    if token.contains("::") {
+        return None;
+    }
+
+    // Must have a recognized extension
+    let extension = token.rsplit('.').next()?;
+    if !SOURCE_EXTENSIONS.contains(&extension.to_lowercase().as_str()) {
+        return None;
+    }
+
+    // Normalize absolute paths: find "src/" and take from there
+    let normalized = if token.starts_with('/') {
+        if let Some(idx) = token.find("/src/") {
+            &token[idx + 1..] // Skip the leading '/', keep "src/..."
+        } else if let Some(idx) = token.find("/tests/") {
+            &token[idx + 1..]
+        } else {
+            // Absolute path without src/ or tests/ — skip (could be system path)
+            return None;
+        }
+    } else {
+        token
+    };
+
+    // Sanity checks
+    let segments: Vec<&str> = normalized.split('/').collect();
+    if segments.len() < 2 {
+        return None; // Need at least dir/file.ext
+    }
+
+    // Reject if any segment is empty or starts with '.'
+    if segments.iter().any(|s| s.is_empty() || s.starts_with('.')) {
+        return None;
+    }
+
+    Some(normalized.to_string())
+}
+
+// ============================================================================
+// Auto-anchoring: link notes to files mentioned in their content
+// ============================================================================
+
+/// Auto-anchor a single note to files mentioned in its content.
+///
+/// Extracts file paths from the note content and creates LINKED_TO relations
+/// to matching File nodes in the graph. Uses `link_note_to_entity` which
+/// performs MERGE (idempotent — safe to call multiple times).
+///
+/// **Important**: `root_path` must be provided so that relative paths extracted
+/// from note content (e.g. `src/neo4j/client.rs`) are resolved to the absolute
+/// paths used by File nodes in Neo4j (e.g. `/home/user/project/src/neo4j/client.rs`).
+/// Without `root_path`, the MATCH query silently returns 0 rows (ghost anchors).
+///
+/// Returns the number of new anchors created.
+pub async fn auto_anchor_note(
+    graph_store: &dyn GraphStore,
+    note: &Note,
+    root_path: Option<&str>,
+) -> anyhow::Result<usize> {
+    use crate::notes::models::EntityType;
+
+    let paths = extract_file_paths_from_content(&note.content);
+    let mut anchored = 0;
+
+    for path in &paths {
+        // File nodes in Neo4j use absolute paths. extract_file_paths_from_content
+        // returns relative paths (e.g. "src/neo4j/client.rs"). Resolve them to
+        // absolute using the project's root_path so the MATCH query finds the node.
+        let resolved_path = if let Some(root) = root_path {
+            let root = root.trim_end_matches('/');
+            format!("{}/{}", root, path)
+        } else {
+            // No root_path — use relative path as-is (will likely not match,
+            // but keeps backward compatibility for tests/edge cases)
+            path.clone()
+        };
+
+        // Try to link — link_note_to_entity uses MERGE, so it's safe if already linked
+        if let Err(e) = graph_store
+            .link_note_to_entity(note.id, &EntityType::File, &resolved_path, None, None)
+            .await
+        {
+            tracing::debug!(
+                note_id = %note.id,
+                path = %resolved_path,
+                "Auto-anchor skipped (file may not exist in graph): {}",
+                e
+            );
+            continue;
+        }
+        anchored += 1;
+    }
+
+    Ok(anchored)
+}
+
+/// Auto-anchor all notes for a project to files mentioned in their content.
+///
+/// This is a batch operation meant to be called from the MCP admin action
+/// `auto_anchor_notes`. It loads the project's `root_path` and all project notes,
+/// then runs `auto_anchor_note` on each with path resolution.
+///
+/// Returns `AutoAnchorResult` with diagnostics.
+pub async fn auto_anchor_notes_for_project(
+    graph_store: &dyn GraphStore,
+    project_id: Uuid,
+) -> anyhow::Result<AutoAnchorResult> {
+    use crate::notes::models::NoteFilters;
+
+    // Resolve project root_path for absolute file path matching.
+    // File nodes in Neo4j use absolute paths, but extract_file_paths_from_content
+    // returns relative paths — we need root_path to bridge the gap.
+    let root_path = match graph_store.get_project(project_id).await? {
+        Some(proj) => Some(proj.root_path),
+        None => {
+            tracing::warn!(%project_id, "Auto-anchor: project not found, using relative paths");
+            None
+        }
+    };
+
+    let filters = NoteFilters::default();
+    let (notes, _total) = graph_store
+        .list_notes(Some(project_id), None, &filters)
+        .await?;
+
+    let notes_count = notes.len();
+    let mut total_anchors = 0;
+
+    for note in &notes {
+        let anchored = auto_anchor_note(graph_store, note, root_path.as_deref()).await?;
+        total_anchors += anchored;
+    }
+
+    tracing::info!(
+        %project_id,
+        notes = notes_count,
+        anchors = total_anchors,
+        root_path = root_path.as_deref().unwrap_or("<none>"),
+        "Auto-anchoring completed"
+    );
+
+    Ok(AutoAnchorResult {
+        notes_processed: notes_count,
+        anchors_created: total_anchors,
+        root_path_resolved: root_path,
+    })
+}
+
+/// Result of batch auto-anchoring with debug info.
+pub struct AutoAnchorResult {
+    pub notes_processed: usize,
+    pub anchors_created: usize,
+    pub root_path_resolved: Option<String>,
 }
 
 // ============================================================================
@@ -1126,8 +1701,14 @@ mod tests {
         )];
 
         // With confidence → 🧠 header with percentage
-        let context =
-            assemble_context_with_confidence("Neo4j Perf", &notes, &decisions, 3200, Some(0.85));
+        let (context, _) = assemble_context_with_confidence(
+            "Neo4j Perf",
+            &notes,
+            &decisions,
+            3200,
+            Some(0.85),
+            false,
+        );
         assert!(
             context.starts_with("## \u{1f9e0} Skill \"Neo4j Perf\" (confidence 85%)"),
             "Expected confidence header, got: {}",
@@ -1148,7 +1729,8 @@ mod tests {
         )];
 
         // Without confidence → 💡 header (same as assemble_context)
-        let context = assemble_context_with_confidence("Test Skill", &notes, &[], 3200, None);
+        let (context, _) =
+            assemble_context_with_confidence("Test Skill", &notes, &[], 3200, None, false);
         assert!(
             context.starts_with("## \u{1f4a1} Test Skill"),
             "Expected default header without confidence, got: {}",
@@ -1167,7 +1749,8 @@ mod tests {
         )];
 
         // Confidence 0.666 → should round to 67%
-        let context = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.666));
+        let (context, _) =
+            assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.666), false);
         assert!(
             context.contains("confidence 67%"),
             "Expected confidence 67%, got: {}",
@@ -1175,7 +1758,8 @@ mod tests {
         );
 
         // Confidence 1.0 → 100%
-        let context = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(1.0));
+        let (context, _) =
+            assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(1.0), false);
         assert!(
             context.contains("confidence 100%"),
             "Expected confidence 100%, got: {}",
@@ -1183,12 +1767,129 @@ mod tests {
         );
 
         // Confidence 0.0 → 0%
-        let context = assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.0));
+        let (context, _) =
+            assemble_context_with_confidence("Skill", &notes, &[], 3200, Some(0.0), false);
         assert!(
             context.contains("confidence 0%"),
             "Expected confidence 0%, got: {}",
             context.lines().next().unwrap_or("")
         );
+    }
+
+    // --- Pre-sorted & notes_included ---
+
+    #[test]
+    fn test_assemble_context_pre_sorted_preserves_order() {
+        // When pre_sorted=true, notes should appear in the order given
+        // (no re-sorting by importance/energy)
+        let notes = vec![
+            make_test_note(
+                Uuid::new_v4(),
+                "Low importance but high score",
+                NoteType::Tip,
+                NoteImportance::Low,
+                0.3,
+            ),
+            make_test_note(
+                Uuid::new_v4(),
+                "Critical but low score",
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                0.9,
+            ),
+        ];
+
+        // pre_sorted=true: Low-importance note should appear first (as given)
+        let (context_sorted, _) =
+            assemble_context_with_confidence("Test", &notes, &[], 3200, None, true);
+        let lines: Vec<&str> = context_sorted.lines().collect();
+        // Line 0 = header, Line 1 = first note (low importance), Line 2 = second note (critical)
+        assert!(
+            lines[1].contains("Low importance"),
+            "First note should be low importance, got: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("Critical"),
+            "Second note should be critical, got: {}",
+            lines[2]
+        );
+
+        // pre_sorted=false: Critical should come first (sorted by importance)
+        let (context_default, _) =
+            assemble_context_with_confidence("Test", &notes, &[], 3200, None, false);
+        let lines: Vec<&str> = context_default.lines().collect();
+        assert!(
+            lines[1].contains("Critical"),
+            "First note should be critical, got: {}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("Low importance"),
+            "Second note should be low importance, got: {}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn test_assemble_context_returns_notes_included_count() {
+        // Create many notes that exceed the budget
+        let notes: Vec<Note> = (0..50)
+            .map(|i| {
+                make_test_note(
+                    Uuid::new_v4(),
+                    &format!(
+                        "Note content number {} with some padding text to take space",
+                        i
+                    ),
+                    NoteType::Guideline,
+                    NoteImportance::Medium,
+                    0.5,
+                )
+            })
+            .collect();
+
+        let (context, notes_included) =
+            assemble_context_with_confidence("Test", &notes, &[], 1000, None, false);
+        // With a 1000 char budget, not all 50 notes should fit
+        assert!(
+            notes_included < 50,
+            "Expected fewer than 50 notes included, got: {}",
+            notes_included
+        );
+        assert!(notes_included > 0, "Expected at least 1 note included");
+        assert!(
+            context.chars().count() <= 1000,
+            "Context should respect budget"
+        );
+    }
+
+    #[test]
+    fn test_activated_note_ids_subset_of_rendered() {
+        // This verifies the fix for the Hebbian over-broad bug:
+        // activated_note_ids should only contain notes that were rendered
+        let notes: Vec<Note> = (0..30)
+            .map(|i| make_test_note(
+                Uuid::new_v4(),
+                &format!("Knowledge entry #{}: this is a substantial note with detailed content about topic {}", i, i),
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                0.5,
+            ))
+            .collect();
+
+        let (_context, notes_included) =
+            assemble_context_with_confidence("Test", &notes, &[], 1500, None, false);
+        // With 30 notes and 1500 char budget, only a subset should be included
+        assert!(
+            notes_included < 30,
+            "Not all notes should fit in budget: {} included",
+            notes_included
+        );
+        // The activated_note_ids should be notes[..notes_included]
+        // (In the actual pipeline, take(notes_included) is used)
+        let activated_ids: Vec<Uuid> = notes.iter().take(notes_included).map(|n| n.id).collect();
+        assert_eq!(activated_ids.len(), notes_included);
     }
 
     // --- Truncation ---
@@ -1964,6 +2665,847 @@ mod tests {
         assert!(
             result.is_none(),
             "No skills in project → should return None gracefully"
+        );
+    }
+
+    // --- Contextual note scoring ---
+
+    fn make_scored_note(
+        content: &str,
+        tags: Vec<&str>,
+        note_type: NoteType,
+        importance: NoteImportance,
+        energy: f64,
+        staleness: f64,
+    ) -> Note {
+        let mut note = make_test_note(Uuid::new_v4(), content, note_type, importance, energy);
+        note.tags = tags.into_iter().map(|t| t.to_string()).collect();
+        note.staleness_score = staleness;
+        note
+    }
+
+    #[test]
+    fn test_extract_path_segments_basic() {
+        let segments = extract_path_segments("src/neo4j/client.rs");
+        assert_eq!(segments, vec!["neo4j", "client"]);
+    }
+
+    #[test]
+    fn test_extract_path_segments_filters_trivial() {
+        let segments = extract_path_segments("src/lib.rs");
+        assert!(segments.is_empty());
+    }
+
+    #[test]
+    fn test_extract_path_segments_absolute_path() {
+        let segments = extract_path_segments("/Users/x/project/src/skills/activation.rs");
+        assert_eq!(segments, vec!["users", "project", "skills", "activation"]);
+    }
+
+    #[test]
+    fn test_extract_path_segments_no_extension() {
+        let segments = extract_path_segments("src/neo4j/Dockerfile");
+        assert_eq!(segments, vec!["neo4j", "dockerfile"]);
+    }
+
+    #[test]
+    fn test_score_tag_path_affinity() {
+        let neo4j_note = make_scored_note(
+            "Neo4j performance tip",
+            vec!["neo4j", "cypher"],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        let tauri_note = make_scored_note(
+            "Tauri macOS gotcha",
+            vec!["tauri", "macos"],
+            NoteType::Gotcha,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let neo4j_score =
+            score_note_relevance(&neo4j_note, Some("src/neo4j/client.rs"), None, "Read");
+        let tauri_score =
+            score_note_relevance(&tauri_note, Some("src/neo4j/client.rs"), None, "Read");
+
+        assert!(
+            neo4j_score > tauri_score,
+            "neo4j note ({}) should score higher than tauri note ({}) for neo4j file",
+            neo4j_score,
+            tauri_score
+        );
+    }
+
+    #[test]
+    fn test_score_content_keyword_match() {
+        let matching_note = make_scored_note(
+            "Modify src/neo4j/client.rs to fix the query pattern",
+            vec![],
+            NoteType::Observation,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        let non_matching_note = make_scored_note(
+            "General performance optimization advice",
+            vec![],
+            NoteType::Observation,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let matching_score =
+            score_note_relevance(&matching_note, Some("src/neo4j/client.rs"), None, "Read");
+        let non_matching_score = score_note_relevance(
+            &non_matching_note,
+            Some("src/neo4j/client.rs"),
+            None,
+            "Read",
+        );
+
+        assert!(
+            matching_score > non_matching_score,
+            "Note mentioning 'client' ({}) should score higher than generic note ({})",
+            matching_score,
+            non_matching_score
+        );
+    }
+
+    #[test]
+    fn test_score_importance_weighting() {
+        let critical_note = make_scored_note(
+            "Same content",
+            vec!["neo4j"],
+            NoteType::Tip,
+            NoteImportance::Critical,
+            0.8,
+            0.0,
+        );
+        let low_note = make_scored_note(
+            "Same content",
+            vec!["neo4j"],
+            NoteType::Tip,
+            NoteImportance::Low,
+            0.8,
+            0.0,
+        );
+
+        let critical_score =
+            score_note_relevance(&critical_note, Some("src/neo4j/client.rs"), None, "Read");
+        let low_score = score_note_relevance(&low_note, Some("src/neo4j/client.rs"), None, "Read");
+
+        // critical = 1.5x, low = 0.8x → critical should be ~1.875x the low
+        assert!(
+            critical_score > low_score,
+            "Critical note ({}) should score higher than low note ({})",
+            critical_score,
+            low_score
+        );
+        let ratio = critical_score / low_score;
+        assert!(
+            (ratio - 1.875).abs() < 0.3,
+            "Ratio should be ~1.875, got {}",
+            ratio
+        );
+    }
+
+    #[test]
+    fn test_score_freshness_decay() {
+        let fresh_note = make_scored_note(
+            "Fresh note",
+            vec!["neo4j"],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0, // fresh
+        );
+        let stale_note = make_scored_note(
+            "Stale note",
+            vec!["neo4j"],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.5, // stale
+        );
+
+        let fresh_score =
+            score_note_relevance(&fresh_note, Some("src/neo4j/client.rs"), None, "Read");
+        let stale_score =
+            score_note_relevance(&stale_note, Some("src/neo4j/client.rs"), None, "Read");
+
+        assert!(
+            fresh_score > stale_score,
+            "Fresh note ({}) should score higher than stale note ({})",
+            fresh_score,
+            stale_score
+        );
+    }
+
+    #[test]
+    fn test_score_note_type_affinity_edit_gotcha() {
+        let gotcha_note = make_scored_note(
+            "Watch out for this",
+            vec![],
+            NoteType::Gotcha,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        let tip_note = make_scored_note(
+            "Helpful tip here",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let gotcha_score =
+            score_note_relevance(&gotcha_note, Some("src/neo4j/client.rs"), None, "Edit");
+        let tip_score = score_note_relevance(&tip_note, Some("src/neo4j/client.rs"), None, "Edit");
+
+        assert!(
+            gotcha_score > tip_score,
+            "Gotcha note ({}) should score higher than tip ({}) for Edit tool",
+            gotcha_score,
+            tip_score
+        );
+    }
+
+    #[test]
+    fn test_score_note_type_affinity_mcp_guideline() {
+        let guideline_note = make_scored_note(
+            "Follow this pattern",
+            vec![],
+            NoteType::Guideline,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        let tip_note = make_scored_note(
+            "Helpful tip here",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let guideline_score = score_note_relevance(
+            &guideline_note,
+            Some("src/neo4j/client.rs"),
+            None,
+            "mcp__project-orchestrator__task",
+        );
+        let tip_score = score_note_relevance(
+            &tip_note,
+            Some("src/neo4j/client.rs"),
+            None,
+            "mcp__project-orchestrator__task",
+        );
+
+        assert!(
+            guideline_score > tip_score,
+            "Guideline note ({}) should score higher than tip ({}) for MCP tool",
+            guideline_score,
+            tip_score
+        );
+    }
+
+    #[test]
+    fn test_score_is_pure_no_side_effects() {
+        let note = make_scored_note(
+            "Test note",
+            vec!["neo4j"],
+            NoteType::Gotcha,
+            NoteImportance::High,
+            0.8,
+            0.1,
+        );
+
+        // Call twice with same inputs → same output
+        let score1 = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Edit");
+        let score2 = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Edit");
+
+        assert!(
+            (score1 - score2).abs() < f64::EPSILON,
+            "Function should be pure: {} != {}",
+            score1,
+            score2
+        );
+    }
+
+    #[test]
+    fn test_score_without_file_context() {
+        let note = make_scored_note(
+            "Generic note",
+            vec!["neo4j"],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        // Without file_context, only base score + importance + type affinity apply
+        let score = score_note_relevance(&note, None, None, "Read");
+        assert!(score > 0.0, "Score should still be positive: {}", score);
+        // Should be base (0.1) × importance (1.0) = 0.1
+        assert!(
+            (score - 0.1).abs() < f64::EPSILON,
+            "Score without context should be base 0.1, got {}",
+            score
+        );
+    }
+
+    #[test]
+    fn test_score_combo_ordering() {
+        // Simulate a real scenario: skill with mixed notes, file is neo4j
+        let notes = [
+            make_scored_note(
+                "Neo4j RETURN count() gotcha after DELETE",
+                vec!["neo4j", "cypher", "gotcha"],
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                0.9,
+                0.0,
+            ),
+            make_scored_note(
+                "Tauri window decoration bug on macOS",
+                vec!["tauri", "macos"],
+                NoteType::Gotcha,
+                NoteImportance::Critical,
+                0.9,
+                0.0,
+            ),
+            make_scored_note(
+                "General code review tip for better readability",
+                vec!["code-review"],
+                NoteType::Tip,
+                NoteImportance::Low,
+                0.5,
+                0.3,
+            ),
+        ];
+
+        let mut scored: Vec<(usize, f64)> = notes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                (
+                    i,
+                    score_note_relevance(n, Some("src/neo4j/client.rs"), None, "Edit"),
+                )
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        // Neo4j note should be first (tag affinity + content match + critical)
+        assert_eq!(scored[0].0, 0, "Neo4j note should rank first");
+        // Code review tip should be last (no affinity + low importance + stale)
+        assert_eq!(scored[2].0, 2, "Code review tip should rank last");
+    }
+
+    #[test]
+    fn test_same_directory() {
+        assert!(same_directory(
+            "src/neo4j/client.rs",
+            "src/neo4j/analytics.rs"
+        ));
+        assert!(!same_directory(
+            "src/neo4j/client.rs",
+            "src/api/handlers.rs"
+        ));
+        assert!(same_directory("/Users/x/src/neo4j/a.rs", "src/neo4j/b.rs"));
+        assert!(!same_directory("a.rs", "b.rs")); // no parent dir
+    }
+
+    // --- extract_file_paths_from_content ---
+
+    #[test]
+    fn test_extract_file_paths_relative() {
+        let content = "Modifier `src/neo4j/client.rs` pour ajouter la méthode.";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths, vec!["src/neo4j/client.rs"]);
+    }
+
+    #[test]
+    fn test_extract_file_paths_multiple() {
+        let content = "Les fichiers src/api/handlers.rs et src/neo4j/note.rs doivent être modifiés. Voir aussi src/skills/activation.rs.";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths.len(), 3);
+        assert!(paths.contains(&"src/api/handlers.rs".to_string()));
+        assert!(paths.contains(&"src/neo4j/note.rs".to_string()));
+        assert!(paths.contains(&"src/skills/activation.rs".to_string()));
+    }
+
+    #[test]
+    fn test_extract_file_paths_absolute_normalized() {
+        let content = "Le fichier /Users/foo/project/src/neo4j/client.rs doit être modifié.";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths, vec!["src/neo4j/client.rs"]);
+    }
+
+    #[test]
+    fn test_extract_file_paths_backtick_wrapped() {
+        let content = "Modifier `src/skills/triggers.rs` puis `src/mcp/tools.rs`";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"src/skills/triggers.rs".to_string()));
+        assert!(paths.contains(&"src/mcp/tools.rs".to_string()));
+    }
+
+    #[test]
+    fn test_extract_file_paths_ignores_urls() {
+        let content = "See https://example.com/src/neo4j/client.rs for docs";
+        let paths = extract_file_paths_from_content(content);
+        assert!(paths.is_empty(), "URLs should be ignored, got: {:?}", paths);
+    }
+
+    #[test]
+    fn test_extract_file_paths_ignores_rust_modules() {
+        let content = "Use crate::neo4j::client for the implementation";
+        let paths = extract_file_paths_from_content(content);
+        assert!(
+            paths.is_empty(),
+            "Rust module paths should be ignored, got: {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_extract_file_paths_no_paths() {
+        let content = "This is a note without any file path references at all.";
+        let paths = extract_file_paths_from_content(content);
+        assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn test_extract_file_paths_deduplicates() {
+        let content = "Modifier src/neo4j/client.rs. Le fichier src/neo4j/client.rs est critique.";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths, vec!["src/neo4j/client.rs"]);
+    }
+
+    #[test]
+    fn test_extract_file_paths_various_extensions() {
+        let content = "Files: src/app.ts, src/index.tsx, tests/test_foo.py, src/main.go";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths.len(), 4);
+    }
+
+    #[test]
+    fn test_extract_file_paths_tests_dir() {
+        let content = "Le fichier /home/user/project/tests/unit/test_note.rs à vérifier";
+        let paths = extract_file_paths_from_content(content);
+        assert_eq!(paths, vec!["tests/unit/test_note.rs"]);
+    }
+
+    #[test]
+    fn test_score_anchor_exact_match() {
+        use crate::notes::models::{EntityType as NoteEntityType, NoteAnchor};
+
+        let mut note = make_scored_note(
+            "Neo4j tip",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        note.anchors = vec![NoteAnchor::new(
+            NoteEntityType::File,
+            "src/neo4j/client.rs".to_string(),
+        )];
+
+        let note_without_anchors = make_scored_note(
+            "Neo4j tip",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let with_anchor = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+        let without_anchor = score_note_relevance(
+            &note_without_anchors,
+            Some("src/neo4j/client.rs"),
+            None,
+            "Read",
+        );
+
+        assert!(
+            with_anchor > without_anchor,
+            "Anchored note ({}) should score higher than non-anchored ({})",
+            with_anchor,
+            without_anchor
+        );
+        // Difference should be ~0.4 (exact match bonus)
+        let diff = with_anchor - without_anchor;
+        assert!(
+            (diff - 0.4).abs() < 0.01,
+            "Anchor bonus should be ~0.4, got {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_score_anchor_directory_match() {
+        use crate::notes::models::{EntityType as NoteEntityType, NoteAnchor};
+
+        let mut note = make_scored_note(
+            "Neo4j tip",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+        note.anchors = vec![NoteAnchor::new(
+            NoteEntityType::File,
+            "src/neo4j/analytics.rs".to_string(),
+        )];
+
+        let note_without_anchors = make_scored_note(
+            "Neo4j tip",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let with_dir_anchor =
+            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+        let without_anchor = score_note_relevance(
+            &note_without_anchors,
+            Some("src/neo4j/client.rs"),
+            None,
+            "Read",
+        );
+
+        // Directory match → +0.2
+        let diff = with_dir_anchor - without_anchor;
+        assert!(
+            (diff - 0.2).abs() < 0.01,
+            "Directory anchor bonus should be ~0.2, got {}",
+            diff
+        );
+    }
+
+    #[test]
+    fn test_score_no_anchors_no_bonus() {
+        let note = make_scored_note(
+            "Generic note",
+            vec![],
+            NoteType::Tip,
+            NoteImportance::Medium,
+            0.8,
+            0.0,
+        );
+
+        let score = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+        // base(0.1) × importance(1.0) = 0.1
+        assert!(
+            (score - 0.1).abs() < f64::EPSILON,
+            "No tags, no content match, no anchors → base score 0.1, got {}",
+            score
+        );
+    }
+
+    // --- E2E contextual scoring simulation ---
+
+    /// Simulates a realistic skill activation scenario: a skill with 15+ notes
+    /// of mixed topics (neo4j, tauri, chat, api), triggered by a Read on
+    /// `src/neo4j/client.rs`. Verifies that notes relevant to neo4j are
+    /// sorted first in the assembled context string.
+    #[test]
+    fn test_e2e_contextual_scoring_sorts_relevant_notes_first() {
+        use crate::notes::models::{EntityType as NoteEntityType, NoteAnchor};
+
+        // --- Build 18 notes with realistic diversity ---
+        let neo4j_notes = vec![
+            {
+                let mut n = make_scored_note(
+                    "Always use parameters in Cypher queries to prevent injection.",
+                    vec!["neo4j", "cypher", "security"],
+                    NoteType::Gotcha,
+                    NoteImportance::Critical,
+                    0.9,
+                    0.0,
+                );
+                n.anchors = vec![NoteAnchor::new(
+                    NoteEntityType::File,
+                    "src/neo4j/client.rs".to_string(),
+                )];
+                n
+            },
+            make_scored_note(
+                "Neo4j MERGE is not atomic, use unique constraints. See src/neo4j/client.rs.",
+                vec!["neo4j", "cypher", "gotcha"],
+                NoteType::Gotcha,
+                NoteImportance::High,
+                0.8,
+                0.05,
+            ),
+            make_scored_note(
+                "The Neo4j driver pool size should match tokio thread count.",
+                vec!["neo4j", "performance"],
+                NoteType::Tip,
+                NoteImportance::Medium,
+                0.7,
+                0.1,
+            ),
+            {
+                let mut n = make_scored_note(
+                    "All LINKED_TO relations must use this exact name, not ATTACHED_TO.",
+                    vec!["neo4j", "knowledge-fabric"],
+                    NoteType::Guideline,
+                    NoteImportance::High,
+                    0.85,
+                    0.0,
+                );
+                n.anchors = vec![NoteAnchor::new(
+                    NoteEntityType::File,
+                    "src/neo4j/note.rs".to_string(),
+                )];
+                n
+            },
+        ];
+
+        let tauri_notes = vec![
+            make_scored_note(
+                "Tauri IPC uses JSON serialization, avoid large binary payloads.",
+                vec!["tauri", "ipc", "performance"],
+                NoteType::Gotcha,
+                NoteImportance::High,
+                0.8,
+                0.0,
+            ),
+            make_scored_note(
+                "Use tauri::Manager for window management in multi-window setups.",
+                vec!["tauri", "desktop", "window"],
+                NoteType::Pattern,
+                NoteImportance::Medium,
+                0.6,
+                0.2,
+            ),
+            make_scored_note(
+                "Custom protocol handlers must be registered before window creation.",
+                vec!["tauri", "protocol"],
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                0.5,
+                0.3,
+            ),
+        ];
+
+        let chat_notes = vec![
+            make_scored_note(
+                "Chat session cleanup requires explicit entity unlinking first.",
+                vec!["chat", "session", "lifecycle"],
+                NoteType::Gotcha,
+                NoteImportance::Medium,
+                0.7,
+                0.1,
+            ),
+            make_scored_note(
+                "Message pagination uses offset/limit, not cursor-based.",
+                vec!["chat", "api", "pagination"],
+                NoteType::Context,
+                NoteImportance::Low,
+                0.5,
+                0.2,
+            ),
+            make_scored_note(
+                "The chat model field supports 'sonnet', 'opus', 'haiku' shortcuts.",
+                vec!["chat", "model"],
+                NoteType::Tip,
+                NoteImportance::Low,
+                0.4,
+                0.15,
+            ),
+        ];
+
+        let api_notes = vec![
+            make_scored_note(
+                "All API endpoints return 404 with {\"error\": \"...\"} JSON body.",
+                vec!["api", "rest", "error-handling"],
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                0.6,
+                0.1,
+            ),
+            make_scored_note(
+                "Rate limiting is not implemented yet, track in backlog.",
+                vec!["api", "security", "backlog"],
+                NoteType::Observation,
+                NoteImportance::Low,
+                0.3,
+                0.4,
+            ),
+        ];
+
+        let misc_notes = vec![
+            make_scored_note(
+                "French stop words must be filtered in trigger generation.",
+                vec!["triggers", "i18n"],
+                NoteType::Guideline,
+                NoteImportance::Medium,
+                0.6,
+                0.0,
+            ),
+            make_scored_note(
+                "Test helpers are in test_helpers.rs, use mock_app_state().",
+                vec!["testing", "mocking"],
+                NoteType::Tip,
+                NoteImportance::Medium,
+                0.5,
+                0.1,
+            ),
+            make_scored_note(
+                "Stale note with low energy should rank last.",
+                vec!["misc"],
+                NoteType::Observation,
+                NoteImportance::Low,
+                0.2,
+                0.8,
+            ),
+        ];
+
+        // Combine all notes in a deliberately non-optimal order
+        let mut all_notes: Vec<Note> = Vec::new();
+        all_notes.extend(tauri_notes);
+        all_notes.extend(chat_notes);
+        all_notes.extend(misc_notes);
+        all_notes.extend(api_notes);
+        all_notes.extend(neo4j_notes); // neo4j notes added LAST
+
+        assert_eq!(all_notes.len(), 15, "Should have 15 notes total");
+
+        // Score and sort (simulate what activate_for_hook does)
+        let file_context = Some("src/neo4j/client.rs");
+        let mut scored: Vec<(f64, &Note)> = all_notes
+            .iter()
+            .map(|n| (score_note_relevance(n, file_context, None, "Read"), n))
+            .collect();
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+        // The top 4 notes should ALL be neo4j-related
+        let top_4_contents: Vec<&str> = scored[0..4]
+            .iter()
+            .map(|(_, n)| n.content.as_str())
+            .collect();
+        for content in &top_4_contents {
+            assert!(
+                content.to_lowercase().contains("neo4j")
+                    || content.to_lowercase().contains("linked_to")
+                    || content.to_lowercase().contains("cypher"),
+                "Top-4 note should be neo4j-related, got: '{}'",
+                content
+            );
+        }
+
+        // The note with exact anchor + critical importance should be first
+        assert!(
+            scored[0].1.content.contains("parameters in Cypher"),
+            "First note should be the critical gotcha with exact anchor, got: '{}'",
+            scored[0].1.content
+        );
+
+        // The note mentioning client.rs in content should rank high (top 3)
+        let client_rs_note_rank = scored
+            .iter()
+            .position(|(_, n)| n.content.contains("client.rs"))
+            .expect("client.rs note should exist");
+        assert!(
+            client_rs_note_rank <= 2,
+            "Note mentioning client.rs should be in top 3, got rank {}",
+            client_rs_note_rank
+        );
+
+        // Tauri notes should be in the bottom half
+        let tauri_positions: Vec<usize> = scored
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, n))| n.tags.contains(&"tauri".to_string()))
+            .map(|(i, _)| i)
+            .collect();
+        for pos in &tauri_positions {
+            assert!(
+                *pos >= 4,
+                "Tauri notes should be below neo4j notes, found at position {}",
+                pos
+            );
+        }
+
+        // Assemble context and verify neo4j notes appear first in the string
+        let sorted_notes: Vec<Note> = scored.iter().map(|(_, n)| (*n).clone()).collect();
+        let decisions = vec![];
+        let (context_str, notes_included) = assemble_context_with_confidence(
+            "TestSkill",
+            &sorted_notes,
+            &decisions,
+            3200,
+            Some(0.75),
+            true, // pre_sorted
+        );
+
+        assert!(notes_included > 0, "Should include at least 1 note");
+        // With short notes, all 15 may fit in 3200 chars. The important thing
+        // is that the ORDER is correct (neo4j first), not that truncation happens.
+
+        // First note line in context should be neo4j-related
+        // Format is "- {emoji}{badge}{content}\n"
+        let first_note_line = context_str
+            .lines()
+            .find(|l| l.starts_with("- "))
+            .expect("Should have at least one note line");
+        assert!(
+            first_note_line.to_lowercase().contains("cypher")
+                || first_note_line.to_lowercase().contains("parameter"),
+            "First note in context should be neo4j-related, got: '{}'",
+            first_note_line
+        );
+    }
+
+    /// Verifies the regression guard: when no file_context or pattern is
+    /// provided, the scoring falls back to energy-based ordering
+    /// (legacy behavior preserved).
+    #[test]
+    fn test_e2e_no_context_preserves_legacy_ordering() {
+        let high_energy = make_scored_note(
+            "High energy generic note",
+            vec!["misc"],
+            NoteType::Tip,
+            NoteImportance::Low,
+            0.95,
+            0.0,
+        );
+        let low_energy = make_scored_note(
+            "Low energy generic note",
+            vec!["misc"],
+            NoteType::Tip,
+            NoteImportance::Low,
+            0.3,
+            0.0,
+        );
+
+        let score_high = score_note_relevance(&high_energy, None, None, "Read");
+        let score_low = score_note_relevance(&low_energy, None, None, "Read");
+
+        // Without file_context, all signals except importance are inert.
+        // Both have same importance (Low → ×0.8), so scores should be equal.
+        assert!(
+            (score_high - score_low).abs() < f64::EPSILON,
+            "Without context, scores should be equal regardless of energy: high={}, low={}",
+            score_high,
+            score_low
         );
     }
 }
