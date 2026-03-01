@@ -722,6 +722,125 @@ impl Neo4jClient {
         Ok(())
     }
 
+    /// Batch-update structural fingerprint vectors on File nodes.
+    ///
+    /// Uses UNWIND in chunks of 1000 to write `structural_fingerprint` as a list of floats.
+    /// Fingerprint = 17-dimensional universal feature vector, project-independent.
+    pub async fn batch_update_structural_fingerprints(
+        &self,
+        updates: &[crate::graph::models::StructuralFingerprintUpdate],
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        const CHUNK_SIZE: usize = 1000;
+
+        for chunk in updates.chunks(CHUNK_SIZE) {
+            let items: Vec<std::collections::HashMap<String, neo4rs::BoltType>> = chunk
+                .iter()
+                .map(|u| {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert("path".into(), u.path.clone().into());
+                    let fp_list: Vec<neo4rs::BoltType> =
+                        u.fingerprint.iter().map(|&v| v.into()).collect();
+                    m.insert(
+                        "fingerprint".into(),
+                        neo4rs::BoltType::List(neo4rs::BoltList::from(fp_list)),
+                    );
+                    m
+                })
+                .collect();
+
+            let q = query(
+                r#"
+                UNWIND $items AS u
+                MATCH (f:File {path: u.path})
+                SET f.structural_fingerprint = u.fingerprint,
+                    f.structural_fingerprint_updated_at = datetime()
+                "#,
+            )
+            .param("items", items);
+
+            self.graph.run(q).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Read structural fingerprint vectors for all File nodes in a project.
+    ///
+    /// Returns (file_path, fingerprint_vector) pairs.
+    pub async fn get_project_structural_fingerprints(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, Vec<f64>)>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.structural_fingerprint IS NOT NULL
+            RETURN f.path AS path, f.structural_fingerprint AS fingerprint
+            "#,
+        )
+        .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut fp_list = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let (Ok(path), Ok(fp)) = (
+                row.get::<String>("path"),
+                row.get::<Vec<f64>>("fingerprint"),
+            ) {
+                fp_list.push((path, fp));
+            }
+        }
+
+        Ok(fp_list)
+    }
+
+    /// Read all file signals needed for multi-signal structural similarity.
+    ///
+    /// Single query returns fingerprint, WL hash, and function count for each file.
+    /// Scoped by project_id. Only returns files that have a computed fingerprint.
+    pub async fn get_project_file_signals(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<crate::graph::models::FileSignalRecord>> {
+        let q = query(
+            r#"
+            MATCH (p:Project {id: $project_id})-[:CONTAINS]->(f:File)
+            WHERE f.structural_fingerprint IS NOT NULL
+            OPTIONAL MATCH (f)-[:CONTAINS]->(fn:Function)
+            WITH f, count(fn) AS func_count
+            RETURN f.path AS path,
+                   f.structural_fingerprint AS fingerprint,
+                   COALESCE(f.cc_wl_hash, 0) AS wl_hash,
+                   func_count AS function_count
+            "#,
+        )
+        .param("project_id", project_id);
+
+        let mut result = self.graph.execute(q).await?;
+        let mut records = Vec::new();
+
+        while let Some(row) = result.next().await? {
+            if let Ok(path) = row.get::<String>("path") {
+                let fingerprint: Vec<f64> = row.get("fingerprint").unwrap_or_default();
+                let wl_hash = row.get::<i64>("wl_hash").unwrap_or(0) as u64;
+                let function_count = row.get::<i64>("function_count").unwrap_or(0) as usize;
+                records.push(crate::graph::models::FileSignalRecord {
+                    path,
+                    fingerprint,
+                    wl_hash,
+                    function_count,
+                });
+            }
+        }
+
+        Ok(records)
+    }
+
     /// Write predicted missing links for a project.
     ///
     /// First removes old PREDICTED_LINK edges for this project, then creates new ones.
@@ -1383,6 +1502,9 @@ impl Neo4jClient {
                     let co_changers_json =
                         serde_json::to_string(&c.cc_co_changers_top5).unwrap_or_default();
                     m.insert("cc_co_changers_top5".into(), co_changers_json.into());
+                    // Fingerprint vector stored as JSON string (nested arrays not supported in UNWIND)
+                    let fp_json = serde_json::to_string(&c.cc_fingerprint).unwrap_or_default();
+                    m.insert("cc_fingerprint".into(), fp_json.into());
                     m.insert("cc_version".into(), (c.cc_version as i64).into());
                     m.insert("cc_computed_at".into(), c.cc_computed_at.clone().into());
                     m
@@ -1405,6 +1527,7 @@ impl Neo4jClient {
                     f.cc_structural_dna = row.cc_structural_dna,
                     f.cc_wl_hash = row.cc_wl_hash,
                     f.cc_co_changers_top5 = row.cc_co_changers_top5,
+                    f.cc_fingerprint = row.cc_fingerprint,
                     f.cc_version = row.cc_version,
                     f.cc_computed_at = row.cc_computed_at
                 "#,
@@ -1473,6 +1596,7 @@ impl Neo4jClient {
                    COALESCE(f.cc_structural_dna, '[]') AS cc_structural_dna,
                    COALESCE(f.cc_wl_hash, 0) AS cc_wl_hash,
                    COALESCE(f.cc_co_changers_top5, '[]') AS cc_co_changers_top5,
+                   COALESCE(f.cc_fingerprint, '[]') AS cc_fingerprint,
                    COALESCE(f.cc_version, 0) AS cc_version,
                    COALESCE(f.cc_computed_at, '') AS cc_computed_at
             "#,
@@ -1498,6 +1622,10 @@ impl Neo4jClient {
                 cc_calls_in: row.get::<i64>("cc_calls_in").unwrap_or(0) as usize,
                 cc_structural_dna: serde_json::from_str(&dna_json).unwrap_or_default(),
                 cc_wl_hash: row.get::<i64>("cc_wl_hash").unwrap_or(0) as u64,
+                cc_fingerprint: {
+                    let fp_json: String = row.get("cc_fingerprint").unwrap_or_default();
+                    serde_json::from_str(&fp_json).unwrap_or_default()
+                },
                 cc_co_changers_top5: serde_json::from_str(&co_changers_json).unwrap_or_default(),
                 cc_version: row.get::<i64>("cc_version").unwrap_or(0) as i32,
                 cc_computed_at: row.get("cc_computed_at").unwrap_or_default(),
@@ -1537,6 +1665,7 @@ impl Neo4jClient {
                    COALESCE(f.cc_structural_dna, '[]') AS cc_structural_dna,
                    COALESCE(f.cc_wl_hash, 0) AS cc_wl_hash,
                    COALESCE(f.cc_co_changers_top5, '[]') AS cc_co_changers_top5,
+                   COALESCE(f.cc_fingerprint, '[]') AS cc_fingerprint,
                    COALESCE(f.cc_version, 0) AS cc_version,
                    COALESCE(f.cc_computed_at, '') AS cc_computed_at
             "#,
@@ -1564,6 +1693,10 @@ impl Neo4jClient {
                 cc_calls_in: row.get::<i64>("cc_calls_in").unwrap_or(0) as usize,
                 cc_structural_dna: serde_json::from_str(&dna_json).unwrap_or_default(),
                 cc_wl_hash: row.get::<i64>("cc_wl_hash").unwrap_or(0) as u64,
+                cc_fingerprint: {
+                    let fp_json: String = row.get("cc_fingerprint").unwrap_or_default();
+                    serde_json::from_str(&fp_json).unwrap_or_default()
+                },
                 cc_co_changers_top5: serde_json::from_str(&co_changers_json).unwrap_or_default(),
                 cc_version: row.get::<i64>("cc_version").unwrap_or(0) as i32,
                 cc_computed_at: row.get("cc_computed_at").unwrap_or_default(),

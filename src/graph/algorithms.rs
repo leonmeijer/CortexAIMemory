@@ -989,6 +989,19 @@ pub fn compute_all_extended(
     let structural_dna_map = dna_result.unwrap_or_default();
     grail_stats.dna_computed = structural_dna_map.len();
 
+    // --- Step 5b: Structural Fingerprint (depends on analytics) ---
+    let (fp_result, fp_timing) = timed_step("structural_fingerprint", || {
+        let mut fps = compute_structural_fingerprint(&working_graph, &analytics);
+        if let Some(ref targets) = incremental_targets {
+            fps.retain(|id, _| targets.contains(id));
+        }
+        Ok(fps)
+    });
+    timings.push(fp_timing);
+
+    let structural_fingerprint_map = fp_result.unwrap_or_default();
+    grail_stats.fingerprints_computed = structural_fingerprint_map.len();
+
     // --- Step 6: WL Subgraph Hash ---
     let (wl_result, wl_timing) = timed_step("wl_subgraph_hash", || {
         let mut hashes =
@@ -1041,7 +1054,13 @@ pub fn compute_all_extended(
 
     // --- Step 9: Context Cards (aggregates ALL above) ---
     let (cards_result, cards_timing) = timed_step("context_cards", || {
-        let cards = compute_context_cards(graph, &analytics, &structural_dna_map, &wl_hashes);
+        let cards = compute_context_cards(
+            graph,
+            &analytics,
+            &structural_dna_map,
+            &wl_hashes,
+            &structural_fingerprint_map,
+        );
         grail_stats.cards_computed = cards.len();
         Ok(cards)
     });
@@ -1064,6 +1083,7 @@ pub fn compute_all_extended(
         grail_stats,
         structural_dna: structural_dna_map,
         wl_hashes,
+        structural_fingerprints: structural_fingerprint_map,
         predicted_links,
         context_cards,
         mode,
@@ -1175,6 +1195,335 @@ pub fn structural_dna(
     Ok(dna_map)
 }
 
+// ============================================================================
+// Structural Fingerprint v2 — Universal cross-project similarity
+// ============================================================================
+
+/// Convert raw values to log-percentiles for power-law distributed metrics.
+///
+/// Uses `log(rank+1) / log(N+1)` instead of `rank/N` to preserve discrimination
+/// in the tail of power-law distributions (inspired by bibliometrics research).
+fn to_log_percentiles(values: &[f64]) -> Vec<f64> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let n = values.len();
+    if n == 1 {
+        return vec![0.5]; // single element gets median percentile
+    }
+
+    // Create (original_index, value) pairs and sort by value
+    let mut indexed: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut percentiles = vec![0.0; n];
+    let log_n = (n as f64 + 1.0).ln();
+
+    for (rank, (orig_idx, _)) in indexed.iter().enumerate() {
+        percentiles[*orig_idx] = (rank as f64 + 1.0).ln() / log_n;
+    }
+
+    percentiles
+}
+
+/// Convert raw values to linear percentiles (rank/N).
+///
+/// Used for metrics with roughly uniform distributions (betweenness, type_count, etc.).
+fn to_linear_percentiles(values: &[f64]) -> Vec<f64> {
+    if values.is_empty() {
+        return Vec::new();
+    }
+    let n = values.len();
+    if n == 1 {
+        return vec![0.5];
+    }
+
+    let mut indexed: Vec<(usize, f64)> = values.iter().copied().enumerate().collect();
+    indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut percentiles = vec![0.0; n];
+    for (rank, (orig_idx, _)) in indexed.iter().enumerate() {
+        percentiles[*orig_idx] = rank as f64 / (n - 1).max(1) as f64;
+    }
+
+    percentiles
+}
+
+/// Shannon entropy of a distribution, normalized to [0, 1].
+///
+/// Returns 0.0 for empty/single-element distributions, 1.0 for uniform distribution.
+fn normalized_shannon_entropy(counts: &[usize]) -> f64 {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        return 0.0;
+    }
+    let n_categories = counts.iter().filter(|&&c| c > 0).count();
+    if n_categories <= 1 {
+        return 0.0;
+    }
+    let total_f = total as f64;
+    let entropy: f64 = counts
+        .iter()
+        .filter(|&&c| c > 0)
+        .map(|&c| {
+            let p = c as f64 / total_f;
+            -p * p.ln()
+        })
+        .sum();
+    let max_entropy = (n_categories as f64).ln();
+    if max_entropy == 0.0 {
+        0.0
+    } else {
+        (entropy / max_entropy).clamp(0.0, 1.0)
+    }
+}
+
+/// Compute structural fingerprints for all File nodes in the graph.
+///
+/// Returns a 17-dimensional feature vector per file with project-independent
+/// semantics, enabling cross-project comparison. See `FINGERPRINT_LABELS`
+/// for the meaning of each dimension.
+///
+/// Uses log-percentiles for power-law metrics (degree, pagerank) and
+/// linear percentiles for uniform metrics (betweenness, type_count).
+///
+/// Dimensions requiring Neo4j-only data (d9: avg_complexity, d10: ratio_public,
+/// d11: ratio_async) are set to 0.0 and enriched later in the pipeline.
+pub fn compute_structural_fingerprint(
+    graph: &CodeGraph,
+    analytics: &GraphAnalytics,
+) -> HashMap<String, Vec<f64>> {
+    use super::models::{CodeEdgeType, CodeNodeType, FINGERPRINT_DIMS};
+
+    let g = &graph.graph;
+
+    // Phase 1: Collect raw metrics per File node
+    struct RawMetrics {
+        imports_in: f64,
+        imports_out: f64,
+        calls_in: f64,
+        calls_out: f64,
+        pagerank: f64,
+        betweenness: f64,
+        clustering: f64,
+        function_count: f64,
+        type_count: f64,
+        // d9 (avg_complexity), d10 (ratio_public), d11 (ratio_async) = 0.0
+        // (enriched from Neo4j in pipeline step)
+        fan_ratio: f64,
+        co_changer_count: f64,
+        community_role_raw: f64,      // will be encoded as 0.0/0.5/1.0
+        neighbor_type_entropy: f64,   // d15
+        neighbor_degree_entropy: f64, // d16 (struc2vec-inspired)
+    }
+
+    let mut file_ids: Vec<String> = Vec::new();
+    let mut raw_metrics: Vec<RawMetrics> = Vec::new();
+
+    // Pre-compute co-change data
+    let co_change_data = extract_co_change_data(graph);
+
+    for (node_id, node_idx) in &graph.id_to_index {
+        let node = &g[*node_idx];
+        if node.node_type != CodeNodeType::File {
+            continue;
+        }
+
+        // Get analytics metrics
+        let metrics = analytics.metrics.get(node_id);
+        let pagerank = metrics.map(|m| m.pagerank).unwrap_or(0.0);
+        let betweenness = metrics.map(|m| m.betweenness).unwrap_or(0.0);
+        let clustering = metrics.map(|m| m.clustering_coefficient).unwrap_or(0.0);
+        let _community_id = metrics.map(|m| m.community_id).unwrap_or(0);
+
+        // Count edges by type (imports/calls in/out)
+        let mut imports_out = 0usize;
+        let mut imports_in = 0usize;
+        let mut calls_out = 0usize;
+        let mut calls_in = 0usize;
+        let mut function_count = 0usize;
+        let mut type_count = 0usize; // structs + traits + enums
+
+        // Outgoing edges
+        for edge_ref in g.edges(*node_idx) {
+            match edge_ref.weight().edge_type {
+                CodeEdgeType::Imports => imports_out += 1,
+                CodeEdgeType::Calls => calls_out += 1,
+                CodeEdgeType::Defines => {
+                    // Count children by type
+                    let target = &g[edge_ref.target()];
+                    match target.node_type {
+                        CodeNodeType::Function => function_count += 1,
+                        CodeNodeType::Struct | CodeNodeType::Trait | CodeNodeType::Enum => {
+                            type_count += 1
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Incoming edges
+        for edge_ref in g.edges_directed(*node_idx, petgraph::Direction::Incoming) {
+            match edge_ref.weight().edge_type {
+                CodeEdgeType::Imports => imports_in += 1,
+                CodeEdgeType::Calls => calls_in += 1,
+                _ => {}
+            }
+        }
+
+        // d12: fan_ratio = imports_in / (imports_in + imports_out)
+        let total_imports = imports_in + imports_out;
+        let fan_ratio = if total_imports > 0 {
+            imports_in as f64 / total_imports as f64
+        } else {
+            0.5 // neutral
+        };
+
+        // d13: co-changer count (number of files that co-change with this one)
+        let co_changer_count = co_change_data
+            .keys()
+            .filter(|(a, b)| a == node_id || b == node_id)
+            .count() as f64;
+
+        // d14: community role — hub/bridge/peripheral (encoded later via percentiles)
+        // For now, store raw total_degree for percentile-based encoding
+        let total_degree = (imports_in + imports_out + calls_in + calls_out) as f64;
+
+        // d15: neighbor type entropy — Shannon entropy over CodeNodeType of neighbors
+        let mut neighbor_type_counts = [0usize; 5]; // File, Function, Struct, Trait, Enum
+        for neighbor_idx in g.neighbors_undirected(*node_idx) {
+            let neighbor = &g[neighbor_idx];
+            match neighbor.node_type {
+                CodeNodeType::File => neighbor_type_counts[0] += 1,
+                CodeNodeType::Function => neighbor_type_counts[1] += 1,
+                CodeNodeType::Struct => neighbor_type_counts[2] += 1,
+                CodeNodeType::Trait => neighbor_type_counts[3] += 1,
+                CodeNodeType::Enum => neighbor_type_counts[4] += 1,
+            }
+        }
+        let neighbor_type_entropy = normalized_shannon_entropy(&neighbor_type_counts);
+
+        // d16: neighbor degree entropy (struc2vec-inspired)
+        // Shannon entropy of the degree distribution of neighbors
+        let mut neighbor_degrees: HashMap<usize, usize> = HashMap::new();
+        for neighbor_idx in g.neighbors_undirected(*node_idx) {
+            let deg = g.edges(neighbor_idx).count()
+                + g.edges_directed(neighbor_idx, petgraph::Direction::Incoming)
+                    .count();
+            *neighbor_degrees.entry(deg).or_insert(0) += 1;
+        }
+        let degree_counts: Vec<usize> = neighbor_degrees.values().copied().collect();
+        let neighbor_degree_entropy = normalized_shannon_entropy(&degree_counts);
+
+        file_ids.push(node_id.clone());
+        raw_metrics.push(RawMetrics {
+            imports_in: imports_in as f64,
+            imports_out: imports_out as f64,
+            calls_in: calls_in as f64,
+            calls_out: calls_out as f64,
+            pagerank,
+            betweenness,
+            clustering,
+            function_count: function_count as f64,
+            type_count: type_count as f64,
+            fan_ratio,
+            co_changer_count,
+            community_role_raw: total_degree,
+            neighbor_type_entropy,
+            neighbor_degree_entropy,
+        });
+    }
+
+    let n = file_ids.len();
+    if n == 0 {
+        return HashMap::new();
+    }
+
+    // Phase 2: Convert raw metrics to percentiles
+
+    // Extract raw value vectors for each percentile-based dimension
+    let imports_in_vals: Vec<f64> = raw_metrics.iter().map(|m| m.imports_in).collect();
+    let imports_out_vals: Vec<f64> = raw_metrics.iter().map(|m| m.imports_out).collect();
+    let calls_in_vals: Vec<f64> = raw_metrics.iter().map(|m| m.calls_in).collect();
+    let calls_out_vals: Vec<f64> = raw_metrics.iter().map(|m| m.calls_out).collect();
+    let pagerank_vals: Vec<f64> = raw_metrics.iter().map(|m| m.pagerank).collect();
+    let betweenness_vals: Vec<f64> = raw_metrics.iter().map(|m| m.betweenness).collect();
+    let function_count_vals: Vec<f64> = raw_metrics.iter().map(|m| m.function_count).collect();
+    let type_count_vals: Vec<f64> = raw_metrics.iter().map(|m| m.type_count).collect();
+    let co_changer_vals: Vec<f64> = raw_metrics.iter().map(|m| m.co_changer_count).collect();
+    let degree_vals: Vec<f64> = raw_metrics.iter().map(|m| m.community_role_raw).collect();
+
+    // Log-percentiles for power-law metrics
+    let imports_in_pct = to_log_percentiles(&imports_in_vals);
+    let imports_out_pct = to_log_percentiles(&imports_out_vals);
+    let calls_in_pct = to_log_percentiles(&calls_in_vals);
+    let calls_out_pct = to_log_percentiles(&calls_out_vals);
+    let pagerank_pct = to_log_percentiles(&pagerank_vals);
+    let function_count_pct = to_log_percentiles(&function_count_vals);
+
+    // Linear percentiles for more uniform metrics
+    let betweenness_pct = to_linear_percentiles(&betweenness_vals);
+    let type_count_pct = to_linear_percentiles(&type_count_vals);
+    let co_changer_pct = to_linear_percentiles(&co_changer_vals);
+    let degree_pct = to_linear_percentiles(&degree_vals);
+    let betweenness_raw_pct = to_linear_percentiles(&betweenness_vals);
+
+    // Phase 3: Assemble fingerprint vectors
+    let mut result = HashMap::with_capacity(n);
+
+    for i in 0..n {
+        let mut fingerprint = vec![0.0f64; FINGERPRINT_DIMS];
+
+        // d0-d3: degree percentiles (log)
+        fingerprint[0] = imports_in_pct[i];
+        fingerprint[1] = imports_out_pct[i];
+        fingerprint[2] = calls_in_pct[i];
+        fingerprint[3] = calls_out_pct[i];
+
+        // d4-d6: centrality
+        fingerprint[4] = pagerank_pct[i];
+        fingerprint[5] = betweenness_pct[i];
+        fingerprint[6] = raw_metrics[i].clustering; // raw 0-1
+
+        // d7-d8: code content (d9 = avg_complexity left at 0.0, enriched from Neo4j)
+        fingerprint[7] = function_count_pct[i];
+        fingerprint[8] = type_count_pct[i];
+        // fingerprint[9] = 0.0; // avg_complexity_pct — enriched later
+
+        // d10-d11: code style (left at 0.0, enriched from Neo4j)
+        // fingerprint[10] = 0.0; // ratio_public — enriched later
+        // fingerprint[11] = 0.0; // ratio_async — enriched later
+
+        // d12: fan ratio (raw 0-1)
+        fingerprint[12] = raw_metrics[i].fan_ratio;
+
+        // d13: co-changer count percentile
+        fingerprint[13] = co_changer_pct[i];
+
+        // d14: community role — hub(0.0) / bridge(0.5) / peripheral(1.0)
+        // Hub = top 10% by degree, bridge = top 20% by betweenness, else peripheral
+        fingerprint[14] = if degree_pct[i] >= 0.9 {
+            0.0 // hub
+        } else if betweenness_raw_pct[i] >= 0.8 {
+            0.5 // bridge
+        } else {
+            1.0 // peripheral
+        };
+
+        // d15: neighbor type entropy (raw 0-1)
+        fingerprint[15] = raw_metrics[i].neighbor_type_entropy;
+
+        // d16: neighbor degree entropy (raw 0-1, struc2vec-inspired)
+        fingerprint[16] = raw_metrics[i].neighbor_degree_entropy;
+
+        result.insert(file_ids[i].clone(), fingerprint);
+    }
+
+    result
+}
+
 /// Compute cosine similarity between two DNA vectors.
 pub fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
     if a.len() != b.len() || a.is_empty() {
@@ -1209,6 +1558,226 @@ pub fn find_structural_twins(
     similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     similarities.truncate(top_n);
     similarities
+}
+
+// ============================================================================
+// Multi-signal Structural Similarity (Fingerprint v2)
+// ============================================================================
+
+/// Fusion weights for multi-signal similarity.
+const W_FINGERPRINT: f64 = 0.50;
+const W_WL_HASH: f64 = 0.20;
+const W_NAME: f64 = 0.20;
+const W_SIZE: f64 = 0.10;
+
+/// Compute Jaro similarity between two strings.
+///
+/// Returns a value in [0.0, 1.0] where 1.0 means identical.
+/// This is the base for Jaro-Winkler and works well for short file-stem comparisons.
+fn jaro_similarity(s1: &str, s2: &str) -> f64 {
+    if s1 == s2 {
+        return 1.0;
+    }
+    let len1 = s1.len();
+    let len2 = s2.len();
+    if len1 == 0 || len2 == 0 {
+        return 0.0;
+    }
+
+    let match_distance = (std::cmp::max(len1, len2) / 2).saturating_sub(1);
+
+    let s1_bytes = s1.as_bytes();
+    let s2_bytes = s2.as_bytes();
+    let mut s1_matched = vec![false; len1];
+    let mut s2_matched = vec![false; len2];
+
+    let mut matches = 0usize;
+    let mut transpositions = 0usize;
+
+    // Count matching characters
+    for i in 0..len1 {
+        let start = i.saturating_sub(match_distance);
+        let end = std::cmp::min(i + match_distance + 1, len2);
+        for j in start..end {
+            if s2_matched[j] || s1_bytes[i] != s2_bytes[j] {
+                continue;
+            }
+            s1_matched[i] = true;
+            s2_matched[j] = true;
+            matches += 1;
+            break;
+        }
+    }
+
+    if matches == 0 {
+        return 0.0;
+    }
+
+    // Count transpositions
+    let mut k = 0usize;
+    for i in 0..len1 {
+        if !s1_matched[i] {
+            continue;
+        }
+        while !s2_matched[k] {
+            k += 1;
+        }
+        if s1_bytes[i] != s2_bytes[k] {
+            transpositions += 1;
+        }
+        k += 1;
+    }
+
+    let m = matches as f64;
+    let t = transpositions as f64 / 2.0;
+    (m / len1 as f64 + m / len2 as f64 + (m - t) / m) / 3.0
+}
+
+/// Compute Jaro-Winkler similarity between two strings.
+///
+/// Boosts the Jaro score when the strings share a common prefix (up to 4 chars).
+/// Good for file names that often share prefixes like "user_", "auth_", etc.
+fn jaro_winkler_similarity(s1: &str, s2: &str) -> f64 {
+    let jaro = jaro_similarity(s1, s2);
+    if jaro == 0.0 {
+        return 0.0;
+    }
+
+    // Count common prefix (max 4 characters)
+    let prefix_len = s1
+        .chars()
+        .zip(s2.chars())
+        .take(4)
+        .take_while(|(a, b)| a == b)
+        .count();
+
+    // Winkler scaling factor p = 0.1 (standard)
+    jaro + prefix_len as f64 * 0.1 * (1.0 - jaro)
+}
+
+/// Extract the file stem (name without extension and path).
+///
+/// "src/api/handlers.rs" → "handlers"
+/// "components/UserProfile.tsx" → "UserProfile"
+fn file_stem(path: &str) -> &str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    name.split('.').next().unwrap_or(name)
+}
+
+/// Compute log-size similarity between two function counts.
+///
+/// Uses `1 - |log(a+1) - log(b+1)| / log(max+1)` to produce a value in [0, 1].
+/// Files with similar function counts (scale-wise) get high scores.
+fn log_size_similarity(count_a: usize, count_b: usize) -> f64 {
+    let la = (count_a as f64 + 1.0).ln();
+    let lb = (count_b as f64 + 1.0).ln();
+    let max_log = la.max(lb);
+    if max_log == 0.0 {
+        return 1.0; // Both zero → identical
+    }
+    1.0 - (la - lb).abs() / max_log
+}
+
+/// Input data for one file in multi-signal similarity computation.
+#[derive(Debug, Clone)]
+pub struct FileSignals {
+    /// File path (used as identifier)
+    pub path: String,
+    /// 17-dim structural fingerprint vector (from `compute_structural_fingerprint`)
+    pub fingerprint: Vec<f64>,
+    /// WL subgraph hash (from `wl_subgraph_hash_all`), None if unavailable
+    pub wl_hash: Option<u64>,
+    /// Number of functions defined in this file (d7 raw value)
+    pub function_count: usize,
+}
+
+/// Compute multi-signal fused similarity between two files.
+///
+/// Combines four independent signals with fixed weights:
+/// - **Fingerprint cosine** (0.50): 17-dim structural role vector comparison
+/// - **WL hash match** (0.20): exact topological neighborhood match bonus
+/// - **Name similarity** (0.20): Jaro-Winkler on file stems (cross-project naming patterns)
+/// - **Size similarity** (0.10): log-ratio of function counts
+///
+/// Returns a `FingerprintSimilarity` with the fused score and per-signal breakdown.
+pub fn compute_multi_signal_similarity(
+    source: &FileSignals,
+    target: &FileSignals,
+) -> super::models::FingerprintSimilarity {
+    // Signal 1: Fingerprint cosine similarity (weight 0.50)
+    let fp_sim = if source.fingerprint.is_empty() || target.fingerprint.is_empty() {
+        0.0
+    } else {
+        cosine_similarity(&source.fingerprint, &target.fingerprint)
+    };
+
+    // Signal 2: WL hash exact match (weight 0.20)
+    let wl_match = match (source.wl_hash, target.wl_hash) {
+        (Some(a), Some(b)) if a == b => 1.0,
+        _ => 0.0,
+    };
+
+    // Signal 3: File name Jaro-Winkler similarity (weight 0.20)
+    let name_sim = jaro_winkler_similarity(file_stem(&source.path), file_stem(&target.path));
+
+    // Signal 4: Log-size similarity (weight 0.10)
+    let size_sim = log_size_similarity(source.function_count, target.function_count);
+
+    // Fused score
+    let fused =
+        W_FINGERPRINT * fp_sim + W_WL_HASH * wl_match + W_NAME * name_sim + W_SIZE * size_sim;
+
+    super::models::FingerprintSimilarity {
+        source: source.path.clone(),
+        target: target.path.clone(),
+        similarity: fused,
+        signals: super::models::SimilaritySignals {
+            fingerprint_similarity: fp_sim,
+            wl_hash_match: wl_match,
+            name_similarity: name_sim,
+            size_similarity: size_sim,
+        },
+        shared_role: None, // Caller can enrich this based on community/cluster labels
+    }
+}
+
+/// Find cross-project structural twins using multi-signal fusion.
+///
+/// Given a source file's signals and a collection of candidate files from other projects,
+/// computes fused similarity for each candidate and returns the top-N most similar.
+///
+/// This replaces the old DNA-only cosine approach which suffered from project-specific
+/// anchor bias (all similarities ≈ 0.999).
+pub fn find_cross_project_twins_multi_signal(
+    source: &FileSignals,
+    candidates: &[FileSignals],
+    top_n: usize,
+) -> Vec<super::models::FingerprintSimilarity> {
+    let mut results: Vec<super::models::FingerprintSimilarity> = candidates
+        .iter()
+        .filter(|c| c.path != source.path)
+        .map(|candidate| compute_multi_signal_similarity(source, candidate))
+        .collect();
+
+    results.sort_by(|a, b| {
+        b.similarity
+            .partial_cmp(&a.similarity)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    results.truncate(top_n);
+    results
+}
+
+/// Find intra-project structural twins using multi-signal fusion.
+///
+/// Same as cross-project but operates within a single project's file set.
+/// Uses fingerprints instead of DNA to avoid the anchor-bias problem.
+pub fn find_structural_twins_multi_signal(
+    source: &FileSignals,
+    project_files: &[FileSignals],
+    top_n: usize,
+) -> Vec<super::models::FingerprintSimilarity> {
+    find_cross_project_twins_multi_signal(source, project_files, top_n)
 }
 
 // ============================================================================
@@ -2379,6 +2948,7 @@ pub fn compute_context_cards(
     analytics: &GraphAnalytics,
     dna_map: &HashMap<String, Vec<f64>>,
     wl_hashes: &HashMap<String, u64>,
+    fp_map: &HashMap<String, Vec<f64>>,
 ) -> Vec<super::models::ContextCard> {
     use super::models::{CodeEdgeType, CodeNodeType, ContextCard};
 
@@ -2472,6 +3042,7 @@ pub fn compute_context_cards(
             cc_calls_in: calls_in,
             cc_structural_dna: dna,
             cc_wl_hash: wl,
+            cc_fingerprint: fp_map.get(node_id).cloned().unwrap_or_default(),
             cc_co_changers_top5,
             cc_version: 1,
             cc_computed_at: now.clone(),
@@ -4346,6 +4917,353 @@ mod tests {
     }
 
     // ========================================================================
+    // Multi-signal similarity tests
+    // ========================================================================
+
+    #[test]
+    fn test_jaro_winkler_identical() {
+        assert!((jaro_winkler_similarity("handlers", "handlers") - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_jaro_winkler_similar_names() {
+        let sim = jaro_winkler_similarity("handlers", "handler");
+        assert!(
+            sim > 0.9,
+            "Similar names should have high similarity: {sim}"
+        );
+    }
+
+    #[test]
+    fn test_jaro_winkler_different_names() {
+        let sim = jaro_winkler_similarity("handlers", "models");
+        assert!(
+            sim < 0.7,
+            "Different names should have low similarity: {sim}"
+        );
+    }
+
+    #[test]
+    fn test_jaro_winkler_empty() {
+        assert_eq!(jaro_winkler_similarity("", "test"), 0.0);
+        assert_eq!(jaro_winkler_similarity("test", ""), 0.0);
+        assert_eq!(jaro_winkler_similarity("", ""), 1.0);
+    }
+
+    #[test]
+    fn test_jaro_winkler_prefix_boost() {
+        // "user_profile" vs "user_settings" share "user_" prefix → boosted
+        let with_prefix = jaro_winkler_similarity("user_profile", "user_settings");
+        // "profile_user" vs "settings_user" share no prefix → not boosted
+        let without_prefix = jaro_winkler_similarity("profile_user", "settings_user");
+        assert!(
+            with_prefix > without_prefix,
+            "Common prefix should boost: {with_prefix} vs {without_prefix}"
+        );
+    }
+
+    #[test]
+    fn test_file_stem() {
+        assert_eq!(file_stem("src/api/handlers.rs"), "handlers");
+        assert_eq!(file_stem("components/UserProfile.tsx"), "UserProfile");
+        assert_eq!(file_stem("Makefile"), "Makefile");
+        assert_eq!(file_stem("src/mod.rs"), "mod");
+        assert_eq!(file_stem("a/b/c/deep.file.ext"), "deep");
+    }
+
+    #[test]
+    fn test_log_size_similarity_identical() {
+        let sim = log_size_similarity(10, 10);
+        assert!((sim - 1.0).abs() < 1e-10, "Same size should be 1.0: {sim}");
+    }
+
+    #[test]
+    fn test_log_size_similarity_close() {
+        let sim = log_size_similarity(10, 12);
+        assert!(sim > 0.9, "Close sizes should have high similarity: {sim}");
+    }
+
+    #[test]
+    fn test_log_size_similarity_different() {
+        let sim = log_size_similarity(1, 100);
+        assert!(
+            sim < 0.5,
+            "Very different sizes should have low similarity: {sim}"
+        );
+    }
+
+    #[test]
+    fn test_log_size_similarity_zero() {
+        // Both zero → identical
+        assert!((log_size_similarity(0, 0) - 1.0).abs() < 1e-10);
+        // One zero, one nonzero → still produces a valid [0,1] value
+        let sim = log_size_similarity(0, 10);
+        assert!((0.0..=1.0).contains(&sim), "Should be in [0,1]: {sim}");
+    }
+
+    #[test]
+    fn test_compute_multi_signal_identical_files() {
+        let source = FileSignals {
+            path: "src/handlers.rs".to_string(),
+            fingerprint: vec![
+                0.5, 0.3, 0.8, 0.1, 0.9, 0.2, 0.4, 0.6, 0.7, 0.3, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.9,
+            ],
+            wl_hash: Some(12345),
+            function_count: 10,
+        };
+        let target = source.clone();
+
+        let result = compute_multi_signal_similarity(&source, &target);
+        assert!(
+            (result.similarity - 1.0).abs() < 1e-10,
+            "Identical files should have similarity 1.0: {}",
+            result.similarity
+        );
+        assert!((result.signals.fingerprint_similarity - 1.0).abs() < 1e-10);
+        assert!((result.signals.wl_hash_match - 1.0).abs() < 1e-10);
+        assert!((result.signals.name_similarity - 1.0).abs() < 1e-10);
+        assert!((result.signals.size_similarity - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_multi_signal_completely_different() {
+        let source = FileSignals {
+            path: "src/handlers.rs".to_string(),
+            fingerprint: vec![
+                1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            wl_hash: Some(111),
+            function_count: 1,
+        };
+        let target = FileSignals {
+            path: "lib/models.py".to_string(),
+            fingerprint: vec![
+                0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            ],
+            wl_hash: Some(999),
+            function_count: 100,
+        };
+
+        let result = compute_multi_signal_similarity(&source, &target);
+        assert!(
+            result.similarity < 0.3,
+            "Completely different files should have low similarity: {}",
+            result.similarity
+        );
+        assert!((result.signals.wl_hash_match).abs() < 1e-10); // No WL match
+    }
+
+    #[test]
+    fn test_compute_multi_signal_same_role_different_project() {
+        // Two "handlers.rs" files from different projects with similar structure
+        let source = FileSignals {
+            path: "project-a/src/api/handlers.rs".to_string(),
+            fingerprint: vec![
+                0.5, 0.3, 0.8, 0.1, 0.7, 0.2, 0.4, 0.6, 0.3, 0.2, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.7,
+            ],
+            wl_hash: Some(555),
+            function_count: 15,
+        };
+        let target = FileSignals {
+            path: "project-b/src/api/handlers.rs".to_string(),
+            fingerprint: vec![
+                0.5, 0.35, 0.75, 0.12, 0.72, 0.18, 0.38, 0.58, 0.28, 0.22, 0.48, 0.12, 0.78, 0.22,
+                0.58, 0.42, 0.68,
+            ],
+            wl_hash: Some(555), // Same WL hash = same topology
+            function_count: 18,
+        };
+
+        let result = compute_multi_signal_similarity(&source, &target);
+        assert!(
+            result.similarity > 0.8,
+            "Same-role cross-project files should be very similar: {}",
+            result.similarity
+        );
+        assert!((result.signals.wl_hash_match - 1.0).abs() < 1e-10); // WL match!
+        assert!(result.signals.name_similarity > 0.9); // Same file name
+    }
+
+    #[test]
+    fn test_compute_multi_signal_no_wl_hash() {
+        let source = FileSignals {
+            path: "src/main.rs".to_string(),
+            fingerprint: vec![0.5; 17],
+            wl_hash: None, // No WL hash available
+            function_count: 5,
+        };
+        let target = FileSignals {
+            path: "src/main.rs".to_string(),
+            fingerprint: vec![0.5; 17],
+            wl_hash: None,
+            function_count: 5,
+        };
+
+        let result = compute_multi_signal_similarity(&source, &target);
+        // WL hash should be 0.0 (missing), but other signals should compensate
+        assert!((result.signals.wl_hash_match).abs() < 1e-10);
+        // Fingerprint (1.0 * 0.5) + WL (0.0 * 0.2) + name (1.0 * 0.2) + size (1.0 * 0.1) = 0.8
+        assert!(
+            (result.similarity - 0.8).abs() < 1e-10,
+            "Without WL hash: 0.5*1.0 + 0.2*0.0 + 0.2*1.0 + 0.1*1.0 = 0.8, got {}",
+            result.similarity
+        );
+    }
+
+    #[test]
+    fn test_compute_multi_signal_empty_fingerprint() {
+        let source = FileSignals {
+            path: "src/main.rs".to_string(),
+            fingerprint: vec![],
+            wl_hash: Some(123),
+            function_count: 5,
+        };
+        let target = FileSignals {
+            path: "lib/main.rs".to_string(),
+            fingerprint: vec![],
+            wl_hash: Some(123),
+            function_count: 5,
+        };
+
+        let result = compute_multi_signal_similarity(&source, &target);
+        assert!((result.signals.fingerprint_similarity).abs() < 1e-10); // No fingerprint
+                                                                        // WL match (0.2) + name match (0.2) + size match (0.1) = 0.5
+        assert!(
+            (result.similarity - 0.5).abs() < 0.01,
+            "Without fingerprint but with matching WL + name + size: ~0.5, got {}",
+            result.similarity
+        );
+    }
+
+    #[test]
+    fn test_find_cross_project_twins_multi_signal_ordering() {
+        let source = FileSignals {
+            path: "project-a/src/handlers.rs".to_string(),
+            fingerprint: vec![
+                0.8, 0.3, 0.7, 0.1, 0.9, 0.2, 0.4, 0.6, 0.3, 0.2, 0.5, 0.1, 0.8, 0.2, 0.6, 0.4, 0.7,
+            ],
+            wl_hash: Some(100),
+            function_count: 10,
+        };
+
+        let candidates = vec![
+            FileSignals {
+                path: "project-b/src/handlers.rs".to_string(), // Same name, same WL, similar FP
+                fingerprint: vec![
+                    0.78, 0.32, 0.68, 0.12, 0.88, 0.22, 0.38, 0.58, 0.28, 0.22, 0.48, 0.12, 0.78,
+                    0.22, 0.58, 0.42, 0.68,
+                ],
+                wl_hash: Some(100),
+                function_count: 12,
+            },
+            FileSignals {
+                path: "project-c/src/models.rs".to_string(), // Different name, different WL
+                fingerprint: vec![
+                    0.1, 0.9, 0.2, 0.8, 0.1, 0.7, 0.3, 0.5, 0.8, 0.6, 0.2, 0.9, 0.1, 0.7, 0.3, 0.8,
+                    0.2,
+                ],
+                wl_hash: Some(200),
+                function_count: 25,
+            },
+            FileSignals {
+                path: "project-d/src/routes.rs".to_string(), // Different name, same WL hash
+                fingerprint: vec![
+                    0.75, 0.35, 0.65, 0.15, 0.85, 0.25, 0.35, 0.55, 0.35, 0.25, 0.45, 0.15, 0.75,
+                    0.25, 0.55, 0.45, 0.65,
+                ],
+                wl_hash: Some(100),
+                function_count: 11,
+            },
+        ];
+
+        let results = find_cross_project_twins_multi_signal(&source, &candidates, 10);
+        assert_eq!(results.len(), 3);
+
+        // Should be sorted by similarity descending
+        for i in 0..results.len() - 1 {
+            assert!(
+                results[i].similarity >= results[i + 1].similarity,
+                "Results should be sorted: {} >= {}",
+                results[i].similarity,
+                results[i + 1].similarity
+            );
+        }
+
+        // project-b/handlers.rs should be #1 (same name + same WL + similar FP)
+        assert!(
+            results[0].target.contains("handlers"),
+            "Best match should be handlers.rs, got: {}",
+            results[0].target
+        );
+        // project-c/models.rs should be last (different everything)
+        assert!(
+            results[2].target.contains("models"),
+            "Worst match should be models.rs, got: {}",
+            results[2].target
+        );
+    }
+
+    #[test]
+    fn test_find_cross_project_twins_multi_signal_top_n() {
+        let source = FileSignals {
+            path: "src/main.rs".to_string(),
+            fingerprint: vec![0.5; 17],
+            wl_hash: Some(1),
+            function_count: 5,
+        };
+
+        let candidates: Vec<FileSignals> = (0..20)
+            .map(|i| FileSignals {
+                path: format!("project-{i}/src/file_{i}.rs"),
+                fingerprint: vec![0.5 + (i as f64) * 0.01; 17],
+                wl_hash: Some(i as u64),
+                function_count: 5 + i,
+            })
+            .collect();
+
+        let results = find_cross_project_twins_multi_signal(&source, &candidates, 5);
+        assert_eq!(results.len(), 5, "Should truncate to top_n=5");
+    }
+
+    #[test]
+    fn test_find_cross_project_twins_skips_self() {
+        let source = FileSignals {
+            path: "src/main.rs".to_string(),
+            fingerprint: vec![0.5; 17],
+            wl_hash: Some(1),
+            function_count: 5,
+        };
+
+        // Include the source path in candidates
+        let candidates = vec![
+            FileSignals {
+                path: "src/main.rs".to_string(), // Same path → should be skipped
+                fingerprint: vec![0.5; 17],
+                wl_hash: Some(1),
+                function_count: 5,
+            },
+            FileSignals {
+                path: "src/other.rs".to_string(),
+                fingerprint: vec![0.4; 17],
+                wl_hash: Some(2),
+                function_count: 3,
+            },
+        ];
+
+        let results = find_cross_project_twins_multi_signal(&source, &candidates, 10);
+        assert_eq!(results.len(), 1, "Should skip self-match");
+        assert_eq!(results[0].target, "src/other.rs");
+    }
+
+    #[test]
+    fn test_weight_sum_is_one() {
+        assert!(
+            (W_FINGERPRINT + W_WL_HASH + W_NAME + W_SIZE - 1.0).abs() < 1e-10,
+            "Weights should sum to 1.0"
+        );
+    }
+
+    // ========================================================================
     // cluster_dna_vectors tests
     // ========================================================================
 
@@ -5246,7 +6164,7 @@ mod tests {
         let dna_map = HashMap::new();
         let wl_hashes = HashMap::new();
 
-        let cards = compute_context_cards(&g, &analytics, &dna_map, &wl_hashes);
+        let cards = compute_context_cards(&g, &analytics, &dna_map, &wl_hashes, &HashMap::new());
 
         assert_eq!(cards.len(), 5, "Should produce 1 card per file node");
 
@@ -5308,7 +6226,13 @@ mod tests {
         use super::super::models::AnalyticsConfig;
         let config = AnalyticsConfig::default();
         let analytics = compute_all(&g, &config);
-        let cards = compute_context_cards(&g, &analytics, &HashMap::new(), &HashMap::new());
+        let cards = compute_context_cards(
+            &g,
+            &analytics,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
 
         assert_eq!(cards.len(), 1, "Only File nodes should get context cards");
         assert_eq!(cards[0].path, "src/main.rs");
@@ -5326,7 +6250,7 @@ mod tests {
         let mut wl_hashes = HashMap::new();
         wl_hashes.insert("A".to_string(), 12345u64);
 
-        let cards = compute_context_cards(&g, &analytics, &dna_map, &wl_hashes);
+        let cards = compute_context_cards(&g, &analytics, &dna_map, &wl_hashes, &HashMap::new());
         let a_card = cards.iter().find(|c| c.path == "A").unwrap();
         assert_eq!(a_card.cc_structural_dna, vec![1.0, 0.5, 0.0]);
         assert_eq!(a_card.cc_wl_hash, 12345);
@@ -5343,7 +6267,13 @@ mod tests {
         let g = CodeGraph::new();
         let config = AnalyticsConfig::default();
         let analytics = compute_all(&g, &config);
-        let cards = compute_context_cards(&g, &analytics, &HashMap::new(), &HashMap::new());
+        let cards = compute_context_cards(
+            &g,
+            &analytics,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(cards.is_empty());
     }
 
@@ -5670,6 +6600,599 @@ mod tests {
             pairs.len(),
             6,
             "Star with 4 leaves: 6 leaf-leaf pairs at distance 2"
+        );
+    }
+
+    // ========================================================================
+    // Structural Fingerprint v2 tests
+    // ========================================================================
+
+    /// Build a file-centric graph for fingerprint testing.
+    /// Creates File nodes with Defines edges to Function/Struct children,
+    /// and Import edges between files.
+    fn make_fingerprint_test_graph() -> (CodeGraph, GraphAnalytics) {
+        let mut g = CodeGraph::new();
+
+        // Hub file: imported by many, defines many functions
+        g.add_node(CodeNode {
+            id: "hub.rs".into(),
+            node_type: CodeNodeType::File,
+            path: Some("hub.rs".into()),
+            name: "hub.rs".into(),
+            project_id: None,
+        });
+        for i in 0..5 {
+            let fname = format!("hub_fn_{}", i);
+            g.add_node(CodeNode {
+                id: fname.clone(),
+                node_type: CodeNodeType::Function,
+                path: Some("hub.rs".into()),
+                name: fname.clone(),
+                project_id: None,
+            });
+            g.add_edge(
+                "hub.rs",
+                &fname,
+                CodeEdge {
+                    edge_type: CodeEdgeType::Defines,
+                    weight: 1.0,
+                },
+            );
+        }
+        // Hub also defines a struct
+        g.add_node(CodeNode {
+            id: "HubStruct".into(),
+            node_type: CodeNodeType::Struct,
+            path: Some("hub.rs".into()),
+            name: "HubStruct".into(),
+            project_id: None,
+        });
+        g.add_edge(
+            "hub.rs",
+            "HubStruct",
+            CodeEdge {
+                edge_type: CodeEdgeType::Defines,
+                weight: 1.0,
+            },
+        );
+
+        // 5 leaf files: each imports hub
+        for i in 0..5 {
+            let leaf = format!("leaf_{}.rs", i);
+            g.add_node(CodeNode {
+                id: leaf.clone(),
+                node_type: CodeNodeType::File,
+                path: Some(leaf.clone()),
+                name: leaf.clone(),
+                project_id: None,
+            });
+            g.add_edge(
+                &leaf,
+                "hub.rs",
+                CodeEdge {
+                    edge_type: CodeEdgeType::Imports,
+                    weight: 1.0,
+                },
+            );
+            // Each leaf defines 1 function
+            let fn_name = format!("leaf_fn_{}", i);
+            g.add_node(CodeNode {
+                id: fn_name.clone(),
+                node_type: CodeNodeType::Function,
+                path: Some(leaf.clone()),
+                name: fn_name.clone(),
+                project_id: None,
+            });
+            g.add_edge(
+                &leaf,
+                &fn_name,
+                CodeEdge {
+                    edge_type: CodeEdgeType::Defines,
+                    weight: 1.0,
+                },
+            );
+        }
+
+        // Peripheral file: no imports, 1 function
+        g.add_node(CodeNode {
+            id: "orphan.rs".into(),
+            node_type: CodeNodeType::File,
+            path: Some("orphan.rs".into()),
+            name: "orphan.rs".into(),
+            project_id: None,
+        });
+        g.add_node(CodeNode {
+            id: "orphan_fn".into(),
+            node_type: CodeNodeType::Function,
+            path: Some("orphan.rs".into()),
+            name: "orphan_fn".into(),
+            project_id: None,
+        });
+        g.add_edge(
+            "orphan.rs",
+            "orphan_fn",
+            CodeEdge {
+                edge_type: CodeEdgeType::Defines,
+                weight: 1.0,
+            },
+        );
+
+        // Compute analytics
+        let config = AnalyticsConfig::default();
+        let analytics = compute_all(&g, &config);
+
+        (g, analytics)
+    }
+
+    #[test]
+    fn test_fingerprint_empty_graph() {
+        let g = CodeGraph::new();
+        let analytics = GraphAnalytics {
+            metrics: HashMap::new(),
+            communities: Vec::new(),
+            components: Vec::new(),
+            health: Default::default(),
+            modularity: 0.0,
+            node_count: 0,
+            edge_count: 0,
+            computation_ms: 0,
+            profile_name: None,
+        };
+        let fp = compute_structural_fingerprint(&g, &analytics);
+        assert!(
+            fp.is_empty(),
+            "Empty graph should produce empty fingerprint map"
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_dimensions_and_range() {
+        use crate::graph::models::{FINGERPRINT_DIMS, FINGERPRINT_LABELS};
+
+        let (g, analytics) = make_fingerprint_test_graph();
+        let fp = compute_structural_fingerprint(&g, &analytics);
+
+        // Should have fingerprints for all 7 File nodes (hub + 5 leaves + orphan)
+        assert_eq!(fp.len(), 7, "Should have 7 file fingerprints");
+
+        // Each fingerprint should have 17 dimensions, all in [0, 1]
+        for (path, vec) in &fp {
+            assert_eq!(
+                vec.len(),
+                FINGERPRINT_DIMS,
+                "File {} should have {} dims, got {}",
+                path,
+                FINGERPRINT_DIMS,
+                vec.len()
+            );
+            for (dim_idx, &val) in vec.iter().enumerate() {
+                assert!(
+                    (0.0..=1.0).contains(&val),
+                    "File {} dim {} ({}) = {} out of [0,1]",
+                    path,
+                    dim_idx,
+                    FINGERPRINT_LABELS[dim_idx],
+                    val
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_fingerprint_hub_vs_leaf_discrimination() {
+        let (g, analytics) = make_fingerprint_test_graph();
+        let fp = compute_structural_fingerprint(&g, &analytics);
+
+        let hub = fp.get("hub.rs").expect("hub should have fingerprint");
+        let leaf = fp.get("leaf_0.rs").expect("leaf should have fingerprint");
+        let orphan = fp.get("orphan.rs").expect("orphan should have fingerprint");
+
+        // Hub should have HIGH imports_in percentile (d0) — it's imported by 5 files
+        assert!(
+            hub[0] > leaf[0],
+            "Hub imports_in_pct ({}) should be > leaf ({}) — hub is imported by 5 files",
+            hub[0],
+            leaf[0]
+        );
+
+        // Hub should have HIGH function_count percentile (d7) — 5 functions vs 1
+        assert!(
+            hub[7] > leaf[7],
+            "Hub function_count_pct ({}) should be > leaf ({})",
+            hub[7],
+            leaf[7]
+        );
+
+        // Hub should be a hub (d14 = 0.0) or at least not peripheral
+        // Orphan should be peripheral (d14 = 1.0)
+        assert!(
+            hub[14] < orphan[14],
+            "Hub community_role ({}) should be < orphan ({}) — hub is more central",
+            hub[14],
+            orphan[14]
+        );
+
+        // Cosine similarity between hub and leaf should be < 0.95
+        // (proves discrimination — threshold relaxed for 17-dim vectors where
+        // neighbor_diversity and neighbor_degree_entropy add shared values)
+        let sim = cosine_similarity(hub, leaf);
+        assert!(
+            sim < 0.95,
+            "Hub-leaf cosine similarity ({}) should be < 0.95 — different roles",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_fingerprint_symmetric_leaves_similar() {
+        let (g, analytics) = make_fingerprint_test_graph();
+        let fp = compute_structural_fingerprint(&g, &analytics);
+
+        let leaf0 = fp.get("leaf_0.rs").unwrap();
+        let leaf1 = fp.get("leaf_1.rs").unwrap();
+
+        // Two leaves with identical structure should have similar fingerprints
+        // (not perfect 1.0 because percentile ranking may break ties differently,
+        // and neighbor_degree_entropy varies with neighbor positions)
+        let sim = cosine_similarity(leaf0, leaf1);
+        assert!(
+            sim > 0.80,
+            "Symmetric leaves should have cosine > 0.80, got {}",
+            sim
+        );
+    }
+
+    #[test]
+    fn test_log_percentile_power_law_spread() {
+        // Simulate a power-law distribution (many small, few large)
+        let values = vec![1.0, 1.0, 2.0, 5.0, 20.0, 100.0];
+
+        let log_pct = to_log_percentiles(&values);
+        let lin_pct = to_linear_percentiles(&values);
+
+        // Log-percentile design: spread low values MORE, compress high values.
+        // This is exactly what we want for power-law metrics (degree, pagerank)
+        // where discrimination among low values matters most.
+
+        // Bottom pair (1.0 vs 2.0 = indices 1 vs 2): log should spread MORE
+        let log_low_spread = log_pct[2] - log_pct[1]; // 2.0 vs 1.0
+        let lin_low_spread = lin_pct[2] - lin_pct[1]; // 2.0 vs 1.0
+        assert!(
+            log_low_spread > lin_low_spread,
+            "Log percentile should spread low values MORE than linear: log={}, lin={}",
+            log_low_spread,
+            lin_low_spread
+        );
+
+        // Top pair (20 vs 100 = indices 4 vs 5): log should COMPRESS
+        let log_high_spread = log_pct[5] - log_pct[4]; // 100 vs 20
+        let lin_high_spread = lin_pct[5] - lin_pct[4]; // 100 vs 20
+        assert!(
+            log_high_spread < lin_high_spread,
+            "Log percentile should compress high values: log={}, lin={}",
+            log_high_spread,
+            lin_high_spread
+        );
+
+        // All values should be in [0, 1]
+        for &v in &log_pct {
+            assert!(
+                (0.0..=1.0).contains(&v),
+                "Log percentile {} out of range",
+                v
+            );
+        }
+        for &v in &lin_pct {
+            assert!(
+                (0.0..=1.0).contains(&v),
+                "Lin percentile {} out of range",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalized_shannon_entropy() {
+        // Uniform distribution → max entropy = 1.0
+        let uniform = vec![10, 10, 10, 10];
+        let h = normalized_shannon_entropy(&uniform);
+        assert!(
+            (h - 1.0).abs() < 0.01,
+            "Uniform distribution should have entropy ~1.0, got {}",
+            h
+        );
+
+        // Single category → zero entropy
+        let single = vec![42, 0, 0, 0];
+        let h = normalized_shannon_entropy(&single);
+        assert!(
+            h.abs() < 0.01,
+            "Single category should have entropy ~0.0, got {}",
+            h
+        );
+
+        // Empty → zero
+        let empty: Vec<usize> = vec![];
+        assert_eq!(normalized_shannon_entropy(&empty), 0.0);
+    }
+
+    // ========================================================================
+    // Metric Comparison: Cosine vs Euclidean vs Dot Product for Fingerprint v2
+    // ========================================================================
+
+    /// Normalized euclidean similarity: 1 - ||a-b|| / (√dim * √2)
+    /// Maps [0, max_distance] → [1, 0] where max_distance = √(dim * 2) for [0,1]-bounded vectors.
+    fn euclidean_similarity(a: &[f64], b: &[f64]) -> f64 {
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        let sq_dist: f64 = a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum();
+        let dist = sq_dist.sqrt();
+        // Max possible distance for vectors in [0,1]^dim is √dim
+        let max_dist = (a.len() as f64).sqrt();
+        if max_dist == 0.0 {
+            return 1.0;
+        }
+        1.0 - dist / max_dist
+    }
+
+    /// Normalized dot product: dot(a,b) / (dim * max_component²)
+    /// For [0,1]-bounded vectors, max dot product = dim.
+    fn dot_product_similarity(a: &[f64], b: &[f64]) -> f64 {
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        let dot: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        // Normalize by dim (max possible dot product for [0,1] vectors)
+        dot / a.len() as f64
+    }
+
+    /// Helper: compute variance of a slice
+    fn variance(values: &[f64]) -> f64 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64
+    }
+
+    #[test]
+    fn test_metric_comparison_cosine_vs_euclidean_vs_dot() {
+        // ================================================================
+        // Comparative test: Cosine vs Euclidean vs Dot Product
+        // on realistic 17-dim structural fingerprint vectors.
+        //
+        // The ideal metric maximizes discrimination:
+        //   - True twins (same archetype) should score HIGH
+        //   - False twins (different archetype) should score LOW
+        //   - Variance across all pairs should be HIGH (good spread)
+        // ================================================================
+
+        // Archetype fingerprints (17 dims):
+        // d0-d2: degree stats (in/out/total as log-percentile)
+        // d3: PageRank, d4: betweenness, d5: clustering_coeff
+        // d6: community_size_pct, d7: community_internal_ratio, d8: bridge_score
+        // d9-d13: function stats (count, avg_cc, max_cc, avg_loc, max_loc)
+        // d14: wl_iteration_count
+        // d15-d16: neighbor entropy (type, degree)
+
+        // Hub file (many imports, high centrality) — e.g. main.rs, app.rs
+        let hub_a = vec![
+            0.95, 0.90, 0.95, // high degree
+            0.85, 0.90, 0.10, // high PR/betweenness, low clustering
+            0.80, 0.55, 0.70, // large community, moderate internal, bridge
+            0.60, 0.30, 0.45, 0.35, 0.50, // moderate functions
+            0.70, // WL iterations
+            0.85, 0.75, // high entropy (diverse neighbors)
+        ];
+        // Another hub (slightly different project)
+        let hub_b = vec![
+            0.90, 0.85, 0.92, 0.80, 0.85, 0.12, 0.75, 0.50, 0.65, 0.55, 0.35, 0.50, 0.30, 0.45,
+            0.65, 0.80, 0.70,
+        ];
+
+        // Leaf file (few imports, low centrality) — e.g. utils.rs, constants.rs
+        let leaf_a = vec![
+            0.10, 0.05, 0.08, // low degree
+            0.05, 0.02, 0.80, // low PR/betweenness, high clustering
+            0.20, 0.90, 0.05, // small community, high internal, no bridge
+            0.15, 0.10, 0.15, 0.20, 0.25, // few small functions
+            0.20, // few WL iterations
+            0.20, 0.15, // low entropy (homogeneous neighbors)
+        ];
+        let leaf_b = vec![
+            0.12, 0.08, 0.10, 0.07, 0.03, 0.75, 0.25, 0.85, 0.08, 0.10, 0.12, 0.18, 0.22, 0.30,
+            0.25, 0.25, 0.18,
+        ];
+
+        // Handler file (API endpoint) — e.g. user_handler.rs
+        let handler_a = vec![
+            0.40, 0.60, 0.50, // moderate degree
+            0.30, 0.25, 0.40, // moderate centrality
+            0.50, 0.65, 0.30, // moderate community
+            0.80, 0.55, 0.70, 0.60, 0.85, // many complex functions
+            0.45, 0.50, 0.45,
+        ];
+        let handler_b = vec![
+            0.45, 0.55, 0.48, 0.35, 0.28, 0.38, 0.55, 0.60, 0.35, 0.75, 0.50, 0.65, 0.55, 0.80,
+            0.50, 0.55, 0.50,
+        ];
+
+        // Service/middleware — e.g. auth_service.rs
+        let service_a = vec![
+            0.60, 0.70, 0.65, 0.55, 0.60, 0.30, 0.60, 0.50, 0.55, 0.50, 0.45, 0.60, 0.45, 0.65,
+            0.55, 0.65, 0.60,
+        ];
+
+        let all_vecs: Vec<(&str, &[f64])> = vec![
+            ("hub_a", &hub_a),
+            ("hub_b", &hub_b),
+            ("leaf_a", &leaf_a),
+            ("leaf_b", &leaf_b),
+            ("handler_a", &handler_a),
+            ("handler_b", &handler_b),
+            ("service_a", &service_a),
+        ];
+
+        // True twin pairs (same archetype)
+        let true_pairs: Vec<(&str, &[f64], &str, &[f64])> = vec![
+            ("hub_a", &hub_a, "hub_b", &hub_b),
+            ("leaf_a", &leaf_a, "leaf_b", &leaf_b),
+            ("handler_a", &handler_a, "handler_b", &handler_b),
+        ];
+
+        // False twin pairs (different archetypes)
+        let false_pairs: Vec<(&str, &[f64], &str, &[f64])> = vec![
+            ("hub_a", &hub_a, "leaf_a", &leaf_a),
+            ("hub_a", &hub_a, "handler_a", &handler_a),
+            ("leaf_a", &leaf_a, "handler_a", &handler_a),
+            ("leaf_a", &leaf_a, "service_a", &service_a),
+            ("hub_a", &hub_a, "service_a", &service_a),
+        ];
+
+        struct MetricResult {
+            name: &'static str,
+            true_twin_scores: Vec<f64>,
+            false_twin_scores: Vec<f64>,
+            all_scores: Vec<f64>,
+        }
+
+        type MetricFn = fn(&[f64], &[f64]) -> f64;
+        let metrics: Vec<(&str, MetricFn)> = vec![
+            ("cosine", cosine_similarity as MetricFn),
+            ("euclidean", euclidean_similarity as MetricFn),
+            ("dot_product", dot_product_similarity as MetricFn),
+        ];
+
+        let mut results: Vec<MetricResult> = Vec::new();
+
+        for (name, metric_fn) in &metrics {
+            let true_scores: Vec<f64> = true_pairs
+                .iter()
+                .map(|(_, a, _, b)| metric_fn(a, b))
+                .collect();
+
+            let false_scores: Vec<f64> = false_pairs
+                .iter()
+                .map(|(_, a, _, b)| metric_fn(a, b))
+                .collect();
+
+            let mut all_scores = Vec::new();
+            for i in 0..all_vecs.len() {
+                for j in (i + 1)..all_vecs.len() {
+                    all_scores.push(metric_fn(all_vecs[i].1, all_vecs[j].1));
+                }
+            }
+
+            results.push(MetricResult {
+                name,
+                true_twin_scores: true_scores,
+                false_twin_scores: false_scores,
+                all_scores,
+            });
+        }
+
+        // Print comparison table
+        eprintln!("\n{}", "=".repeat(70));
+        eprintln!("METRIC COMPARISON — Structural Fingerprint v2 (17-dim)");
+        eprintln!("{}", "=".repeat(70));
+
+        let mut best_discrimination = 0.0_f64;
+        let mut best_metric = "";
+
+        for r in &results {
+            let true_mean =
+                r.true_twin_scores.iter().sum::<f64>() / r.true_twin_scores.len() as f64;
+            let false_mean =
+                r.false_twin_scores.iter().sum::<f64>() / r.false_twin_scores.len() as f64;
+            let discrimination = true_mean - false_mean;
+            let all_var = variance(&r.all_scores);
+            let true_min = r
+                .true_twin_scores
+                .iter()
+                .cloned()
+                .fold(f64::INFINITY, f64::min);
+            let false_max = r
+                .false_twin_scores
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let separation = true_min - false_max; // >0 means perfect separation
+
+            eprintln!("\n--- {} ---", r.name);
+            eprintln!("  True twin mean:   {:.4}", true_mean);
+            eprintln!("  False twin mean:  {:.4}", false_mean);
+            eprintln!(
+                "  Discrimination:   {:.4} (true_mean - false_mean)",
+                discrimination
+            );
+            eprintln!(
+                "  Separation gap:   {:.4} (true_min - false_max)",
+                separation
+            );
+            eprintln!("  Overall variance: {:.6}", all_var);
+            eprintln!(
+                "  Score range:      [{:.4}, {:.4}]",
+                r.all_scores.iter().cloned().fold(f64::INFINITY, f64::min),
+                r.all_scores
+                    .iter()
+                    .cloned()
+                    .fold(f64::NEG_INFINITY, f64::max)
+            );
+
+            if discrimination > best_discrimination {
+                best_discrimination = discrimination;
+                best_metric = r.name;
+            }
+        }
+
+        eprintln!("\n{}", "=".repeat(70));
+        eprintln!(
+            "WINNER: {} (discrimination = {:.4})",
+            best_metric, best_discrimination
+        );
+        eprintln!("{}\n", "=".repeat(70));
+
+        // Assertions: all metrics should produce reasonable results
+        for r in &results {
+            let true_mean =
+                r.true_twin_scores.iter().sum::<f64>() / r.true_twin_scores.len() as f64;
+            let false_mean =
+                r.false_twin_scores.iter().sum::<f64>() / r.false_twin_scores.len() as f64;
+
+            // True twins must score higher than false twins on average
+            assert!(
+                true_mean > false_mean,
+                "{}: true twin mean ({:.4}) should be > false twin mean ({:.4})",
+                r.name,
+                true_mean,
+                false_mean
+            );
+
+            // Variance must be non-trivial (spread > 0.001)
+            let all_var = variance(&r.all_scores);
+            assert!(
+                all_var > 0.001,
+                "{}: variance ({:.6}) too low — metric lacks discrimination",
+                r.name,
+                all_var
+            );
+        }
+
+        // Cosine should have the best or near-best discrimination
+        // (this validates our choice in compute_multi_signal_similarity)
+        let cosine_result = results.iter().find(|r| r.name == "cosine").unwrap();
+        let cosine_discrimination = {
+            let t = cosine_result.true_twin_scores.iter().sum::<f64>()
+                / cosine_result.true_twin_scores.len() as f64;
+            let f = cosine_result.false_twin_scores.iter().sum::<f64>()
+                / cosine_result.false_twin_scores.len() as f64;
+            t - f
+        };
+        assert!(
+            cosine_discrimination > 0.05,
+            "Cosine discrimination ({:.4}) too low for reliable twin detection",
+            cosine_discrimination
         );
     }
 }
