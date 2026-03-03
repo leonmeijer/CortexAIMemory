@@ -1,161 +1,91 @@
-# Cortex AI Memory
+<p align="center">
+  <img src="dist/logo-512.png" alt="CortexAIMemory" width="128" />
+</p>
 
-**Een gedeeld kennisgeheugen voor AI-agents.**
+<h1 align="center">CortexAIMemory</h1>
 
-Cortex geeft AI-agents een gemeenschappelijk brein. In plaats van dat elke agent opnieuw begint, delen ze codestructuur, plannen, beslissingen en voortgang via een centrale kennisgraaf — aangedreven door IndentiaGraph DB.
+<p align="center">
+  <strong>AI-geheugen en orchestratielaag voor Indentia — koppelt Claude Code aan een kennisgraaf met episodisch geheugen.</strong>
+</p>
 
----
-
-## Wat is Cortex?
-
-Cortex is een Rust-gebaseerde service die AI-coding-agents coördineert op complexe projecten. Het biedt:
-
-- **Kennisgraaf** — Codestructuur en relaties opgeslagen in SurrealDB (IndentiaGraph), toegankelijk voor alle agents
-- **Semantisch zoeken** — Vind code op betekenis via IndentiaGraph ingebouwde vectorzoekopdracht
-- **Plan- en taakbeheer** — Gestructureerde workflows met afhankelijkheden, stappen en voortgangsbewaking
-- **Meertalige parsing** — Tree-sitter ondersteuning voor Rust, TypeScript, Python, Go en 13 andere talen
-- **Multi-project workspaces** — Groepeer gerelateerde projecten met gedeelde context, contracten en mijlpalen
-- **MCP-integratie** — 20 mega-tools beschikbaar voor Claude Code, OpenAI Agents en Cursor
-- **Auto-sync** — Bestandswatcher houdt de kennisbank up-to-date terwijl je codeert
-- **Authenticatie** — Google OAuth2, OIDC en wachtwoord-login met deny-by-default beveiliging
-- **Chat WebSocket** — Realtime conversationele AI via Claude-integratie
-- **Event-systeem** — Live CRUD-notificaties via WebSocket
-- **NATS-integratie** — Inter-process eventsync voor multi-instance deployments
-- **Neurale skills** — Emergente kennisclusters met activatie, triggers en levenscyclusbeheer
-- **Spreading activation** — Multi-hop neurale ophaling via SYNAPSE-verbindingen
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT%20AND%20BUSL--1.1-blue.svg" alt="Licentie"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.75+-orange.svg" alt="Rust"></a>
+</p>
 
 ---
 
-## Hoe werkt het?
+## Wat is CortexAIMemory?
+
+CortexAIMemory is de AI-orchestratielaag van het Indentia-platform. Het geeft Claude Code en andere AI-agents een gedeeld, persistent geheugen: codestructuur, plannen, beslissingen, kennisnotities en episodisch geheugen worden centraal opgeslagen en doorzoekbaar gemaakt.
+
+In plaats van elke sessie opnieuw te beginnen, bouwt CortexAIMemory een kennisgraaf op die groeit naarmate je codebase evolueert. Agents kunnen elkaars context lezen, taken oppakken, beslissingen terugvinden en patronen herkennen die eerder zijn vastgelegd.
+
+Het systeem is opgezet rond twee kernprincipes: **structureel geheugen** (wat staat er in de code, wie hangt van wie af, welke beslissingen zijn genomen) en **episodisch geheugen** (wat is er wanneer gebeurd, wat wisten we op een bepaald moment in de tijd).
+
+### Kernfunctionaliteit
+
+- **Kennisgraaf (IndentiaGraph/SurrealDB)** — code-structuur, plannen, taken, beslissingen en notes als graaf
+- **Native BM25 + vector search** — full-text en semantisch zoeken direct op de graph-backend
+- **Episodisch geheugen (Graphiti-inspired)** — tijdgestempelde episoden, bi-temporele notes, historische queries
+- **MCP-server** — 20 mega-tools voor Claude Code, OpenAI Agents en Cursor
+- **cortex-mem** — memory worker daemon die Claude Code sessies automatisch vastlegt (poort 37777)
+- **Tree-sitter parser** — 17 programmeertalen, inclusief HCL/Terraform
+- **File watcher** — automatische code-synchronisatie bij elke opgeslagen wijziging
+- **Authenticatie** — Google OAuth2, generieke OIDC, wachtwoord + JWT, deny-by-default middleware
+- **Chat WebSocket** — real-time conversationele AI via Claude Code CLI (Nexus SDK)
+- **Event systeem** — live CRUD-notificaties via WebSocket
+
+---
+
+## Architectuur
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     JOUW AI-AGENTS                          │
+│                    AI-AGENTS                                │
 │           (Claude Code / OpenAI / Cursor)                   │
 └──────────┬──────────────────┬───────────────────┬───────────┘
            │ MCP Protocol     │ WebSocket         │ REST API
            ▼                  ▼                   ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                        CORTEX                               │
-│                   (20 MCP Mega-Tools)                       │
+│                   CORTEX (HTTP server)                      │
+│              (20 MCP Mega-Tools, Axum 0.8)                  │
 │                                                             │
 │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
-│  │   Auth   │  │   Chat   │  │  Events  │  │   Config   │  │
-│  │OIDC+Pass │  │  Claude  │  │ Live WS  │  │   YAML +   │  │
-│  │  + JWT   │  │  Streams │  │ + NATS   │  │  env vars  │  │
+│  │   Auth   │  │   Chat   │  │  Events  │  │  Episodes  │  │
+│  │OIDC+Pass │  │  Claude  │  │ Live WS  │  │ Bi-temporal│  │
+│  │  + JWT   │  │  Streams │  │ + NATS   │  │   Memory   │  │
 │  └──────────┘  └──────────┘  └──────────┘  └────────────┘  │
 └─────────────────────────────┬───────────────────────────────┘
                               │
-          ┌───────────────────┼────────────────────┐
-          ▼                   ▼                    ▼
-┌──────────────────┐  ┌──────────┐     ┌──────────────────┐
-│    SURREALDB     │  │  NATS    │     │   TREE-SITTER    │
-│  (IndentiaGraph) │  │          │     │                  │
-│                  │  │• Events  │     │• 17 talen        │
-│• Kennisgraaf     │  │• Chat    │     │• AST-parsing     │
-│• Plannen & taken │  │  relay   │     │• Symbolen        │
-│• Vector search   │  │          │     │• Oproepgraaf     │
-│• Notes & skills  │  └──────────┘     └──────────────────┘
-└──────────────────┘
+   ┌──────────────────────────┼──────────────────────────┐
+   ▼                          ▼                          ▼
+┌────────────────────┐  ┌──────────────────────┐  ┌──────────────┐
+│ INDENTIAGRAPH API  │  │   SURREALDB ENGINE   │  │ TREE-SITTER  │
+│                    │  │  (via indentiagraph) │  │              │
+│ • Code graph       │  │ • BM25 zoeken        │  │ • 17 talen   │
+│ • Plannen/taken    │  │ • Episoden           │  │ • AST parse  │
+│ • Beslissingen     │  │ • Temporele queries  │  │ • Symbolen   │
+└────────────────────┘  └──────────────────────┘  └──────────────┘
 ```
 
-### Gegevensstroom
+### Binaries
 
-1. **Sync** — Cortex parseert je codebase met Tree-sitter en slaat symbolen, oproepen en imports op in IndentiaGraph
-2. **Query** — AI-agents vragen via MCP-tools naar relevante code, plannen en beslissingen
-3. **Schrijven** — Agents leggen beslissingen, voortgang en notities vast — beschikbaar voor alle andere agents
-4. **Activatie** — Het neurale skill-systeem detecteert kennisclusters en activeert contextinjectie via hooks
+| Binary | Beschrijving |
+|--------|-------------|
+| `cortex` | Hoofdserver (was: `orchestrator`) |
+| `cortex-cli` | CLI-tool (was: `orch`) |
+| `cortex-mcp` | MCP-server voor AI-tools (was: `mcp_server`) |
+| `cortex-mem` | Memory worker daemon (poort 37777) |
+| `cortex-mem-hook` | Claude Code hook binary |
 
----
+### Feature Flags
 
-## Snel aan de slag
-
-### 1. Start de backends
-
-```bash
-docker compose up -d
-```
-
-Dit start: **SurrealDB** (kennisgraaf) en **NATS** (eventsync).
-
-Daarna start je Cortex:
-
-```bash
-cortex serve
-```
-
-### 2. Configureer je AI-tool
-
-Voeg toe aan je MCP-configuratie (`~/.claude/mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "cortex": {
-      "command": "cortex-mcp",
-      "env": {
-        "SURREALDB_URL": "ws://localhost:8000",
-        "SURREALDB_USERNAME": "root",
-        "SURREALDB_PASSWORD": "root",
-        "SURREALDB_NAMESPACE": "cortex",
-        "SURREALDB_DATABASE": "memory",
-        "NATS_URL": "nats://localhost:4222"
-      }
-    }
-  }
-}
-```
-
-Of automatisch instellen:
-
-```bash
-cortex setup-claude
-```
-
-### 3. Registreer je project
-
-```bash
-# Via CLI
-cortex-cli project create --name "mijn-project" --path /pad/naar/code
-
-# Of via de AI-agent (MCP)
-# "Registreer dit project en sync de codebase"
-```
-
----
-
-## Wat kunnen je agents doen?
-
-### Code verkennen
-```
-"Zoek alle functies die authenticatie afhandelen"
-"Wat importeert dit bestand?"
-"Wat is de impact van het wijzigen van UserService?"
-"Toon de oproepgraaf van parse_file()"
-```
-
-### Werk beheren
-```
-"Maak een plan voor OAuth-ondersteuning"
-"Wat is de volgende taak die ik moet oppakken?"
-"Leg vast dat we JWT boven sessies hebben gekozen"
-"Toon de kritieke pad van dit plan"
-```
-
-### Gesynchroniseerd blijven
-```
-"Welke beslissingen zijn genomen over caching?"
-"Toon de projectroadmap"
-"Welke taken blokkeren de release?"
-"Hoe staan de mijlpalen ervoor?"
-```
-
-### Meerdere projecten coördineren
-```
-"Maak een workspace voor onze microservices"
-"Voeg het API-contract toe dat alle services delen"
-"Wat is de voortgang van de cross-project mijlpalen?"
-```
+| Flag | Standaard | Beschrijving |
+|------|-----------|-------------|
+| `embedded-frontend` | nee | Embed React SPA in de binary |
+| `vendored-openssl` | nee | Statische OpenSSL voor cross-compilatie |
+| `nexus-memory` | nee | Activeert Nexus memory integratie voor chat |
 
 ---
 
@@ -163,94 +93,267 @@ cortex-cli project create --name "mijn-project" --path /pad/naar/code
 
 ### Vereisten
 
-| Vereiste | Versie | Doel |
-|----------|--------|------|
-| Rust | 1.75+ | Bouwen vanuit broncode |
-| Docker | 20.10+ | SurrealDB en NATS draaien |
-| Docker Compose | 2.0+ | Services orkestreren |
+- Rust 1.75+
+- Geen Docker nodig voor standaardgebruik (embedded SurrealKV)
+- Optioneel: externe SurrealDB 2.x/3.x via `ws://...`
 
-### Vanuit broncode bouwen
+### Snel starten
 
 ```bash
+# Clone de repository
 git clone <repository-url>
 cd CortexAIMemory
 
-# Bouw alle binaries
+# Bouw en start de server
 cargo build --release
-
-# Binaries in target/release/:
-#   cortex       — hoofdserver
-#   cortex-cli   — CLI-tool
-#   cortex-mcp   — MCP-server voor AI-tools
-#   cortex-mem   — geheugenworker-daemon
+./target/release/cortex serve --port 8080
 ```
 
-### Docker
+### Configuratie (config.yaml)
 
-```bash
-# Start alle services
-docker compose up -d
-```
-
-### Vanuit binaire release
-
-```bash
-# Zet de binaries in je PATH
-cp target/release/cortex /usr/local/bin/
-cp target/release/cortex-cli /usr/local/bin/
-cp target/release/cortex-mcp /usr/local/bin/
-```
-
----
-
-## Configuratie
-
-Het systeem gebruikt een gelaagde configuratie: **omgevingsvariabelen > config.yaml > standaarden**.
-
-```bash
-cp config.yaml.example config.yaml
-# Pas config.yaml aan
-```
-
-### config.yaml voorbeeld
+Kopieer en pas `config.yaml` aan:
 
 ```yaml
 server:
-  port: 8080
+  port: 8080                        # SERVER_PORT
 
-graph_backend: "indentiagraph"
-
-surrealdb:
-  url: "ws://localhost:8000"
-  namespace: "cortex"
-  database: "memory"
-  username: "root"
-  password: "root"
-
-nats:
-  url: "nats://localhost:4222"
+indentiagraph:
+  # Persistent lokale opslag (non-ephemeral, zonder Docker)
+  uri: "surrealkv://./.cortex/indentiagraph"  # SURREALDB_URL (of legacy INDENTIAGRAPH_URI)
+  user: "root"                      # SURREALDB_USERNAME (alleen nodig voor remote ws/http)
+  password: "root"                  # SURREALDB_PASSWORD (alleen nodig voor remote ws/http)
+  namespace: "cortex"               # SURREALDB_NAMESPACE
+  database: "memory"                # SURREALDB_DATABASE
 
 chat:
-  default_model: "claude-opus-4-6"
+  default_model: "claude-opus-4-6"  # CHAT_DEFAULT_MODEL
 ```
 
-### Omgevingsvariabelen
-
-| Variabele | Standaard | Beschrijving |
-|-----------|-----------|--------------|
-| `SURREALDB_URL` | `ws://localhost:8000` | SurrealDB WebSocket-URL |
-| `SURREALDB_USERNAME` | `root` | SurrealDB gebruikersnaam |
-| `SURREALDB_PASSWORD` | `root` | SurrealDB wachtwoord |
-| `SURREALDB_NAMESPACE` | `cortex` | SurrealDB namespace |
-| `SURREALDB_DATABASE` | `memory` | SurrealDB database |
-| `GRAPH_BACKEND` | `indentiagraph` | Graafbackend (`indentiagraph` of `neo4j`) |
-| `NATS_URL` | *(optioneel)* | NATS-server URL |
-| `CHAT_DEFAULT_MODEL` | `claude-opus-4-6` | Standaard Claude-model voor chat |
-| `RUST_LOG` | `info` | Logniveau |
+| Omgevingsvariabele | Beschrijving | Standaard |
+|--------------------|-------------|-----------|
+| `SURREALDB_URL` | SurrealDB verbindings-URI | `surrealkv://./.cortex/indentiagraph` |
+| `SURREALDB_USERNAME` | SurrealDB gebruiker | `root` |
+| `SURREALDB_PASSWORD` | SurrealDB wachtwoord | `root` |
+| `SURREALDB_NAMESPACE` | SurrealDB namespace | `cortex` |
+| `SURREALDB_DATABASE` | SurrealDB database | `memory` |
+| `INDENTIAGRAPH_URI/USER/PASSWORD` | Legacy aliases (achterwaarts compatibel) | - |
+| `CHAT_DEFAULT_MODEL` | Standaard Claude model | `claude-opus-4-6` |
+| `RUST_LOG` | Log niveau | `info` |
 
 ---
 
-## Ondersteunde talen
+## MCP-integratie (Claude Code)
+
+### Bouwen
+
+```bash
+cargo build --release --bin cortex-mcp
+```
+
+### Configuratie in `~/.claude/mcp.json`
+
+```json
+{
+  "mcpServers": {
+    "cortex": {
+      "command": "/pad/naar/cortex-mcp",
+      "env": {
+        "PO_SERVER_URL": "http://127.0.0.1:8080"
+      }
+    }
+  }
+}
+```
+
+### Overzicht van de 20 Mega-Tools
+
+| Mega-Tool | Acties | Beschrijving |
+|-----------|--------|-------------|
+| `project` | 8 | Project CRUD, sync, roadmap |
+| `plan` | 10 | Plan lifecycle, dependency graph, critical path |
+| `task` | 13 | Taken, afhankelijkheden, blockers, context |
+| `step` | 6 | Subtaken, voortgang bijhouden |
+| `decision` | 12 | Beslissingen, tijdlijn, impact tracking |
+| `constraint` | 5 | Plan constraints (performance, security, stijl) |
+| `release` | 8 | Releasemanagement met taken en commits |
+| `milestone` | 9 | Mijlpalen met voortgang en plan-koppeling |
+| `commit` | 7 | Git commit tracking, bestandshistorie |
+| `note` | 24 | Kennisnotities, semantisch zoeken, episodisch geheugen |
+| `workspace` | 10 | Multi-project workspaces, topologie |
+| `workspace_milestone` | 10 | Cross-project mijlpalen |
+| `resource` | 6 | Gedeelde API-contracten, schema's |
+| `component` | 8 | Servicetopologie en afhankelijkheden |
+| `chat` | 7 | Chat sessies, berichten, delegatie |
+| `feature_graph` | 6 | Feature grafen, automatisch bouwen vanuit code |
+| `code` | 36 | Code zoeken, call grafen, impact analyse, communities, bridge |
+| `admin` | 25 | Sync, watch, Knowledge Fabric, neural onderhoud, skills |
+| `skill` | 12 | Neurale skills detectie, activatie, export/import |
+| `analysis_profile` | 4 | Edge/fusion gewichten presets voor analyse |
+
+---
+
+## Episodisch Geheugen
+
+CortexAIMemory ondersteunt Graphiti-geïnspireerd temporeel episodisch geheugen: ruwe tekst als tijdgestempelde episoden opslaan, bi-temporele notes en historische queries.
+
+### Hoe het werkt
+
+**Episoden** zijn ruwe teksteenheden met een tijdstempel (gesprekken, code-events, documenten, systeem-events). Ze worden opgeslagen met BM25-indexering voor snelle full-text zoekacties.
+
+**Bi-temporele notes** hebben twee tijdstempels:
+- `valid_at` — wanneer het feit waar werd
+- `invalid_at` — wanneer het feit ophield waar te zijn (NULL = nu nog geldig)
+
+Dit maakt het mogelijk te vragen: "Wat wisten we op 15 januari 2024?" zonder huidige kennis te verliezen.
+
+### API-voorbeelden
+
+```bash
+# Episode opslaan (gesprek, code-event, document, systeem-event)
+curl -X POST http://localhost:8080/api/episodes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Sprint planning 2024-01-15",
+    "content": "Team besloot auth te migreren van JWT naar PASETO...",
+    "source": "conversation",
+    "reference_time": "2024-01-15T09:00:00Z",
+    "project_id": "uuid-van-project"
+  }'
+
+# Recente episoden ophalen
+curl "http://localhost:8080/api/episodes?project_id=uuid&limit=20"
+
+# Episoden doorzoeken (BM25)
+curl "http://localhost:8080/api/episodes/search?query=auth+migratie&project_id=uuid"
+
+# Wat wisten we op een bepaald moment? (temporele zoekopdracht)
+curl "http://localhost:8080/api/notes/at-time?query=auth&at_time=2024-01-15T09:00:00Z&project_id=uuid"
+
+# Note niet-destructief ongeldig markeren op een tijdstip
+curl -X POST http://localhost:8080/api/notes/{id}/invalidate-temporal \
+  -H "Content-Type: application/json" \
+  -d '{"at_time": "2024-01-16T00:00:00Z"}'
+```
+
+### MCP-tools voor episodisch geheugen
+
+De `note` mega-tool heeft 5 extra acties:
+
+| Actie | Beschrijving |
+|-------|-------------|
+| `add_episode` | Ruwe tekst opslaan als tijdgestempelde episode |
+| `get_episodes` | Recente episoden ophalen (filter op project_id, group_id) |
+| `search_episodes` | BM25 zoeken over episode-inhoud |
+| `search_at_time` | "Wat wisten we op datum X?" temporele notitiezoekopdracht |
+| `invalidate_temporal` | Note ongeldig markeren op een specifiek tijdstip |
+
+---
+
+## cortex-mem (Claude Code Hook)
+
+`cortex-mem` is een memory worker daemon die automatisch Claude Code sessies vastlegt als episoden in het geheugen.
+
+### Hoe het werkt
+
+1. `cortex-mem` draait als achtergrondproces op poort 37777
+2. `cortex-mem-hook` is een lichtgewicht binary die als `PostToolUse` hook in Claude Code wordt geconfigureerd
+3. Na elke tool-aanroep stuurt de hook de context naar de memory worker
+4. De worker slaat dit op als episode in SurrealDB
+
+### Installatie als Claude Code hook
+
+```bash
+# Bouw de hook binary
+cargo build --release -p cortex-mem --bin cortex-mem-hook
+
+# Bouw ook de worker binary
+cargo build --release -p cortex-mem --bin cortex-mem
+
+# Start de memory worker
+./target/release/cortex-mem &
+
+# Configureer in ~/.claude/settings.json
+```
+
+Voeg toe aan `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/pad/naar/cortex-mem-hook"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+---
+
+## API-overzicht
+
+### Plannen en Taken
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/api/plans` | GET/POST | Plannen ophalen / aanmaken |
+| `/api/plans/{id}/tasks` | POST | Taak toevoegen aan plan |
+| `/api/tasks/{id}` | GET/PATCH | Taakdetails / bijwerken |
+| `/api/tasks/{id}/dependencies` | POST | Afhankelijkheden toevoegen |
+| `/api/tasks/{id}/blockers` | GET | Geblokkeerde taken ophalen |
+
+### Code Exploratie
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/api/code/search` | GET | Semantisch zoeken in code |
+| `/api/code/symbols/{path}` | GET | Symbolen in een bestand |
+| `/api/code/callgraph` | GET | Functie-aanroepgraaf |
+| `/api/code/impact` | GET | Impact-analyse bij wijzigingen |
+| `/api/code/architecture` | GET | Codebase-overzicht |
+
+### Kennisnotities
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/api/notes` | GET/POST | Notities ophalen / aanmaken |
+| `/api/notes/search` | GET | Semantisch zoeken in notities |
+| `/api/notes/at-time` | GET | Temporele notitiezoekopdracht |
+| `/api/notes/{id}/invalidate-temporal` | POST | Notitie ongeldig markeren op tijdstip |
+
+### Episodisch Geheugen
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/api/episodes` | GET/POST | Episoden ophalen / opslaan |
+| `/api/episodes/search` | GET | BM25 zoeken in episoden |
+
+### Workspaces
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/api/workspaces` | GET/POST | Workspaces beheren |
+| `/api/workspaces/{slug}/projects` | GET/POST | Projecten in workspace |
+| `/api/workspaces/{slug}/topology` | GET | Topologiegraaf |
+
+### Authenticatie
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/auth/login` | POST | Inloggen (wachtwoord) |
+| `/auth/google` | GET | Google OAuth URL ophalen |
+| `/auth/me` | GET | Huidig gebruikersprofiel |
+
+---
+
+## Ondersteunde Programmeertalen
 
 | Taal | Extensies |
 |------|-----------|
@@ -273,27 +376,46 @@ chat:
 
 ---
 
-## Integraties
+## Ontwikkeling
 
-| Platform | Status | Documentatie |
-|----------|--------|--------------|
-| **Claude Code** | Volledig ondersteund | [Installatiegids](docs/integrations/claude-code.md) |
-| **OpenAI Agents** | Volledig ondersteund | [Installatiegids](docs/integrations/openai.md) |
-| **Cursor** | Volledig ondersteund | [Installatiegids](docs/integrations/cursor.md) |
+```bash
+# Alle tests uitvoeren (mock backends, geen Docker vereist voor unit tests)
+cargo test
+
+# Linter
+cargo clippy
+
+# Formatter
+cargo fmt
+
+# Release build
+cargo build --release
+```
+
+### Teststructuur
+
+| Testbestand | Beschrijving |
+|-------------|-------------|
+| `tests/api_tests.rs` | HTTP API tests |
+| `tests/integration_tests.rs` | Database integratietests |
+| `tests/parser_tests.rs` | Parser tests |
+| `tests/workspace_tests.rs` | Workspace tests |
+| `crates/cortex-indentiagraph/` | SurrealDB implementatietests (221) |
+
+### Nieuwe API-endpoint toevoegen
+
+1. Handler toevoegen in `src/api/handlers.rs` of een nieuwe `*_handlers.rs`
+2. Route registreren in `src/api/routes.rs`
+3. Test schrijven in `tests/api_tests.rs`
 
 ---
 
-## Documentatie
+## Licentie
 
-| Gids | Beschrijving |
-|------|--------------|
-| [Installatie](docs/setup/installation.md) | Volledige installatie-instructies |
-| [Aan de slag](docs/guides/getting-started.md) | Stap-voor-stap tutorial |
-| [API-referentie](docs/api/reference.md) | Volledige REST API-documentatie |
-| [MCP-tools](docs/api/mcp-tools.md) | Alle 20 MCP mega-tools met voorbeelden |
-| [Workspaces](docs/guides/workspaces.md) | Multi-projectcoördinatie |
-| [Multi-agent workflows](docs/guides/multi-agent-workflow.md) | Meerdere agents coördineren |
-| [Authenticatie](docs/guides/authentication.md) | JWT + OAuth/OIDC instellen |
-| [Chat & WebSocket](docs/guides/chat-websocket.md) | Realtime chat en events |
-| [Kennisnotities](docs/guides/knowledge-notes.md) | Contextuele kennisopname |
+MIT AND BUSL-1.1 — zie [LICENSE](LICENSE) voor details.
 
+---
+
+<p align="center">
+  <i>Geef je AI-agents een gedeeld geheugen.</i>
+</p>
