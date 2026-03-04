@@ -1,19 +1,3 @@
-<p align="center">
-  <img src="dist/logo-512.png" alt="CortexAIMemory" width="128" />
-</p>
-
-<h1 align="center">CortexAIMemory</h1>
-
-<p align="center">
-  <strong>AI-geheugen en orchestratielaag voor Indentia — koppelt Claude Code aan een kennisgraaf met episodisch geheugen.</strong>
-</p>
-
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT%20AND%20BUSL--1.1-blue.svg" alt="Licentie"></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.75+-orange.svg" alt="Rust"></a>
-</p>
-
----
 
 ## Wat is CortexAIMemory?
 
