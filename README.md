@@ -9,7 +9,7 @@ Het systeem is opgezet rond twee kernprincipes: **structureel geheugen** (wat st
 
 ### Kernfunctionaliteit
 
-- **Kennisgraaf (IndentiaGraph/SurrealDB)** — code-structuur, plannen, taken, beslissingen en notes als graaf
+- **Kennisgraaf (IndentiaGraph)** — code-structuur, plannen, taken, beslissingen en notes als graaf
 - **Native BM25 + vector search** — full-text en semantisch zoeken direct op de graph-backend
 - **Episodisch geheugen (Graphiti-inspired)** — tijdgestempelde episoden, bi-temporele notes, historische queries
 - **MCP-server** — 20 mega-tools voor Claude Code, OpenAI Agents en Cursor
@@ -46,7 +46,7 @@ Het systeem is opgezet rond twee kernprincipes: **structureel geheugen** (wat st
    ▼                          ▼                          ▼
 ┌────────────────────┐  ┌──────────────────────┐  ┌──────────────┐
 │ INDENTIAGRAPH API  │  │   SURREALDB ENGINE   │  │ TREE-SITTER  │
-│                    │  │  (via indentiagraph) │  │              │
+│                    │  │  (via IndentiaGraph) │  │              │
 │ • Code graph       │  │ • BM25 zoeken        │  │ • 17 talen   │
 │ • Plannen/taken    │  │ • Episoden           │  │ • AST parse  │
 │ • Beslissingen     │  │ • Temporele queries  │  │ • Symbolen   │
@@ -242,7 +242,7 @@ De `note` mega-tool heeft 5 extra acties:
 1. `cortex-mem` draait als achtergrondproces op poort 37777
 2. `cortex-mem-hook` is een lichtgewicht binary die als `PostToolUse` hook in Claude Code wordt geconfigureerd
 3. Na elke tool-aanroep stuurt de hook de context naar de memory worker
-4. De worker slaat dit op als episode in SurrealDB
+4. De worker slaat dit op als episode in IndentiaGraph DB
 
 ### Installatie als Claude Code hook
 
