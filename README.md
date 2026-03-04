@@ -392,14 +392,3 @@ cargo build --release
 2. Route registreren in `src/api/routes.rs`
 3. Test schrijven in `tests/api_tests.rs`
 
----
-
-## Licentie
-
-MIT AND BUSL-1.1 — zie [LICENSE](LICENSE) voor details.
-
----
-
-<p align="center">
-  <i>Geef je AI-agents een gedeeld geheugen.</i>
-</p>
