@@ -1,6 +1,6 @@
-//! Project Orchestrator - CLI Tool
+//! CortexAIMemory - CLI Tool
 //!
-//! Command-line interface for interacting with the orchestrator.
+//! Command-line interface for interacting with Cortex.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -8,15 +8,21 @@ use reqwest::Client;
 use serde_json::Value;
 use uuid::Uuid;
 
+fn default_server_url() -> String {
+    std::env::var("CORTEX_URL")
+        .or_else(|_| std::env::var("ORCHESTRATOR_URL"))
+        .unwrap_or_else(|_| "http://localhost:8080".to_string())
+}
+
 #[derive(Parser)]
-#[command(name = "orch")]
-#[command(about = "CLI for Project Orchestrator")]
+#[command(name = "cortex-cli")]
+#[command(about = "CLI for CortexAIMemory")]
 struct Cli {
-    /// Orchestrator server URL
+    /// Cortex server URL
     #[arg(
         long,
-        env = "ORCHESTRATOR_URL",
-        default_value = "http://localhost:8080"
+        env = "CORTEX_URL",
+        default_value_t = default_server_url()
     )]
     server: String,
 

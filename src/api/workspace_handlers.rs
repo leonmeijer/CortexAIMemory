@@ -1,7 +1,7 @@
 //! Workspace API handlers
 
 use crate::api::{PaginatedResponse, PaginationParams, StatusFilter};
-use crate::neo4j::models::*;
+use crate::indentiagraph::models::*;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -326,7 +326,7 @@ pub async fn list_workspaces(
     State(state): State<OrchestratorState>,
     Query(query): Query<PaginationParams>,
 ) -> Result<Json<PaginatedResponse<WorkspaceResponse>>, AppError> {
-    let workspaces = state.orchestrator.neo4j().list_workspaces().await?;
+    let workspaces = state.orchestrator.indentiagraph().list_workspaces().await?;
 
     let total = workspaces.len() as i64;
     let limit = query.validated_limit();
@@ -387,7 +387,7 @@ pub async fn get_workspace(
 ) -> Result<Json<WorkspaceResponse>, AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
@@ -403,7 +403,7 @@ pub async fn update_workspace(
 ) -> Result<Json<WorkspaceResponse>, AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
@@ -415,7 +415,7 @@ pub async fn update_workspace(
 
     let updated = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace(workspace.id)
         .await?
         .unwrap();
@@ -430,7 +430,7 @@ pub async fn delete_workspace(
 ) -> Result<StatusCode, AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
@@ -447,32 +447,32 @@ pub async fn get_workspace_overview(
 ) -> Result<Json<WorkspaceOverviewResponse>, AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
 
     let projects = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_workspace_projects(workspace.id)
         .await?;
 
     let milestones = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_workspace_milestones(workspace.id)
         .await?;
 
     let resources = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_workspace_resources(workspace.id)
         .await?;
 
     let components = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_components(workspace.id)
         .await?;
 
@@ -514,14 +514,14 @@ pub async fn list_workspace_projects(
 ) -> Result<Json<Vec<ProjectNode>>, AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
 
     let projects = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_workspace_projects(workspace.id)
         .await?;
 
@@ -536,7 +536,7 @@ pub async fn add_project_to_workspace(
 ) -> Result<StatusCode, AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
@@ -561,7 +561,7 @@ pub async fn remove_project_from_workspace(
 ) -> Result<StatusCode, AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
@@ -601,7 +601,7 @@ pub async fn list_workspace_milestones(
 
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
@@ -610,7 +610,7 @@ pub async fn list_workspace_milestones(
 
     let (milestones, total) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_workspace_milestones_filtered(
             workspace.id,
             status_str,
@@ -640,7 +640,7 @@ pub async fn create_workspace_milestone(
 ) -> Result<(StatusCode, Json<WorkspaceMilestoneResponse>), AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
@@ -682,20 +682,20 @@ pub async fn get_workspace_milestone(
         .parse()
         .map_err(|_| AppError::BadRequest("Invalid milestone ID".to_string()))?;
 
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
 
     // 1. Get milestone node
-    let milestone = neo4j
+    let milestone = indentiagraph
         .get_workspace_milestone(id)
         .await?
         .ok_or_else(|| AppError::NotFound("Milestone not found".to_string()))?;
 
     // 2. Get tasks with plan info (plan_id, plan_title, plan_status)
-    let tasks_with_plan = neo4j.get_workspace_milestone_tasks(id).await?;
+    let tasks_with_plan = indentiagraph.get_workspace_milestone_tasks(id).await?;
 
     // 3. Get progress stats
     let (total, completed, in_progress, pending) =
-        neo4j.get_workspace_milestone_progress(id).await?;
+        indentiagraph.get_workspace_milestone_progress(id).await?;
 
     let percentage = if total > 0 {
         (completed as f64 / total as f64) * 100.0
@@ -704,7 +704,7 @@ pub async fn get_workspace_milestone(
     };
 
     // 4. Get all steps in one batch query
-    let mut steps_map = neo4j.get_workspace_milestone_steps(id).await?;
+    let mut steps_map = indentiagraph.get_workspace_milestone_steps(id).await?;
 
     // 5. Group tasks by plan and build hierarchical response
     let mut plan_order: Vec<Uuid> = Vec::new();
@@ -817,7 +817,7 @@ pub async fn update_workspace_milestone(
 
     let updated = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_milestone(id)
         .await?
         .unwrap();
@@ -928,7 +928,7 @@ pub async fn list_workspace_milestone_tasks(
 
     let tasks = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_milestone_tasks(id)
         .await?;
 
@@ -946,7 +946,7 @@ pub async fn get_workspace_milestone_progress(
 
     let (total, completed, in_progress, pending) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_milestone_progress(id)
         .await?;
 
@@ -1010,13 +1010,13 @@ pub async fn list_all_workspace_milestones(
 
     let total = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .count_all_workspace_milestones(workspace_id, status_str)
         .await?;
 
     let results = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_all_workspace_milestones_filtered(
             workspace_id,
             status_str,
@@ -1054,14 +1054,14 @@ pub async fn list_resources(
 ) -> Result<Json<Vec<ResourceResponse>>, AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
 
     let resources = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_workspace_resources(workspace.id)
         .await?;
 
@@ -1078,7 +1078,7 @@ pub async fn create_resource(
 ) -> Result<(StatusCode, Json<ResourceResponse>), AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
@@ -1127,7 +1127,7 @@ pub async fn get_resource(
 
     let resource = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_resource(id)
         .await?
         .ok_or_else(|| AppError::NotFound("Resource not found".to_string()))?;
@@ -1233,14 +1233,14 @@ pub async fn list_components(
 ) -> Result<Json<Vec<ComponentResponse>>, AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
 
     let components = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_components(workspace.id)
         .await?;
 
@@ -1260,7 +1260,7 @@ pub async fn create_component(
 ) -> Result<(StatusCode, Json<ComponentResponse>), AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
@@ -1308,7 +1308,7 @@ pub async fn get_component(
 
     let component = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_component(id)
         .await?
         .ok_or_else(|| AppError::NotFound("Component not found".to_string()))?;
@@ -1439,14 +1439,14 @@ pub async fn get_workspace_topology(
 ) -> Result<Json<TopologyResponse>, AppError> {
     let workspace = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Workspace '{}' not found", slug)))?;
 
     let topology = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_workspace_topology(workspace.id)
         .await?;
 
@@ -1474,7 +1474,7 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
-    use crate::neo4j::models::{MilestoneStatus, WorkspaceMilestoneNode};
+    use crate::indentiagraph::models::{MilestoneStatus, WorkspaceMilestoneNode};
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{
         mock_app_state, test_bearer_token, test_plan, test_task_titled, test_workspace,
@@ -1525,7 +1525,7 @@ mod tests {
 
         // Create workspace
         let ws = test_workspace();
-        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        app_state.indentiagraph.create_workspace(&ws).await.unwrap();
 
         // Create workspace milestone
         let milestone_id = Uuid::new_v4();
@@ -1541,34 +1541,46 @@ mod tests {
             tags: vec!["test".to_string()],
         };
         app_state
-            .neo4j
+            .indentiagraph
             .create_workspace_milestone(&milestone)
             .await
             .unwrap();
 
         // Create a plan (needed to create tasks)
         let plan = test_plan();
-        app_state.neo4j.create_plan(&plan).await.unwrap();
+        app_state.indentiagraph.create_plan(&plan).await.unwrap();
 
         // Create two tasks and link them to the milestone
         let task1 = test_task_titled("Task Alpha");
         let task2 = test_task_titled("Task Beta");
-        app_state.neo4j.create_task(plan.id, &task1).await.unwrap();
-        app_state.neo4j.create_task(plan.id, &task2).await.unwrap();
         app_state
-            .neo4j
+            .indentiagraph
+            .create_task(plan.id, &task1)
+            .await
+            .unwrap();
+        app_state
+            .indentiagraph
+            .create_task(plan.id, &task2)
+            .await
+            .unwrap();
+        app_state
+            .indentiagraph
             .add_task_to_workspace_milestone(milestone_id, task1.id)
             .await
             .unwrap();
         app_state
-            .neo4j
+            .indentiagraph
             .add_task_to_workspace_milestone(milestone_id, task2.id)
             .await
             .unwrap();
 
         // Create a third task NOT linked to the milestone
         let task3 = test_task_titled("Task Gamma (not linked)");
-        app_state.neo4j.create_task(plan.id, &task3).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_task(plan.id, &task3)
+            .await
+            .unwrap();
 
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
@@ -1955,7 +1967,7 @@ mod tests {
         let app_state = mock_app_state();
         let ws = test_workspace();
         let slug = ws.slug.clone();
-        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        app_state.indentiagraph.create_workspace(&ws).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -2002,7 +2014,7 @@ mod tests {
         let app_state = mock_app_state();
         let ws = test_workspace();
         let slug = ws.slug.clone();
-        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        app_state.indentiagraph.create_workspace(&ws).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -2037,7 +2049,7 @@ mod tests {
         let app_state = mock_app_state();
         let ws = test_workspace();
         let slug = ws.slug.clone();
-        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        app_state.indentiagraph.create_workspace(&ws).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -2072,7 +2084,7 @@ mod tests {
         let app_state = mock_app_state();
         let ws = test_workspace();
         let slug = ws.slug.clone();
-        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        app_state.indentiagraph.create_workspace(&ws).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -2109,7 +2121,7 @@ mod tests {
         let app_state = mock_app_state();
         let ws = test_workspace();
         let slug = ws.slug.clone();
-        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        app_state.indentiagraph.create_workspace(&ws).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -2146,7 +2158,7 @@ mod tests {
         let app_state = mock_app_state();
         let ws = test_workspace();
         let slug = ws.slug.clone();
-        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        app_state.indentiagraph.create_workspace(&ws).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -2181,7 +2193,7 @@ mod tests {
         let app_state = mock_app_state();
         let ws = test_workspace();
         let slug = ws.slug.clone();
-        app_state.neo4j.create_workspace(&ws).await.unwrap();
+        app_state.indentiagraph.create_workspace(&ws).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),

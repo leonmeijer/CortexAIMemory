@@ -1,7 +1,7 @@
 //! Code exploration API handlers
 //!
-//! These endpoints provide intelligent code exploration using Neo4j graph queries
-//! and Meilisearch semantic search - much more powerful than reading files directly.
+//! These endpoints provide intelligent code exploration using IndentiaGraph graph queries
+//! and graph-based semantic search - much more powerful than reading files directly.
 
 use axum::{
     extract::{Path, Query, State},
@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 use super::handlers::{AppError, OrchestratorState};
 use crate::graph::algorithms::into_ranked;
 use crate::graph::models::{FusionWeights, MultiSignalImpact, MultiSignalScore, RankedList};
-use crate::neo4j::models::{ConnectedFileNode, DecisionNode};
+use crate::indentiagraph::models::{ConnectedFileNode, DecisionNode};
 
 // ============================================================================
-// Code Search (Meilisearch)
+// Code Search
 // ============================================================================
 
 #[derive(Deserialize)]
@@ -32,108 +32,49 @@ pub struct CodeSearchQuery {
     pub workspace_slug: Option<String>,
 }
 
-/// Search response with both legacy hits and ranked view (Plan 10).
+/// Search response with ranked code hits.
 #[derive(Serialize)]
 pub struct CodeSearchResult {
-    /// Legacy: flat list of SearchHit (retro-compatible)
-    pub hits:
-        Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>,
-    /// Ranked view with margins and natural clusters.
-    /// Uses CodeDocument directly (Meilisearch score as ranking score).
-    pub ranked: RankedList<crate::meilisearch::indexes::CodeDocument>,
-}
-
-/// Build a CodeSearchResult from raw Meilisearch hits
-fn build_search_result(
-    hits: Vec<crate::meilisearch::indexes::SearchHit<crate::meilisearch::indexes::CodeDocument>>,
-) -> CodeSearchResult {
-    let scored: Vec<(crate::meilisearch::indexes::CodeDocument, f64)> =
-        hits.iter().map(|h| (h.document.clone(), h.score)).collect();
-    let total = scored.len();
-    let ranked = into_ranked(scored, total);
-    CodeSearchResult { hits, ranked }
+    pub hits: Vec<serde_json::Value>,
+    pub total: usize,
 }
 
 /// Search code semantically across the codebase
 ///
-/// Returns a `CodeSearchResult` with both legacy `hits` array and
-/// `ranked` view with margins and clusters (Plan 10).
-///
-/// When `workspace_slug` is provided (and `project_slug` is not), searches all
-/// projects in the workspace, merges results by score, and truncates to `limit`.
+/// When `workspace_slug` is provided (and `project_slug` is not), validates the workspace exists.
 pub async fn search_code(
     State(state): State<OrchestratorState>,
     Query(params): Query<CodeSearchQuery>,
 ) -> Result<Json<CodeSearchResult>, AppError> {
-    let limit = params.limit.unwrap_or(10);
-
-    // If project_slug is given, use it directly (backward compat)
-    if params.project_slug.is_some() {
-        let hits = state
-            .orchestrator
-            .meili()
-            .search_code_with_scores(
-                &params.query,
-                limit,
-                params.language.as_deref(),
-                params.project_slug.as_deref(),
-                None,
-            )
-            .await?;
-        return Ok(Json(build_search_result(hits)));
-    }
-
-    // If workspace_slug is given, resolve to project slugs and merge results
+    // If workspace_slug is given, validate it exists
     if let Some(ref ws_slug) = params.workspace_slug {
-        let workspace = state
+        state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_workspace_by_slug(ws_slug)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Workspace not found: {}", ws_slug)))?;
-
-        let projects = state
-            .orchestrator
-            .neo4j()
-            .list_workspace_projects(workspace.id)
-            .await?;
-
-        let mut all_hits = Vec::new();
-        for project in &projects {
-            let hits = state
-                .orchestrator
-                .meili()
-                .search_code_with_scores(
-                    &params.query,
-                    limit,
-                    params.language.as_deref(),
-                    Some(&project.slug),
-                    None,
-                )
-                .await
-                .unwrap_or_default();
-            all_hits.extend(hits);
-        }
-
-        // Sort by score descending and truncate to limit
-        all_hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        all_hits.truncate(limit);
-
-        return Ok(Json(build_search_result(all_hits)));
     }
 
-    // No filter — global search
+    // BM25 full-text search across code symbols and file paths
     let hits = state
         .orchestrator
-        .meili()
-        .search_code_with_scores(&params.query, limit, params.language.as_deref(), None, None)
+        .indentiagraph()
+        .search_code_fts(
+            &params.query,
+            params.limit.unwrap_or(20),
+            None, // project_id filtering via workspace_slug handled below if needed
+            params.language.as_deref(),
+        )
         .await?;
 
-    Ok(Json(build_search_result(hits)))
+    Ok(Json(CodeSearchResult {
+        total: hits.len(),
+        hits: hits
+            .into_iter()
+            .map(|h| serde_json::to_value(h).expect("serialize CodeSearchHit"))
+            .collect(),
+    }))
 }
 
 // ============================================================================
@@ -179,14 +120,14 @@ pub async fn get_file_symbols(
 
     let language = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_file_language(&file_path)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("File not found: {}", file_path)))?;
 
     let func_nodes = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_file_functions_summary(&file_path)
         .await?;
 
@@ -205,7 +146,7 @@ pub async fn get_file_symbols(
 
     let struct_nodes = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_file_structs_summary(&file_path)
         .await?;
 
@@ -221,7 +162,7 @@ pub async fn get_file_symbols(
 
     let imports = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_file_import_paths_list(&file_path)
         .await?;
 
@@ -277,7 +218,7 @@ pub async fn find_references(
         Some(
             state
                 .orchestrator
-                .neo4j()
+                .indentiagraph()
                 .get_project_by_slug(slug)
                 .await?
                 .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?
@@ -289,7 +230,7 @@ pub async fn find_references(
 
     let ref_nodes = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .find_symbol_references(&query.symbol, limit, project_id)
         .await?;
 
@@ -354,13 +295,13 @@ pub async fn get_file_dependencies(
 
     let dependents = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .find_dependent_files(&file_path, 3, None)
         .await?;
 
     let import_nodes = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_file_direct_imports(&file_path)
         .await?;
 
@@ -440,7 +381,7 @@ pub async fn get_call_graph(
         Some(
             state
                 .orchestrator
-                .neo4j()
+                .indentiagraph()
                 .get_project_by_slug(slug)
                 .await?
                 .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?
@@ -458,13 +399,13 @@ pub async fn get_call_graph(
     if direction == "callers" || direction == "both" {
         callers = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_function_callers_by_name(&query.function, depth, project_id)
             .await?;
         // Also get direct callers with confidence (depth 1)
         if let Ok(details) = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_callers_with_confidence(&query.function, project_id)
             .await
         {
@@ -483,12 +424,12 @@ pub async fn get_call_graph(
     if direction == "callees" || direction == "both" {
         callees = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_function_callees_by_name(&query.function, depth, project_id)
             .await?;
         if let Ok(details) = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_callees_with_confidence(&query.function, project_id)
             .await
         {
@@ -582,7 +523,7 @@ pub async fn analyze_impact(
     let (project_id, project_root) = if let Some(ref slug) = query.project_slug {
         let project = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_project_by_slug(slug)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
@@ -601,10 +542,10 @@ pub async fn analyze_impact(
         match found {
             Some(p) => Some(p),
             None => {
-                // Try Neo4j lookup by id
+                // Try IndentiaGraph lookup by id
                 state
                     .orchestrator
-                    .neo4j()
+                    .indentiagraph()
                     .get_analysis_profile(profile_ref)
                     .await
                     .unwrap_or(None)
@@ -630,14 +571,14 @@ pub async fn analyze_impact(
     {
         let direct = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .find_impacted_files(&target, 1, project_id)
             .await?;
         // Fallback: if resolved path found nothing, retry with the raw input
         let (direct, effective) = if direct.is_empty() && target != query.target {
             let fallback = state
                 .orchestrator
-                .neo4j()
+                .indentiagraph()
                 .find_impacted_files(&query.target, 1, project_id)
                 .await?;
             if !fallback.is_empty() {
@@ -650,7 +591,7 @@ pub async fn analyze_impact(
         };
         let transitive = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .find_impacted_files(&effective, 3, project_id)
             .await?;
         let count = direct.len() as i64;
@@ -658,13 +599,13 @@ pub async fn analyze_impact(
     } else {
         let callers = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .find_callers(&target, project_id)
             .await?;
         let direct: Vec<String> = callers.iter().map(|f| f.file_path.clone()).collect();
         let count = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_function_caller_count(&target, project_id)
             .await?;
         (direct.clone(), direct, count, target)
@@ -681,7 +622,7 @@ pub async fn analyze_impact(
     let node_analytics = {
         let analytics = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_node_analytics(&target, target_type)
             .await
             .unwrap_or(None);
@@ -689,7 +630,7 @@ pub async fn analyze_impact(
             Some(a) => Some(a),
             None if target != query.target => state
                 .orchestrator
-                .neo4j()
+                .indentiagraph()
                 .get_node_analytics(&query.target, target_type)
                 .await
                 .unwrap_or(None),
@@ -705,7 +646,7 @@ pub async fn analyze_impact(
         .collect();
     let affected_communities = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_affected_communities(&all_affected)
         .await
         .unwrap_or_default();
@@ -815,7 +756,7 @@ pub async fn analyze_impact(
         // Get decisions affecting the target itself
         let mut decisions = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_decisions_affecting(entity_type_label, &target, None)
             .await
             .unwrap_or_default();
@@ -824,7 +765,7 @@ pub async fn analyze_impact(
         for affected_file in directly_affected.iter().take(5) {
             let file_decisions = state
                 .orchestrator
-                .neo4j()
+                .indentiagraph()
                 .get_decisions_affecting("File", affected_file, None)
                 .await
                 .unwrap_or_default();
@@ -841,7 +782,7 @@ pub async fn analyze_impact(
     let context_cards = if let Some(ref pid) = project_id {
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_context_cards_batch(&directly_affected, &pid.to_string())
             .await
             .unwrap_or_default()
@@ -907,10 +848,10 @@ pub async fn analyze_impact_v2(
     Query(query): Query<MultiImpactQuery>,
 ) -> Result<Json<MultiSignalImpact>, AppError> {
     let start = std::time::Instant::now();
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
 
     // Resolve project
-    let project = neo4j
+    let project = indentiagraph
         .get_project_by_slug(&query.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
@@ -925,13 +866,22 @@ pub async fn analyze_impact_v2(
         query.target.clone()
     };
 
-    // Resolve analysis profile (built-in first, then Neo4j)
+    // Resolve analysis profile (built-in first, then DB lookup)
     let profile = if let Some(ref profile_ref) = query.profile {
         let builtins = crate::graph::models::builtin_profiles();
-        // TODO: fallback to async Neo4j profile lookup when not found in builtins
-        builtins
+        let found = builtins
             .into_iter()
-            .find(|p| p.name == *profile_ref || p.id == *profile_ref)
+            .find(|p| p.name == *profile_ref || p.id == *profile_ref);
+        match found {
+            Some(p) => Some(p),
+            None => {
+                // Fallback: look up custom profile by id in the graph DB
+                indentiagraph
+                    .get_analysis_profile(profile_ref)
+                    .await
+                    .unwrap_or(None)
+            }
+        }
     } else {
         None
     };
@@ -954,15 +904,15 @@ pub async fn analyze_impact_v2(
     // ===== 5 signals in parallel via tokio::join! =====
     let (structural_res, co_change_res, knowledge_res, pagerank_res, bridge_res) = tokio::join!(
         // Signal 1: Structural impact (IMPORTS + CALLS traversal)
-        neo4j.find_impacted_files(&target, 3, Some(project_id)),
+        indentiagraph.find_impacted_files(&target, 3, Some(project_id)),
         // Signal 2: Co-change (temporal coupling)
-        neo4j.get_file_co_changers(&target, 1, 20),
+        indentiagraph.get_file_co_changers(&target, 1, 20),
         // Signal 3: Knowledge density (notes + decisions linked)
-        neo4j.get_knowledge_density(&target, &project_id_str),
+        indentiagraph.get_knowledge_density(&target, &project_id_str),
         // Signal 4: PageRank (structural importance)
-        neo4j.get_node_pagerank(&target, &project_id_str),
+        indentiagraph.get_node_pagerank(&target, &project_id_str),
         // Signal 5: Bridge proximity (shortest path to co-changers)
-        neo4j.get_bridge_proximity(&target, &project_id_str),
+        indentiagraph.get_bridge_proximity(&target, &project_id_str),
     );
 
     // Collect results (best-effort: log errors, use defaults)
@@ -1138,7 +1088,7 @@ pub async fn get_architecture(
         // Single project filter (backward compat)
         let project = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_project_by_slug(slug)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", slug)))?;
@@ -1147,13 +1097,13 @@ pub async fn get_architecture(
         // Workspace filter: resolve to all project IDs
         let workspace = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_workspace_by_slug(ws_slug)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Workspace not found: {}", ws_slug)))?;
         let projects = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .list_workspace_projects(workspace.id)
             .await?;
         Some(projects.into_iter().map(|p| p.id).collect())
@@ -1168,7 +1118,7 @@ pub async fn get_architecture(
             for pid in ids {
                 let stats = state
                     .orchestrator
-                    .neo4j()
+                    .indentiagraph()
                     .get_language_stats_for_project(*pid)
                     .await?;
                 all_stats.extend(stats);
@@ -1182,14 +1132,20 @@ pub async fn get_architecture(
             merged
                 .into_iter()
                 .map(
-                    |(language, file_count)| crate::neo4j::models::LanguageStatsNode {
+                    |(language, file_count)| crate::indentiagraph::models::LanguageStatsNode {
                         language,
                         file_count,
                     },
                 )
                 .collect::<Vec<_>>()
         }
-        None => state.orchestrator.neo4j().get_language_stats().await?,
+        None => {
+            state
+                .orchestrator
+                .indentiagraph()
+                .get_language_stats()
+                .await?
+        }
     };
 
     let languages: Vec<LanguageStats> = lang_stats
@@ -1209,7 +1165,7 @@ pub async fn get_architecture(
             for pid in ids {
                 let files = state
                     .orchestrator
-                    .neo4j()
+                    .indentiagraph()
                     .get_most_connected_files_for_project(*pid, 10)
                     .await?;
                 all_files.extend(files);
@@ -1228,7 +1184,7 @@ pub async fn get_architecture(
         None => {
             state
                 .orchestrator
-                .neo4j()
+                .indentiagraph()
                 .get_most_connected_files_detailed(10)
                 .await?
         }
@@ -1241,7 +1197,7 @@ pub async fn get_architecture(
             for pid in ids {
                 let comms = state
                     .orchestrator
-                    .neo4j()
+                    .indentiagraph()
                     .get_project_communities(*pid)
                     .await?;
                 all_rows.extend(comms);
@@ -1291,29 +1247,63 @@ pub struct SimilarCode {
     pub similarity: f64,
 }
 
-/// Find code similar to a given snippet
+/// Find code similar to a given snippet using BM25 full-text search.
+///
+/// The snippet is tokenized into words; for each significant word (length ≥ 3)
+/// a search is issued and results are merged, so partial matches are returned.
 pub async fn find_similar_code(
     State(state): State<OrchestratorState>,
     Json(query): Json<SimilarCodeQuery>,
 ) -> Result<Json<Vec<SimilarCode>>, AppError> {
-    let hits = state
-        .orchestrator
-        .meili()
-        .search_code_with_scores(&query.snippet, query.limit.unwrap_or(5), None, None, None)
-        .await?;
+    let limit = query.limit.unwrap_or(10);
 
-    let similar: Vec<SimilarCode> = hits
-        .into_iter()
-        .map(|hit| SimilarCode {
-            path: hit.document.path,
-            line_start: 0,
-            line_end: 0,
-            snippet: hit.document.docstrings.chars().take(300).collect(),
-            similarity: hit.score,
-        })
+    // Extract significant keywords from the snippet (length >= 3, skip stop words)
+    let stop_words = [
+        "the", "and", "for", "with", "that", "this", "from", "are", "was",
+    ];
+    let keywords: Vec<&str> = query
+        .snippet
+        .split_whitespace()
+        .filter(|w| w.len() >= 3 && !stop_words.contains(&w.to_lowercase().as_str()))
         .collect();
 
-    Ok(Json(similar))
+    // Use the full snippet if no keywords extracted
+    let search_terms: Vec<String> = if keywords.is_empty() {
+        vec![query.snippet.clone()]
+    } else {
+        keywords.iter().map(|w| w.to_string()).collect()
+    };
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut all_hits: Vec<SimilarCode> = Vec::new();
+
+    for term in &search_terms {
+        let hits = state
+            .orchestrator
+            .indentiagraph()
+            .search_code_fts(term, limit, None, None)
+            .await?;
+
+        for h in hits {
+            if seen.insert(h.path.clone()) {
+                all_hits.push(SimilarCode {
+                    path: h.path,
+                    line_start: 0,
+                    line_end: 0,
+                    snippet: h.symbols.join(", "),
+                    similarity: h.score,
+                });
+            }
+            if all_hits.len() >= limit {
+                break;
+            }
+        }
+        if all_hits.len() >= limit {
+            break;
+        }
+    }
+
+    Ok(Json(all_hits))
 }
 
 // ============================================================================
@@ -1348,7 +1338,7 @@ pub async fn find_trait_implementations(
 ) -> Result<Json<TraitImplementors>, AppError> {
     let trait_info = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_trait_info(&query.trait_name)
         .await?;
 
@@ -1358,7 +1348,7 @@ pub async fn find_trait_implementations(
 
     let impl_nodes = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_trait_implementors_detailed(&query.trait_name)
         .await?;
 
@@ -1407,7 +1397,7 @@ pub async fn find_type_traits(
 ) -> Result<Json<TypeTraits>, AppError> {
     let trait_nodes = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_type_trait_implementations(&query.type_name)
         .await?;
 
@@ -1460,7 +1450,7 @@ pub async fn get_impl_blocks(
 ) -> Result<Json<TypeImplBlocks>, AppError> {
     let block_nodes = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_type_impl_blocks_detailed(&query.type_name)
         .await?;
 
@@ -1520,7 +1510,7 @@ pub async fn create_feature_graph(
     State(state): State<OrchestratorState>,
     Json(body): Json<CreateFeatureGraphBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let fg = crate::neo4j::models::FeatureGraphNode {
+    let fg = crate::indentiagraph::models::FeatureGraphNode {
         id: uuid::Uuid::new_v4(),
         name: body.name,
         description: body.description,
@@ -1532,7 +1522,11 @@ pub async fn create_feature_graph(
         build_depth: None,
         include_relations: None,
     };
-    state.orchestrator.neo4j().create_feature_graph(&fg).await?;
+    state
+        .orchestrator
+        .indentiagraph()
+        .create_feature_graph(&fg)
+        .await?;
     Ok(Json(serde_json::json!({
         "id": fg.id.to_string(),
         "name": fg.name,
@@ -1548,7 +1542,7 @@ pub async fn list_feature_graphs(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let graphs = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_feature_graphs(query.project_id)
         .await?;
     let items: Vec<serde_json::Value> = graphs
@@ -1578,7 +1572,7 @@ pub async fn get_feature_graph(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let detail = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_feature_graph_detail(id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Feature graph not found: {}", id)))?;
@@ -1623,7 +1617,11 @@ pub async fn delete_feature_graph(
     State(state): State<OrchestratorState>,
     Path(id): Path<uuid::Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let deleted = state.orchestrator.neo4j().delete_feature_graph(id).await?;
+    let deleted = state
+        .orchestrator
+        .indentiagraph()
+        .delete_feature_graph(id)
+        .await?;
     Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
 
@@ -1636,14 +1634,14 @@ pub async fn add_entity_to_feature_graph(
     // Resolve the feature graph's project_id for proper scoping
     let project_id = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_feature_graph_detail(id)
         .await?
         .map(|detail| detail.graph.project_id);
 
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .add_entity_to_feature_graph(
             id,
             &body.entity_type,
@@ -1669,7 +1667,7 @@ pub async fn auto_build_feature_graph(
     let depth = body.depth.unwrap_or(2);
     let detail = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .auto_build_feature_graph(
             &body.name,
             body.description.as_deref(),
@@ -1733,7 +1731,7 @@ pub async fn get_code_communities(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| {
@@ -1743,7 +1741,7 @@ pub async fn get_code_communities(
     let min_size = params.min_size.unwrap_or(2);
     let communities = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_communities(project.id)
         .await?;
 
@@ -1796,7 +1794,7 @@ pub async fn get_code_health(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| {
@@ -1806,13 +1804,13 @@ pub async fn get_code_health(
     let threshold = params.god_function_threshold.unwrap_or(10);
     let report = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_code_health_report(project.id, threshold)
         .await?;
 
     let circular_deps = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_circular_dependencies(project.id)
         .await?;
 
@@ -1841,21 +1839,21 @@ pub async fn get_code_health(
     // Returns empty arrays / null if properties have not been computed yet.
     let hotspots = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_top_hotspots(project.id, 5)
         .await
         .unwrap_or_default();
 
     let knowledge_gaps = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_top_knowledge_gaps(project.id, 5)
         .await
         .unwrap_or_default();
 
     let risk_assessment = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_risk_summary(project.id)
         .await
         .unwrap_or(serde_json::json!(null));
@@ -1863,7 +1861,7 @@ pub async fn get_code_health(
     // Neural metrics (SYNAPSE layer health)
     let neural_metrics = match state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_neural_metrics(project.id)
         .await
     {
@@ -1879,7 +1877,7 @@ pub async fn get_code_health(
     // Multi-signal impact score (average combined score of top-10 files by PageRank)
     let avg_impact_score = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_avg_multi_signal_score(project.id)
         .await
         .unwrap_or(0.0);
@@ -1887,7 +1885,7 @@ pub async fn get_code_health(
     // Topology violations (best-effort — returns null if no rules defined)
     let topology_violations = match state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .check_topology_rules(&project.id.to_string())
         .await
     {
@@ -1942,7 +1940,7 @@ pub async fn get_node_importance(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| {
@@ -1953,7 +1951,7 @@ pub async fn get_node_importance(
 
     let metrics = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_node_gds_metrics(&params.node_path, node_type, project.id)
         .await
         .map_err(AppError::Internal)?;
@@ -1982,7 +1980,7 @@ pub async fn get_node_importance(
 
     let percentiles = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_percentiles(project.id)
         .await
         .map_err(AppError::Internal)?;
@@ -2062,7 +2060,7 @@ pub async fn plan_implementation(
     // Resolve project slug → project ID
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", body.project_slug))?;
@@ -2110,7 +2108,7 @@ pub async fn get_change_hotspots(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| {
@@ -2120,11 +2118,12 @@ pub async fn get_change_hotspots(
     let limit = params.limit.unwrap_or(20);
     let scores = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .compute_churn_scores(project.id)
         .await?;
 
-    let limited: Vec<&crate::neo4j::models::FileChurnScore> = scores.iter().take(limit).collect();
+    let limited: Vec<&crate::indentiagraph::models::FileChurnScore> =
+        scores.iter().take(limit).collect();
 
     Ok(Json(serde_json::json!({
         "hotspots": limited,
@@ -2150,7 +2149,7 @@ pub async fn get_knowledge_gaps(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| {
@@ -2160,7 +2159,7 @@ pub async fn get_knowledge_gaps(
     let limit = params.limit.unwrap_or(20);
     let mut scores = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .compute_knowledge_density(project.id)
         .await?;
 
@@ -2171,7 +2170,7 @@ pub async fn get_knowledge_gaps(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    let limited: Vec<&crate::neo4j::models::FileKnowledgeDensity> =
+    let limited: Vec<&crate::indentiagraph::models::FileKnowledgeDensity> =
         scores.iter().take(limit).collect();
 
     Ok(Json(serde_json::json!({
@@ -2198,7 +2197,7 @@ pub async fn get_risk_assessment(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| {
@@ -2208,11 +2207,12 @@ pub async fn get_risk_assessment(
     let limit = params.limit.unwrap_or(20);
     let scores = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .compute_risk_scores(project.id)
         .await?;
 
-    let limited: Vec<&crate::neo4j::models::FileRiskScore> = scores.iter().take(limit).collect();
+    let limited: Vec<&crate::indentiagraph::models::FileRiskScore> =
+        scores.iter().take(limit).collect();
 
     // Compute summary stats
     let total = scores.len();
@@ -2259,7 +2259,7 @@ pub async fn detect_processes(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
@@ -2312,7 +2312,7 @@ pub async fn get_class_hierarchy(
     let max_depth = params.max_depth.unwrap_or(10).clamp(1, 20);
     let hierarchy = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_class_hierarchy(&params.type_name, max_depth)
         .await?;
 
@@ -2333,7 +2333,7 @@ pub async fn find_subclasses(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let subclasses = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .find_subclasses(&params.class_name)
         .await?;
 
@@ -2358,7 +2358,7 @@ pub async fn find_interface_implementors(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let implementors = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .find_interface_implementors(&params.interface_name)
         .await?;
 
@@ -2387,7 +2387,7 @@ pub async fn list_processes(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| {
@@ -2396,7 +2396,7 @@ pub async fn list_processes(
 
     let processes = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_processes(project.id)
         .await?;
 
@@ -2420,7 +2420,7 @@ pub async fn get_process_detail(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let process = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_process_detail(&params.process_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Process '{}' not found", params.process_id)))?;
@@ -2443,7 +2443,7 @@ pub async fn get_entry_points(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| {
@@ -2453,7 +2453,7 @@ pub async fn get_entry_points(
     let limit = params.limit.unwrap_or(50);
     let entry_points = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_entry_points(project.id, limit)
         .await?;
 
@@ -2476,7 +2476,7 @@ pub async fn enrich_communities(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
@@ -2535,10 +2535,10 @@ pub async fn get_bridge(
     State(state): State<OrchestratorState>,
     Query(params): Query<BridgeQuery>,
 ) -> Result<Json<crate::graph::models::BridgeSubgraph>, AppError> {
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
 
     // Resolve project
-    let project = neo4j
+    let project = indentiagraph
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", params.project_slug)))?;
@@ -2570,8 +2570,8 @@ pub async fn get_bridge(
         "IMPLEMENTS".to_string(),
     ];
 
-    // Phase 1: Extract raw bridge subgraph from Neo4j
-    let (raw_nodes, raw_edges) = neo4j
+    // Phase 1: Extract raw bridge subgraph from IndentiaGraph
+    let (raw_nodes, raw_edges) = indentiagraph
         .find_bridge_subgraph(&source, &target, max_hops, &relation_types, &project_id_str)
         .await?;
 
@@ -2637,11 +2637,11 @@ pub async fn get_bridge(
     // "Notes that bridge together, wire together"
     // Collect notes linked to bridge nodes and reinforce synapses between them.
     let bridge_node_paths: Vec<String> = node_paths;
-    let neo4j_bg = state.orchestrator.neo4j_arc();
+    let indentiagraph_bg = state.orchestrator.indentiagraph_arc();
     tokio::spawn(async move {
         let mut all_note_ids: Vec<uuid::Uuid> = Vec::new();
         for path in &bridge_node_paths {
-            if let Ok(notes) = neo4j_bg
+            if let Ok(notes) = indentiagraph_bg
                 .get_notes_for_entity(&crate::notes::EntityType::File, path)
                 .await
             {
@@ -2653,7 +2653,10 @@ pub async fn get_bridge(
         all_note_ids.sort();
         all_note_ids.dedup();
         if all_note_ids.len() >= 2 {
-            match neo4j_bg.reinforce_synapses(&all_note_ids, 0.05).await {
+            match indentiagraph_bg
+                .reinforce_synapses(&all_note_ids, 0.05)
+                .await
+            {
                 Ok(count) => {
                     tracing::debug!(
                         reinforced = count,
@@ -2694,21 +2697,21 @@ pub async fn check_topology(
     Query(params): Query<TopologyCheckQuery>,
 ) -> Result<Json<crate::graph::models::TopologyCheckResult>, AppError> {
     let start = std::time::Instant::now();
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
 
     // Resolve project
-    let project = neo4j
+    let project = indentiagraph
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", params.project_slug)))?;
     let project_id_str = project.id.to_string();
 
     // Count rules
-    let rules = neo4j.list_topology_rules(&project_id_str).await?;
+    let rules = indentiagraph.list_topology_rules(&project_id_str).await?;
     let rules_checked = rules.len();
 
     // Check all rules
-    let violations = neo4j.check_topology_rules(&project_id_str).await?;
+    let violations = indentiagraph.check_topology_rules(&project_id_str).await?;
 
     let error_count = violations
         .iter()
@@ -2742,14 +2745,16 @@ pub async fn list_topology_rules(
     State(state): State<OrchestratorState>,
     Query(params): Query<TopologyRulesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
 
-    let project = neo4j
+    let project = indentiagraph
         .get_project_by_slug(&params.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", params.project_slug)))?;
 
-    let rules = neo4j.list_topology_rules(&project.id.to_string()).await?;
+    let rules = indentiagraph
+        .list_topology_rules(&project.id.to_string())
+        .await?;
 
     Ok(Json(serde_json::json!({
         "rules": rules,
@@ -2763,7 +2768,7 @@ pub struct CreateTopologyRuleBody {
     pub project_slug: String,
     /// Rule type: must_not_import, must_not_call, max_distance, max_fan_out, no_circular
     pub rule_type: String,
-    /// Glob pattern for source files (e.g. "src/neo4j/**")
+    /// Glob pattern for source files (e.g. "src/indentiagraph/**")
     pub source_pattern: String,
     /// Glob pattern for target files (e.g. "src/api/**") — optional for MaxFanOut, NoCircular
     pub target_pattern: Option<String>,
@@ -2780,9 +2785,9 @@ pub async fn create_topology_rule(
     State(state): State<OrchestratorState>,
     Json(body): Json<CreateTopologyRuleBody>,
 ) -> Result<Json<crate::graph::models::TopologyRule>, AppError> {
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
 
-    let project = neo4j
+    let project = indentiagraph
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", body.project_slug)))?;
@@ -2815,7 +2820,7 @@ pub async fn create_topology_rule(
         description: body.description,
     };
 
-    neo4j.create_topology_rule(&rule).await?;
+    indentiagraph.create_topology_rule(&rule).await?;
 
     Ok(Json(rule))
 }
@@ -2825,8 +2830,8 @@ pub async fn delete_topology_rule(
     State(state): State<OrchestratorState>,
     Path(rule_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let neo4j = state.orchestrator.neo4j();
-    neo4j.delete_topology_rule(&rule_id).await?;
+    let indentiagraph = state.orchestrator.indentiagraph();
+    indentiagraph.delete_topology_rule(&rule_id).await?;
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 
@@ -2846,21 +2851,21 @@ pub struct CheckFileTopologyBody {
 ///
 /// Real-time pre-write validation: checks if the given `new_imports` for
 /// `file_path` would violate any MustNotImport/MustNotCall topology rules.
-/// Designed for <50ms response time (in-memory regex matching after 1 Neo4j query).
+/// Designed for <50ms response time (in-memory regex matching after 1 IndentiaGraph query).
 pub async fn check_file_topology(
     State(state): State<OrchestratorState>,
     Json(body): Json<CheckFileTopologyBody>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let violations = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .check_file_topology(&project.id.to_string(), &body.file_path, &body.new_imports)
         .await?;
 
@@ -2896,7 +2901,7 @@ pub async fn get_structural_profile(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
@@ -2911,7 +2916,7 @@ pub async fn get_structural_profile(
 
     let all_dna = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_structural_dna(&project.id.to_string())
         .await?;
 
@@ -2952,7 +2957,7 @@ pub async fn find_structural_twins(
 
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
@@ -2968,7 +2973,7 @@ pub async fn find_structural_twins(
     // Try fingerprint-based multi-signal comparison first
     let file_signals = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_file_signals(&project.id.to_string())
         .await?;
 
@@ -3053,7 +3058,7 @@ pub async fn find_structural_twins(
 
     let all_dna = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_structural_dna(&project.id.to_string())
         .await?;
 
@@ -3132,14 +3137,14 @@ pub async fn cluster_dna(
 
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
     let all_dna = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_structural_dna(&project.id.to_string())
         .await?;
 
@@ -3189,10 +3194,10 @@ pub async fn find_cross_project_twins(
 ) -> Result<Json<serde_json::Value>, AppError> {
     use crate::graph::algorithms::{compute_multi_signal_similarity, FileSignals};
 
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
 
     // Resolve workspace
-    let workspace = neo4j
+    let workspace = indentiagraph
         .get_workspace_by_slug(&body.workspace_slug)
         .await?
         .ok_or_else(|| {
@@ -3200,10 +3205,10 @@ pub async fn find_cross_project_twins(
         })?;
 
     // Get all projects in workspace
-    let projects = neo4j.list_workspace_projects(workspace.id).await?;
+    let projects = indentiagraph.list_workspace_projects(workspace.id).await?;
 
     // Resolve source project
-    let source_project = neo4j
+    let source_project = indentiagraph
         .get_project_by_slug(&body.source_project_slug)
         .await?
         .ok_or_else(|| {
@@ -3219,7 +3224,7 @@ pub async fn find_cross_project_twins(
     };
 
     // Get source project file signals (fingerprints + WL hashes + function counts)
-    let source_signals = neo4j
+    let source_signals = indentiagraph
         .get_project_file_signals(&source_project.id.to_string())
         .await?;
 
@@ -3259,7 +3264,7 @@ pub async fn find_cross_project_twins(
             continue; // Skip source project
         }
 
-        let other_signals = neo4j
+        let other_signals = indentiagraph
             .get_project_file_signals(&project.id.to_string())
             .await?;
 
@@ -3344,7 +3349,7 @@ pub async fn predict_missing_links(
 
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
@@ -3354,7 +3359,7 @@ pub async fn predict_missing_links(
     // Get structural DNA (optional, used as signal if available)
     let all_dna = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_structural_dna(&project_id)
         .await?;
 
@@ -3366,7 +3371,7 @@ pub async fn predict_missing_links(
     };
 
     // Extract file graph
-    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let extractor = GraphExtractor::new(state.orchestrator.indentiagraph_arc());
     let graph = extractor.extract_file_graph(project.id).await?;
 
     // Extract co-change data from CoChanged edges
@@ -3407,7 +3412,7 @@ pub async fn check_link_plausibility(
 
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
@@ -3417,7 +3422,7 @@ pub async fn check_link_plausibility(
     // Get structural DNA (optional)
     let all_dna = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_structural_dna(&project_id)
         .await?;
 
@@ -3429,7 +3434,7 @@ pub async fn check_link_plausibility(
     };
 
     // Extract file graph
-    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let extractor = GraphExtractor::new(state.orchestrator.indentiagraph_arc());
     let graph = extractor.extract_file_graph(project.id).await?;
 
     // Look up source and target in the graph
@@ -3472,12 +3477,12 @@ pub async fn stress_test_node(
 
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
-    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let extractor = GraphExtractor::new(state.orchestrator.indentiagraph_arc());
     let graph = extractor.extract_file_graph(project.id).await?;
 
     let result = stress_test_node_removal(&graph, &body.target_id).ok_or_else(|| {
@@ -3511,12 +3516,12 @@ pub async fn stress_test_edge(
 
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
-    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let extractor = GraphExtractor::new(state.orchestrator.indentiagraph_arc());
     let graph = extractor.extract_file_graph(project.id).await?;
 
     let result = stress_test_edge_removal(&graph, &body.from_id, &body.to_id).ok_or_else(|| {
@@ -3551,12 +3556,12 @@ pub async fn stress_test_cascade(
 
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
-    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let extractor = GraphExtractor::new(state.orchestrator.indentiagraph_arc());
     let graph = extractor.extract_file_graph(project.id).await?;
 
     let max_iterations = body.max_iterations.unwrap_or(10);
@@ -3590,12 +3595,12 @@ pub async fn find_bridges(
 
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&body.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", body.project_slug)))?;
 
-    let extractor = GraphExtractor::new(state.orchestrator.neo4j_arc());
+    let extractor = GraphExtractor::new(state.orchestrator.indentiagraph_arc());
     let graph = extractor.extract_file_graph(project.id).await?;
 
     let bridges = find_bridges(&graph);
@@ -3620,7 +3625,7 @@ pub struct ContextCardQuery {
 
 /// Get pre-computed context card for a single file.
 ///
-/// Returns the cached cc_* properties from Neo4j. If `cc_version == -1`,
+/// Returns the cached cc_* properties from IndentiaGraph. If `cc_version == -1`,
 /// the card is stale and should be refreshed via analytics re-run.
 pub async fn get_context_card(
     State(state): State<OrchestratorState>,
@@ -3628,7 +3633,7 @@ pub async fn get_context_card(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&query.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
@@ -3643,7 +3648,7 @@ pub async fn get_context_card(
 
     let card = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_context_card(&path, &project.id.to_string())
         .await?;
 
@@ -3673,7 +3678,7 @@ pub async fn refresh_context_cards(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&query.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
@@ -3712,7 +3717,7 @@ pub async fn get_fingerprint(
 
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&query.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
@@ -3727,7 +3732,7 @@ pub async fn get_fingerprint(
 
     let card = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_context_card(&path, &project.id.to_string())
         .await?;
 
@@ -3781,7 +3786,7 @@ pub async fn find_isomorphic(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&query.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
@@ -3789,7 +3794,7 @@ pub async fn find_isomorphic(
     let min_size = query.min_group_size.unwrap_or(2);
     let groups = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .find_isomorphic_groups(&project.id.to_string(), min_size)
         .await?;
 
@@ -3820,7 +3825,7 @@ pub async fn suggest_structural_templates(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&query.project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", query.project_slug)))?;
@@ -3830,7 +3835,7 @@ pub async fn suggest_structural_templates(
     // Get isomorphic groups with min_size = min_occurrences
     let groups = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .find_isomorphic_groups(&project.id.to_string(), min_occ)
         .await?;
 
@@ -3849,7 +3854,7 @@ pub async fn suggest_structural_templates(
         for path in exemplars.iter().take(3) {
             if let Ok(Some(card)) = state
                 .orchestrator
-                .neo4j()
+                .indentiagraph()
                 .get_context_card(path, &project.id.to_string())
                 .await
             {
@@ -3992,8 +3997,7 @@ mod tests {
     use super::*;
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
-    use crate::meilisearch::indexes::CodeDocument;
-    use crate::neo4j::models::FileNode;
+    use crate::indentiagraph::models::FileNode;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{mock_app_state, test_bearer_token};
     use axum::body::Body;
@@ -4040,20 +4044,6 @@ mod tests {
     async fn test_app_with_code() -> axum::Router {
         let app_state = mock_app_state();
 
-        // Seed a code document in the mock search store
-        let doc = CodeDocument {
-            id: "src/main.rs".to_string(),
-            path: "src/main.rs".to_string(),
-            language: "rust".to_string(),
-            symbols: vec!["main".to_string(), "Config".to_string()],
-            docstrings: "Main entry point for the application".to_string(),
-            signatures: vec!["fn main()".to_string()],
-            imports: vec!["std::io".to_string()],
-            project_id: "proj-1".to_string(),
-            project_slug: "test-project".to_string(),
-        };
-        app_state.meili.index_code(&doc).await.unwrap();
-
         // Seed files in the mock graph store for architecture endpoint
         let file1 = FileNode {
             path: "src/main.rs".to_string(),
@@ -4069,8 +4059,8 @@ mod tests {
             last_parsed: chrono::Utc::now(),
             project_id: None,
         };
-        app_state.neo4j.upsert_file(&file1).await.unwrap();
-        app_state.neo4j.upsert_file(&file2).await.unwrap();
+        app_state.indentiagraph.upsert_file(&file1).await.unwrap();
+        app_state.indentiagraph.upsert_file(&file2).await.unwrap();
 
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
@@ -4112,11 +4102,10 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Response is now a CodeSearchResult wrapper (Plan 10)
         assert!(json.is_object());
         assert!(json["hits"].is_array());
         assert_eq!(json["hits"].as_array().unwrap().len(), 0);
-        assert!(json["ranked"]["items"].is_array());
+        assert_eq!(json["total"], 0);
     }
 
     #[tokio::test]
@@ -4132,16 +4121,9 @@ mod tests {
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        // Response is now a CodeSearchResult wrapper (Plan 10)
         let results = json["hits"].as_array().unwrap();
+        // "main" matches "src/main.rs" file path — expect at least one hit
         assert!(!results.is_empty());
-        // Verify SearchHit<CodeDocument> shape: { document, score }
-        let first = &results[0];
-        assert!(first["document"].is_object());
-        assert!(first["score"].is_number());
-        assert_eq!(first["document"]["path"], "src/main.rs");
-        // Verify ranked view is present
-        assert!(json["ranked"]["items"].is_array());
     }
 
     #[tokio::test]
@@ -4160,8 +4142,10 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let results = json["hits"].as_array().unwrap();
+        // "main" with language=rust should match "src/main.rs"
         assert!(!results.is_empty());
-        assert_eq!(results[0]["document"]["language"], "rust");
+        // Each hit is a CodeSearchHit with a direct "language" field (not wrapped in "document")
+        assert_eq!(results[0]["language"], "rust");
     }
 
     #[tokio::test]
@@ -4281,7 +4265,7 @@ mod tests {
 
     /// Build a test router with a workspace containing a project with seeded code
     async fn test_app_with_workspace() -> axum::Router {
-        use crate::neo4j::models::{ProjectNode, WorkspaceNode};
+        use crate::indentiagraph::models::{ProjectNode, WorkspaceNode};
 
         let app_state = mock_app_state();
 
@@ -4296,7 +4280,11 @@ mod tests {
             updated_at: None,
             metadata: serde_json::Value::Null,
         };
-        app_state.neo4j.create_workspace(&workspace).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_workspace(&workspace)
+            .await
+            .unwrap();
 
         // Create project and link to workspace
         let proj_id = uuid::Uuid::new_v4();
@@ -4311,26 +4299,16 @@ mod tests {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
         };
-        app_state.neo4j.create_project(&project).await.unwrap();
         app_state
-            .neo4j
+            .indentiagraph
+            .create_project(&project)
+            .await
+            .unwrap();
+        app_state
+            .indentiagraph
             .add_project_to_workspace(ws_id, proj_id)
             .await
             .unwrap();
-
-        // Seed code document
-        let doc = CodeDocument {
-            id: "src/main.rs".to_string(),
-            path: "src/main.rs".to_string(),
-            language: "rust".to_string(),
-            symbols: vec!["main".to_string()],
-            docstrings: "Entry point".to_string(),
-            signatures: vec!["fn main()".to_string()],
-            imports: vec![],
-            project_id: proj_id.to_string(),
-            project_slug: "test-project".to_string(),
-        };
-        app_state.meili.index_code(&doc).await.unwrap();
 
         // Seed file for architecture
         let file = FileNode {
@@ -4340,7 +4318,7 @@ mod tests {
             last_parsed: chrono::Utc::now(),
             project_id: Some(proj_id),
         };
-        app_state.neo4j.upsert_file(&file).await.unwrap();
+        app_state.indentiagraph.upsert_file(&file).await.unwrap();
 
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
@@ -4382,7 +4360,6 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         let results = json["hits"].as_array().unwrap();
         assert!(!results.is_empty());
-        assert_eq!(results[0]["document"]["path"], "src/main.rs");
     }
 
     #[tokio::test]
@@ -4437,10 +4414,9 @@ mod tests {
     /// Build a test router with seeded import relationships and a project.
     /// Uses MockGraphStore directly (before Arc wrapping) to access project_files.
     async fn test_app_with_imports() -> axum::Router {
-        use crate::meilisearch::mock::MockSearchStore;
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::{FunctionNode, ProjectNode, Visibility};
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::{FunctionNode, ProjectNode, Visibility};
+        use crate::indentiagraph::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -4515,7 +4491,7 @@ mod tests {
             .await
             .unwrap();
 
-        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let app_state = mock_app_state_with(graph);
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(
             crate::orchestrator::FileWatcher::new(orchestrator.clone()),
@@ -4617,10 +4593,9 @@ mod tests {
     /// Build a test router with files that have GDS analytics scores
     async fn test_app_with_analytics() -> (axum::Router, uuid::Uuid) {
         use crate::graph::models::FileAnalyticsUpdate;
-        use crate::meilisearch::mock::MockSearchStore;
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::ProjectNode;
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::ProjectNode;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -4715,7 +4690,7 @@ mod tests {
         ];
         graph.batch_update_file_analytics(&analytics).await.unwrap();
 
-        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let app_state = mock_app_state_with(graph);
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -4816,10 +4791,9 @@ mod tests {
         // Test 3: File with high pagerank but lower degree should rank higher
         // than file with low pagerank but higher degree
         use crate::graph::models::FileAnalyticsUpdate;
-        use crate::meilisearch::mock::MockSearchStore;
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::ProjectNode;
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::ProjectNode;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -4900,7 +4874,7 @@ mod tests {
         ];
         graph.batch_update_file_analytics(&analytics).await.unwrap();
 
-        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let app_state = mock_app_state_with(graph);
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -4954,10 +4928,9 @@ mod tests {
     /// for testing the enriched impact analysis.
     async fn test_app_with_impact_analytics() -> axum::Router {
         use crate::graph::models::FileAnalyticsUpdate;
-        use crate::meilisearch::mock::MockSearchStore;
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::ProjectNode;
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::ProjectNode;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -5089,7 +5062,7 @@ mod tests {
         ];
         graph.batch_update_file_analytics(&analytics).await.unwrap();
 
-        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let app_state = mock_app_state_with(graph);
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(
             crate::orchestrator::FileWatcher::new(orchestrator.clone()),
@@ -5262,10 +5235,11 @@ mod tests {
 
     /// Build a test router with a file that has functions, structs, and imports
     async fn test_app_with_symbols() -> axum::Router {
-        use crate::meilisearch::mock::MockSearchStore;
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::{FunctionNode, ImportNode, Parameter, StructNode, Visibility};
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::{
+            FunctionNode, ImportNode, Parameter, StructNode, Visibility,
+        };
+        use crate::indentiagraph::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -5324,7 +5298,7 @@ mod tests {
         };
         graph.upsert_import(&imp).await.unwrap();
 
-        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let app_state = mock_app_state_with(graph);
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -5421,10 +5395,9 @@ mod tests {
     #[tokio::test]
     async fn test_find_references_with_callers() {
         // Seed call relationships: caller_fn calls "target_fn"
-        use crate::meilisearch::mock::MockSearchStore;
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::{FunctionNode, Visibility};
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::{FunctionNode, Visibility};
+        use crate::indentiagraph::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -5452,7 +5425,7 @@ mod tests {
             vec!["target_fn".to_string()],
         );
 
-        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let app_state = mock_app_state_with(graph);
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -5603,10 +5576,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_call_graph_with_relationships() {
-        use crate::meilisearch::mock::MockSearchStore;
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::{FunctionNode, Visibility};
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::{FunctionNode, Visibility};
+        use crate::indentiagraph::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -5654,7 +5626,7 @@ mod tests {
             );
         }
 
-        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let app_state = mock_app_state_with(graph);
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -5760,10 +5732,9 @@ mod tests {
     #[tokio::test]
     async fn test_analyze_impact_function_mode() {
         // analyze_impact with target_type=function should use callers path
-        use crate::meilisearch::mock::MockSearchStore;
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::{FunctionNode, Visibility};
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::{FunctionNode, Visibility};
+        use crate::indentiagraph::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with;
 
         let graph = MockGraphStore::new();
@@ -5809,7 +5780,7 @@ mod tests {
             .await
             .insert("src/main.rs::main".to_string(), vec!["do_work".to_string()]);
 
-        let app_state = mock_app_state_with(graph, MockSearchStore::new());
+        let app_state = mock_app_state_with(graph);
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),

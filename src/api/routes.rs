@@ -6,8 +6,10 @@
 use super::auth_handlers;
 use super::chat_handlers;
 use super::code_handlers;
+use super::episode_handlers;
 use super::handlers::{self, OrchestratorState};
 use super::hook_handlers;
+use super::mem_handlers;
 use super::note_handlers;
 use super::profile_handlers;
 use super::project_handlers;
@@ -185,6 +187,23 @@ fn public_routes() -> Router<OrchestratorState> {
             "/api/hooks/resolve-project",
             get(hook_handlers::resolve_project),
         )
+        // ================================================================
+        // Memory hooks (public — called from cortex-mem-hook binary)
+        // ================================================================
+        .route("/api/sessions/init", post(mem_handlers::session_init))
+        .route(
+            "/api/sessions/observations",
+            post(mem_handlers::session_observation),
+        )
+        .route(
+            "/api/sessions/summarize",
+            post(mem_handlers::session_summarize),
+        )
+        .route(
+            "/api/sessions/complete",
+            post(mem_handlers::session_complete),
+        )
+        .route("/api/context/inject", get(mem_handlers::context_inject))
 }
 
 // ============================================================================
@@ -460,9 +479,9 @@ fn protected_routes() -> Router<OrchestratorState> {
         // ================================================================
         // Code Exploration (Graph + Search powered)
         // ================================================================
-        // Search code semantically (Meilisearch)
+        // Search code semantically (BM25 / graph-backed search)
         .route("/api/code/search", get(code_handlers::search_code))
-        // Get symbols in a file (Neo4j)
+        // Get symbols in a file (IndentiaGraph)
         .route(
             "/api/code/symbols/{*file_path}",
             get(code_handlers::get_file_symbols),
@@ -771,6 +790,25 @@ fn protected_routes() -> Router<OrchestratorState> {
             get(note_handlers::get_entity_notes),
         )
         // ================================================================
+        // Episodic Memory & Temporal Search
+        // ================================================================
+        .route(
+            "/api/episodes",
+            get(episode_handlers::list_episodes).post(episode_handlers::add_episode),
+        )
+        .route(
+            "/api/episodes/search",
+            get(episode_handlers::search_episodes),
+        )
+        .route(
+            "/api/notes/at-time",
+            get(episode_handlers::search_notes_at_time),
+        )
+        .route(
+            "/api/notes/{note_id}/invalidate-temporal",
+            post(episode_handlers::invalidate_note_temporal),
+        )
+        // ================================================================
         // Analysis Profiles
         // ================================================================
         .route(
@@ -859,17 +897,6 @@ fn protected_routes() -> Router<OrchestratorState> {
         .route(
             "/api/admin/backfill-discussed",
             post(handlers::backfill_discussed),
-        )
-        // ================================================================
-        // Meilisearch Maintenance
-        // ================================================================
-        .route(
-            "/api/meilisearch/stats",
-            get(handlers::get_meilisearch_stats),
-        )
-        .route(
-            "/api/meilisearch/orphans",
-            axum::routing::delete(handlers::delete_meilisearch_orphans),
         )
         // ================================================================
         // Admin Cleanup

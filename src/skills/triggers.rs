@@ -847,6 +847,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            valid_at: None,
+            invalid_at: None,
         }
     }
 
@@ -927,11 +929,15 @@ mod tests {
     fn test_regex_from_tags() {
         let notes = vec![
             make_note_with_anchors(
-                vec!["neo4j", "cypher", "query"],
-                "Neo4j query patterns",
+                vec!["indentiagraph", "cypher", "query"],
+                "IndentiaGraph query patterns",
                 vec![],
             ),
-            make_note_with_anchors(vec!["neo4j", "index"], "Neo4j indexing tips", vec![]),
+            make_note_with_anchors(
+                vec!["indentiagraph", "index"],
+                "IndentiaGraph indexing tips",
+                vec![],
+            ),
             make_note_with_anchors(vec!["cypher", "perf"], "Cypher performance", vec![]),
         ];
 
@@ -940,8 +946,8 @@ mod tests {
 
         let pattern = &triggers[0].pattern_value;
         assert!(
-            pattern.contains("neo4j"),
-            "Expected 'neo4j' in pattern '{}'",
+            pattern.contains("indentiagraph"),
+            "Expected 'indentiagraph' in pattern '{}'",
             pattern
         );
         assert!(
@@ -985,8 +991,8 @@ mod tests {
 
     #[test]
     fn test_regex_escapes_special_chars() {
-        let escaped = regex_escape("neo4j.driver");
-        assert_eq!(escaped, "neo4j\\.driver");
+        let escaped = regex_escape("indentiagraph.driver");
+        assert_eq!(escaped, "indentiagraph\\.driver");
 
         let escaped2 = regex_escape("C++");
         assert_eq!(escaped2, "C\\+\\+");
@@ -1092,7 +1098,7 @@ mod tests {
                 word
             );
         }
-        // Project-specific terms like "rust", "neo4j", "mcp" must NOT be hardcoded
+        // Project-specific terms like "rust", "indentiagraph", "mcp" must NOT be hardcoded
         // They are handled by IDF inter-skills (auto-emergent filtering)
     }
 
@@ -1198,16 +1204,16 @@ mod tests {
 
     #[test]
     fn test_regex_quality_high_precision_recall() {
-        // Skill notes all have "neo4j" tag, no other project notes match
+        // Skill notes all have "indentiagraph" tag, no other project notes match
         let skill_notes = vec![
-            make_note_with_anchors(vec!["neo4j"], "Neo4j query", vec![]),
-            make_note_with_anchors(vec!["neo4j"], "Neo4j index", vec![]),
-            make_note_with_anchors(vec!["neo4j"], "Neo4j driver", vec![]),
+            make_note_with_anchors(vec!["indentiagraph"], "IndentiaGraph query", vec![]),
+            make_note_with_anchors(vec!["indentiagraph"], "IndentiaGraph index", vec![]),
+            make_note_with_anchors(vec!["indentiagraph"], "IndentiaGraph driver", vec![]),
         ];
         // All project notes = skill notes only
         let all_notes = skill_notes.clone();
 
-        let trigger = SkillTrigger::regex("neo4j", 0.7);
+        let trigger = SkillTrigger::regex("indentiagraph", 0.7);
         let quality = evaluate_trigger_quality(&trigger, &skill_notes, &all_notes);
 
         // P=3/3=1.0, R=3/3=1.0, F1=1.0
@@ -1311,9 +1317,17 @@ mod tests {
     #[test]
     fn test_generate_all_triggers_sets_quality() {
         let skill_notes = vec![
-            make_note_with_anchors(vec!["neo4j", "cypher"], "Neo4j queries", vec![]),
-            make_note_with_anchors(vec!["neo4j"], "Neo4j driver", vec![]),
-            make_note_with_anchors(vec!["neo4j", "index"], "Neo4j indexing", vec![]),
+            make_note_with_anchors(
+                vec!["indentiagraph", "cypher"],
+                "IndentiaGraph queries",
+                vec![],
+            ),
+            make_note_with_anchors(vec!["indentiagraph"], "IndentiaGraph driver", vec![]),
+            make_note_with_anchors(
+                vec!["indentiagraph", "index"],
+                "IndentiaGraph indexing",
+                vec![],
+            ),
         ];
         let all_notes = skill_notes.clone();
         let embeddings = HashMap::new();
@@ -1348,10 +1362,10 @@ mod tests {
 
     #[test]
     fn test_tokenize_filters_short_tokens() {
-        let tokens = tokenize("a be do it go neo4j");
+        let tokens = tokenize("a be do it go indentiagraph");
         assert!(!tokens.contains(&"a".to_string()));
         assert!(!tokens.contains(&"be".to_string()));
-        assert!(tokens.contains(&"neo4j".to_string()));
+        assert!(tokens.contains(&"indentiagraph".to_string()));
     }
 
     // ================================================================
@@ -1441,11 +1455,23 @@ mod tests {
 
     #[test]
     fn test_file_glob_no_broad_src_when_distinctive_exists() {
-        // 3 skill notes in src/neo4j/, 15 other project notes spread across src/
+        // 3 skill notes in src/indentiagraph/, 15 other project notes spread across src/
         let skill_notes = vec![
-            make_note_with_anchors(vec![], "N1", vec![file_anchor("src/neo4j/client.rs")]),
-            make_note_with_anchors(vec![], "N2", vec![file_anchor("src/neo4j/queries.rs")]),
-            make_note_with_anchors(vec![], "N3", vec![file_anchor("src/neo4j/models.rs")]),
+            make_note_with_anchors(
+                vec![],
+                "N1",
+                vec![file_anchor("src/indentiagraph/client.rs")],
+            ),
+            make_note_with_anchors(
+                vec![],
+                "N2",
+                vec![file_anchor("src/indentiagraph/queries.rs")],
+            ),
+            make_note_with_anchors(
+                vec![],
+                "N3",
+                vec![file_anchor("src/indentiagraph/models.rs")],
+            ),
         ];
 
         let mut all_notes = skill_notes.clone();
@@ -1462,14 +1488,14 @@ mod tests {
         let triggers = generate_file_glob_triggers(&skill_notes, &all_notes);
         assert!(!triggers.is_empty());
 
-        // Should get src/neo4j/**, not the broad src/**
-        let has_neo4j = triggers
+        // Should get src/indentiagraph/**, not the broad src/**
+        let has_indentiagraph = triggers
             .iter()
-            .any(|t| t.pattern_value.contains("src/neo4j"));
+            .any(|t| t.pattern_value.contains("src/indentiagraph"));
         let has_broad_src = triggers.iter().any(|t| t.pattern_value == "src/**");
         assert!(
-            has_neo4j,
-            "Expected src/neo4j/** in triggers, got: {:?}",
+            has_indentiagraph,
+            "Expected src/indentiagraph/** in triggers, got: {:?}",
             triggers
                 .iter()
                 .map(|t| &t.pattern_value)
@@ -1477,7 +1503,7 @@ mod tests {
         );
         assert!(
             !has_broad_src,
-            "Should NOT have broad src/** when distinctive src/neo4j/** exists"
+            "Should NOT have broad src/** when distinctive src/indentiagraph/** exists"
         );
     }
 
@@ -1714,17 +1740,17 @@ mod tests {
         // appear in the generated regex patterns
         let notes = vec![
             make_note_with_anchors(
-                vec!["neo4j", "cypher"],
+                vec!["indentiagraph", "cypher"],
                 "Les requêtes dans le système pour les utilisateurs avec des paramètres",
                 vec![],
             ),
             make_note_with_anchors(
-                vec!["neo4j", "performance"],
-                "Il faut toujours utiliser des index pour les recherches dans Neo4j",
+                vec!["indentiagraph", "performance"],
+                "Il faut toujours utiliser des index pour les recherches dans IndentiaGraph",
                 vec![],
             ),
             make_note_with_anchors(
-                vec!["neo4j"],
+                vec!["indentiagraph"],
                 "Cette fonction est très importante pour la gestion des connexions",
                 vec![],
             ),
@@ -1773,30 +1799,34 @@ mod tests {
 
     #[test]
     fn test_tfidf_filters_ubiquitous_tags_across_project() {
-        // Skill A has tags ["grail", "topology", "neo4j"]
-        // But "neo4j" also appears in 90% of ALL project notes (ubiquitous)
-        // → "neo4j" should get low IDF and be filtered/deprioritized
+        // Skill A has tags ["grail", "topology", "indentiagraph"]
+        // But "indentiagraph" also appears in 90% of ALL project notes (ubiquitous)
+        // → "indentiagraph" should get low IDF and be filtered/deprioritized
         // → "grail" and "topology" should be selected (unique to this skill)
         let skill_notes = vec![
             make_note_with_anchors(
-                vec!["grail", "topology", "neo4j"],
+                vec!["grail", "topology", "indentiagraph"],
                 "GraIL topological reasoning",
                 vec![],
             ),
             make_note_with_anchors(
-                vec!["grail", "topology", "neo4j"],
+                vec!["grail", "topology", "indentiagraph"],
                 "Topology community detection",
                 vec![],
             ),
-            make_note_with_anchors(vec!["grail", "neo4j"], "GraIL graph patterns", vec![]),
+            make_note_with_anchors(
+                vec!["grail", "indentiagraph"],
+                "GraIL graph patterns",
+                vec![],
+            ),
         ];
 
-        // Simulate a project with 20 notes, 18 of which have "neo4j"
+        // Simulate a project with 20 notes, 18 of which have "indentiagraph"
         let mut all_project_notes = skill_notes.clone();
         for i in 0..17 {
             all_project_notes.push(make_note_with_anchors(
-                vec!["neo4j", &format!("other-{}", i)],
-                &format!("Some other neo4j note {}", i),
+                vec!["indentiagraph", &format!("other-{}", i)],
+                &format!("Some other indentiagraph note {}", i),
                 vec![],
             ));
         }
@@ -1813,16 +1843,16 @@ mod tests {
             pattern
         );
 
-        // "neo4j" appears in 18/20 notes → very low IDF → should be deprioritized
+        // "indentiagraph" appears in 18/20 notes → very low IDF → should be deprioritized
         // It might still appear if we don't have enough other terms, but "grail"
-        // should come before "neo4j" in TF-IDF ranking
-        if pattern.contains("neo4j") {
-            // If neo4j is present, grail should appear first (higher TF-IDF)
+        // should come before "indentiagraph" in TF-IDF ranking
+        if pattern.contains("indentiagraph") {
+            // If indentiagraph is present, grail should appear first (higher TF-IDF)
             let grail_pos = pattern.find("grail").unwrap_or(usize::MAX);
-            let neo4j_pos = pattern.find("neo4j").unwrap_or(0);
+            let indentiagraph_pos = pattern.find("indentiagraph").unwrap_or(0);
             assert!(
-                grail_pos < neo4j_pos,
-                "grail should appear before neo4j (higher TF-IDF), pattern: {}",
+                grail_pos < indentiagraph_pos,
+                "grail should appear before indentiagraph (higher TF-IDF), pattern: {}",
                 pattern
             );
         }
@@ -1833,19 +1863,23 @@ mod tests {
         // When skill notes = project notes (no cross-skill context),
         // all tags have the same IDF → falls back to TF ordering
         let notes = vec![
-            make_note_with_anchors(vec!["neo4j", "cypher"], "Neo4j queries", vec![]),
-            make_note_with_anchors(vec!["neo4j", "cypher"], "Cypher patterns", vec![]),
-            make_note_with_anchors(vec!["neo4j"], "Neo4j driver", vec![]),
+            make_note_with_anchors(
+                vec!["indentiagraph", "cypher"],
+                "IndentiaGraph queries",
+                vec![],
+            ),
+            make_note_with_anchors(vec!["indentiagraph", "cypher"], "Cypher patterns", vec![]),
+            make_note_with_anchors(vec!["indentiagraph"], "IndentiaGraph driver", vec![]),
         ];
 
         let triggers = generate_regex_triggers(&notes, &notes);
         assert!(!triggers.is_empty());
 
         let pattern = &triggers[0].pattern_value;
-        // Both neo4j and cypher should appear (no cross-skill competition)
+        // Both indentiagraph and cypher should appear (no cross-skill competition)
         assert!(
-            pattern.contains("neo4j"),
-            "Expected 'neo4j' in pattern, got: {}",
+            pattern.contains("indentiagraph"),
+            "Expected 'indentiagraph' in pattern, got: {}",
             pattern
         );
     }

@@ -1,7 +1,7 @@
 //! In-memory cache for the hook activation hot path.
 //!
 //! Caches two expensive operations:
-//! 1. **Skills per project**: avoids a Neo4j round-trip on every hook call
+//! 1. **Skills per project**: avoids a IndentiaGraph round-trip on every hook call
 //! 2. **Compiled triggers**: `Regex::new()` and `glob::Pattern::new()` are
 //!    compiled once and reused across requests
 //!
@@ -372,8 +372,8 @@ mod tests {
         let cache = SkillCache::new();
         let project_id = Uuid::new_v4();
         let skills = vec![make_test_skill(
-            "Neo4j",
-            vec![(TriggerType::Regex, "neo4j")],
+            "IndentiaGraph",
+            vec![(TriggerType::Regex, "indentiagraph")],
         )];
 
         cache.insert(project_id, skills).await;
@@ -488,7 +488,10 @@ mod tests {
 
     #[test]
     fn test_compiled_trigger_regex() {
-        let skill = make_test_skill("Neo4j", vec![(TriggerType::Regex, "neo4j|cypher")]);
+        let skill = make_test_skill(
+            "IndentiaGraph",
+            vec![(TriggerType::Regex, "indentiagraph|cypher")],
+        );
         let cached = CachedSkill::from_skill(skill);
 
         assert_eq!(cached.compiled_triggers.len(), 1);
@@ -521,10 +524,13 @@ mod tests {
 
     #[test]
     fn test_evaluate_cached_skill_regex_match() {
-        let skill = make_test_skill("Neo4j", vec![(TriggerType::Regex, "neo4j|cypher")]);
+        let skill = make_test_skill(
+            "IndentiaGraph",
+            vec![(TriggerType::Regex, "indentiagraph|cypher")],
+        );
         let cached = CachedSkill::from_skill(skill);
 
-        let confidence = evaluate_cached_skill(&cached, Some("neo4j_client"), None);
+        let confidence = evaluate_cached_skill(&cached, Some("indentiagraph_client"), None);
         // Returns the trigger's confidence_threshold (0.5 in test helper)
         assert!(confidence > 0.0, "Should match, got {}", confidence);
         assert!((confidence - 0.5).abs() < f64::EPSILON);
@@ -532,17 +538,23 @@ mod tests {
 
     #[test]
     fn test_evaluate_cached_skill_regex_case_insensitive() {
-        let skill = make_test_skill("Neo4j", vec![(TriggerType::Regex, "neo4j|cypher")]);
+        let skill = make_test_skill(
+            "IndentiaGraph",
+            vec![(TriggerType::Regex, "indentiagraph|cypher")],
+        );
         let cached = CachedSkill::from_skill(skill);
 
         // Should match case-insensitively
-        let confidence = evaluate_cached_skill(&cached, Some("Neo4j_Client"), None);
+        let confidence = evaluate_cached_skill(&cached, Some("IndentiaGraph_Client"), None);
         assert!(confidence > 0.0, "Case-insensitive match should work");
     }
 
     #[test]
     fn test_evaluate_cached_skill_regex_no_match() {
-        let skill = make_test_skill("Neo4j", vec![(TriggerType::Regex, "neo4j|cypher")]);
+        let skill = make_test_skill(
+            "IndentiaGraph",
+            vec![(TriggerType::Regex, "indentiagraph|cypher")],
+        );
         let cached = CachedSkill::from_skill(skill);
 
         let confidence = evaluate_cached_skill(&cached, Some("api_handler"), None);
@@ -592,15 +604,18 @@ mod tests {
         let skill = make_test_skill(
             "Mixed",
             vec![
-                (TriggerType::Regex, "neo4j"),
+                (TriggerType::Regex, "indentiagraph"),
                 (TriggerType::FileGlob, "src/other/**"),
             ],
         );
         let cached = CachedSkill::from_skill(skill);
 
         // Regex matches, glob doesn't
-        let confidence =
-            evaluate_cached_skill(&cached, Some("neo4j_query"), Some("src/api/test.rs"));
+        let confidence = evaluate_cached_skill(
+            &cached,
+            Some("indentiagraph_query"),
+            Some("src/api/test.rs"),
+        );
         assert!(confidence > 0.0, "Should match via regex");
     }
 

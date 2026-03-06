@@ -59,7 +59,7 @@ pub fn generate_skill_name(
     }
 }
 
-/// Convert a tag string to title case: "api_auth" → "Api Auth", "neo4j" → "Neo4j"
+/// Convert a tag string to title case: "api_auth" → "Api Auth", "indentiagraph" → "IndentiaGraph"
 fn title_case(s: &str) -> String {
     s.split(['_', '-', ' '])
         .filter(|part| !part.is_empty())
@@ -112,15 +112,15 @@ mod tests {
     #[test]
     fn test_generate_skill_name_single_dominant_tag() {
         let tags = vec![
-            vec!["neo4j".to_string()],
-            vec!["neo4j".to_string()],
-            vec!["neo4j".to_string()],
+            vec!["indentiagraph".to_string()],
+            vec!["indentiagraph".to_string()],
+            vec!["indentiagraph".to_string()],
             vec!["cypher".to_string()],
         ];
         let name = generate_skill_name(&tags, 0, None);
         assert!(
-            name.starts_with("Neo4j"),
-            "Expected 'Neo4j' first in '{}'",
+            name.starts_with("IndentiaGraph"),
+            "Expected 'IndentiaGraph' first in '{}'",
             name
         );
     }
@@ -147,7 +147,7 @@ mod tests {
     fn test_title_case() {
         assert_eq!(title_case("api"), "Api");
         assert_eq!(title_case("api_auth"), "Api Auth");
-        assert_eq!(title_case("neo4j"), "Neo4j");
+        assert_eq!(title_case("indentiagraph"), "IndentiaGraph");
         assert_eq!(title_case("knowledge-fabric"), "Knowledge Fabric");
     }
 

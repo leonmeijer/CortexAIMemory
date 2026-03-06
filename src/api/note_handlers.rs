@@ -559,7 +559,7 @@ pub async fn get_entity_notes(
 
     let notes = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_notes_for_entity(&entity_type, &entity_id)
         .await?;
 
@@ -767,7 +767,7 @@ pub async fn search_neurons(
     let project_id = if let Some(ref slug) = query.project_slug {
         let project = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_project_by_slug(slug)
             .await
             .map_err(AppError::Internal)?
@@ -1018,7 +1018,7 @@ pub async fn search_notes_semantic(
     let project_id = if let Some(ref slug) = query.project_slug {
         let project = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_project_by_slug(slug)
             .await
             .map_err(AppError::Internal)?
@@ -1092,17 +1092,17 @@ pub async fn reinforce_neurons(
     let energy_boost = body.energy_boost.unwrap_or(0.2);
     let synapse_boost = body.synapse_boost.unwrap_or(0.05);
 
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
     let mut neurons_boosted = 0u64;
     for note_id in &body.note_ids {
-        neo4j
+        indentiagraph
             .boost_energy(*note_id, energy_boost)
             .await
             .map_err(AppError::Internal)?;
         neurons_boosted += 1;
     }
 
-    let synapses_reinforced = neo4j
+    let synapses_reinforced = indentiagraph
         .reinforce_synapses(&body.note_ids, synapse_boost)
         .await
         .map_err(AppError::Internal)?;
@@ -1132,7 +1132,7 @@ pub async fn decay_synapses(
 
     let (decayed, pruned) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .decay_synapses(decay_amount, prune_threshold)
         .await
         .map_err(AppError::Internal)?;

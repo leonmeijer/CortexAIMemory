@@ -2,7 +2,7 @@
 //!
 //! Two-layer architecture:
 //! 1. Hardcoded base prompt (~2500 words) — protocols, data model, git workflow, statuses, best practices
-//! 2. Dynamic context — oneshot Opus via send_and_receive() analyzes user request + Neo4j data
+//! 2. Dynamic context — oneshot Opus via send_and_receive() analyzes user request + IndentiaGraph data
 //!    to build a tailored contextual section (<500 words). Programmatic fallback if oneshot fails.
 
 /// Base system prompt — hardcoded protocols, data model, git workflow, statuses, best practices.
@@ -68,7 +68,7 @@ Workspace
 
 ### Code Graph — Structural Relations
 
-The Neo4j graph also contains relations extracted by Tree-sitter:
+The IndentiaGraph graph also contains relations extracted by Tree-sitter:
 - `IMPORTS`: File → File — imports/requires between files
 - `CALLS`: Function → Function — function calls (with confidence score)
 - `EXTENDS`: Struct → Struct — class inheritance (Java, TS, Python, PHP, C++, Ruby, Kotlin, Swift)
@@ -121,7 +121,7 @@ Business processes: `code(action: "list_processes")`, `code(action: "get_process
 
 - **Atomic commits**: one commit = one coherent logical change
 - Format: `<type>(<scope>): <short description>`
-  - Examples: `feat(chat): add smart system prompt`, `fix(neo4j): handle null workspace`
+  - Examples: `feat(chat): add smart system prompt`, `fix(indentiagraph): handle null workspace`
 - Never commit sensitive files (.env, credentials, secrets)
 
 ### After Each Commit
@@ -208,7 +208,7 @@ For each task:
 
 Example of correct decomposition:
 - Task: "Add the GET /api/releases/:id endpoint"
-  - Step 1: "Add the get_release method in neo4j/client.rs" → verify: "cargo check"
+  - Step 1: "Add the get_release method in indentiagraph/client.rs" → verify: "cargo check"
   - Step 2: "Add the handler in api/handlers.rs" → verify: "cargo check"
   - Step 3: "Register the route in api/routes.rs" → verify: "curl test"
 
@@ -291,12 +291,12 @@ Only use Grep/Read/Glob as a last resort for exact literal strings.
 Search hierarchy (from most recommended to least recommended):
 
 1. **Exploratory search** → `code(action: "search", query)` / `code(action: "search_project", project_slug, query)`
-   - MeiliSearch semantic search, cross-file, ranked by relevance
+   - BM25 semantic search, cross-file, ranked by relevance
    - Supports `path_prefix` to filter a subdirectory
    - **Use this instead of**: Grep for searching a concept, Task(Explore) for exploring
 
 2. **Symbol usages** → `code(action: "find_references", symbol)`
-   - Resolution via Neo4j graph (imports, exports, calls)
+   - Resolution via IndentiaGraph graph (imports, exports, calls)
    - More reliable than grep because it understands code structure
    - **Use this instead of**: Grep for "where is X used"
 
@@ -719,7 +719,7 @@ Explore and analyze code. Actions: search, search_project, search_workspace, get
 | check_file_topology | `project_slug` (req), `file_path` (req), `new_imports` (req, array) | Check if new imports would violate rules |
 
 ## admin
-Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, detect_skills, maintain_skills, install_hooks
+Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, detect_skills, maintain_skills, install_hooks
 
 | Action | Key Parameters | Description |
 |--------|---------------|-------------|
@@ -727,8 +727,6 @@ Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status
 | start_watch | `path` (req), `project_id` | Start watching directory |
 | stop_watch | `project_id` (req) | Stop watching |
 | watch_status | | Get watch status |
-| meilisearch_stats | | Get search index stats |
-| delete_meilisearch_orphans | | Clean orphaned search docs |
 | cleanup_cross_project_calls | | Remove cross-project calls |
 | cleanup_builtin_calls | | Remove builtin calls |
 | migrate_calls_confidence | | Migrate call confidence |
@@ -785,7 +783,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 // ============================================================================
-// Fabric metrics TTL cache — avoids N Neo4j queries per conversation
+// Fabric metrics TTL cache — avoids N IndentiaGraph queries per conversation
 // ============================================================================
 
 /// Cached fabric metrics with TTL expiry.
@@ -1015,13 +1013,13 @@ pub static TOOL_GROUPS: &[ToolGroup] = &[
         name: "sync_admin",
         description: "Code synchronization, administration, Knowledge Fabric bootstrap",
         keywords: &[
-            "sync", "watch", "watcher", "meilisearch", "index", "admin", "cleanup",
+            "sync", "watch", "watcher", "index", "admin", "cleanup",
             "fabric", "bootstrap", "neural", "synapse", "neuron", "energy",
             "staleness", "decay", "backfill", "hooks", "detect", "maintain",
         ],
         tools: &[ToolRef {
             name: "admin",
-            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/meilisearch_stats/delete_meilisearch_orphans/cleanup_cross_project_calls/cleanup_builtin_calls/migrate_calls_confidence/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/reindex_decisions/backfill_decision_embeddings/backfill_touches/backfill_discussed/update_fabric_scores/bootstrap_knowledge_fabric/detect_skills/maintain_skills/install_hooks)",
+            description: "Admin ops (sync_directory/start_watch/stop_watch/watch_status/cleanup_cross_project_calls/cleanup_builtin_calls/migrate_calls_confidence/cleanup_sync_data/update_staleness_scores/update_energy_scores/search_neurons/reinforce_neurons/decay_synapses/backfill_synapses/reindex_decisions/backfill_decision_embeddings/backfill_touches/backfill_discussed/update_fabric_scores/bootstrap_knowledge_fabric/detect_skills/maintain_skills/install_hooks)",
         }],
     },
 ];
@@ -1099,18 +1097,18 @@ pub fn select_tool_groups_by_keywords(user_message: &str) -> Vec<&'static ToolGr
     matched
 }
 
-use crate::neo4j::models::{
+use crate::indentiagraph::models::{
     ConnectedFileNode, ConstraintNode, FeatureGraphNode, LanguageStatsNode, MilestoneNode,
     PlanNode, ProjectNode, ReleaseNode, WorkspaceNode,
 };
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::GraphStore;
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteStatus, NoteType};
 
 // ============================================================================
-// ProjectContext — all dynamic data fetched from Neo4j
+// ProjectContext — all dynamic data fetched from IndentiaGraph
 // ============================================================================
 
-/// Contextual data fetched from Neo4j for the current project.
+/// Contextual data fetched from IndentiaGraph for the current project.
 /// Used to build the dynamic section of the system prompt.
 #[derive(Default)]
 pub struct ProjectContext {
@@ -1152,7 +1150,7 @@ pub struct FabricPromptMetrics {
 // Fetcher — populates ProjectContext from GraphStore
 // ============================================================================
 
-/// Fetch all project context from Neo4j. Individual fetch errors are handled
+/// Fetch all project context from IndentiaGraph. Individual fetch errors are handled
 /// gracefully (empty defaults) to never block the prompt building.
 pub async fn fetch_project_context(
     graph: &Arc<dyn GraphStore>,
@@ -1303,7 +1301,7 @@ pub async fn fetch_project_context(
 }
 
 /// Build lightweight Knowledge Fabric metrics for the system prompt.
-/// Uses a 30s TTL cache to avoid repeated Neo4j queries within a conversation.
+/// Uses a 30s TTL cache to avoid repeated IndentiaGraph queries within a conversation.
 /// Returns None if no fabric data exists (graceful degradation).
 async fn build_fabric_metrics(
     graph: &Arc<dyn GraphStore>,
@@ -1326,8 +1324,8 @@ async fn build_fabric_metrics(
         }
     }
 
-    // Cache miss or expired — fetch from Neo4j
-    let metrics = fetch_fabric_metrics_from_neo4j(graph, project_id).await;
+    // Cache miss or expired — fetch from IndentiaGraph
+    let metrics = fetch_fabric_metrics_from_indentiagraph(graph, project_id).await;
 
     // Update cache
     if let Some(ref m) = metrics {
@@ -1349,8 +1347,8 @@ async fn build_fabric_metrics(
     metrics
 }
 
-/// Actually fetch fabric metrics from Neo4j (called on cache miss).
-async fn fetch_fabric_metrics_from_neo4j(
+/// Actually fetch fabric metrics from IndentiaGraph (called on cache miss).
+async fn fetch_fabric_metrics_from_indentiagraph(
     graph: &Arc<dyn GraphStore>,
     project_id: Uuid,
 ) -> Option<FabricPromptMetrics> {
@@ -2217,9 +2215,9 @@ mod tests {
 
         let state = mock_app_state();
         let project = test_project();
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
 
-        let ctx = fetch_project_context(&state.neo4j, &project.slug)
+        let ctx = fetch_project_context(&state.indentiagraph, &project.slug)
             .await
             .unwrap();
 
@@ -2235,7 +2233,7 @@ mod tests {
 
         let state = mock_app_state();
 
-        let ctx = fetch_project_context(&state.neo4j, "nonexistent-slug")
+        let ctx = fetch_project_context(&state.indentiagraph, "nonexistent-slug")
             .await
             .unwrap();
 
@@ -2249,17 +2247,17 @@ mod tests {
 
         let state = mock_app_state();
         let project = test_project();
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
 
         let plan = test_plan();
-        state.neo4j.create_plan(&plan).await.unwrap();
+        state.indentiagraph.create_plan(&plan).await.unwrap();
         state
-            .neo4j
+            .indentiagraph
             .link_plan_to_project(plan.id, project.id)
             .await
             .unwrap();
 
-        let ctx = fetch_project_context(&state.neo4j, &project.slug)
+        let ctx = fetch_project_context(&state.indentiagraph, &project.slug)
             .await
             .unwrap();
 
@@ -2275,7 +2273,7 @@ mod tests {
 
         let state = mock_app_state();
         let project = test_project();
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
 
         // Create a project-specific guideline (must be Critical/High to be fetched)
         let mut project_note = crate::notes::Note::new(
@@ -2285,7 +2283,11 @@ mod tests {
             "test".to_string(),
         );
         project_note.importance = NoteImportance::High;
-        state.neo4j.create_note(&project_note).await.unwrap();
+        state
+            .indentiagraph
+            .create_note(&project_note)
+            .await
+            .unwrap();
 
         // Create a global guideline (no project_id)
         let mut global_note = crate::notes::Note::new(
@@ -2295,9 +2297,9 @@ mod tests {
             "test".to_string(),
         );
         global_note.importance = NoteImportance::Critical;
-        state.neo4j.create_note(&global_note).await.unwrap();
+        state.indentiagraph.create_note(&global_note).await.unwrap();
 
-        let ctx = fetch_project_context(&state.neo4j, &project.slug)
+        let ctx = fetch_project_context(&state.indentiagraph, &project.slug)
             .await
             .unwrap();
 
@@ -2429,25 +2431,33 @@ mod tests {
 
         let state = mock_app_state();
         let ws = test_workspace();
-        state.neo4j.create_workspace(&ws).await.unwrap();
+        state.indentiagraph.create_workspace(&ws).await.unwrap();
 
         let project_a = test_project_named("ProjectA");
-        state.neo4j.create_project(&project_a).await.unwrap();
         state
-            .neo4j
+            .indentiagraph
+            .create_project(&project_a)
+            .await
+            .unwrap();
+        state
+            .indentiagraph
             .add_project_to_workspace(ws.id, project_a.id)
             .await
             .unwrap();
 
         let project_b = test_project_named("ProjectB");
-        state.neo4j.create_project(&project_b).await.unwrap();
         state
-            .neo4j
+            .indentiagraph
+            .create_project(&project_b)
+            .await
+            .unwrap();
+        state
+            .indentiagraph
             .add_project_to_workspace(ws.id, project_b.id)
             .await
             .unwrap();
 
-        let ctx = fetch_project_context(&state.neo4j, &project_a.slug)
+        let ctx = fetch_project_context(&state.indentiagraph, &project_a.slug)
             .await
             .unwrap();
 
@@ -2464,9 +2474,9 @@ mod tests {
 
         let state = mock_app_state();
         let project = test_project();
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
 
-        let ctx = fetch_project_context(&state.neo4j, &project.slug)
+        let ctx = fetch_project_context(&state.indentiagraph, &project.slug)
             .await
             .unwrap();
 
@@ -2875,8 +2885,7 @@ mod tests {
     #[tokio::test]
     async fn test_topology_section_with_full_data() {
         use crate::graph::models::FileAnalyticsUpdate;
-        use crate::meilisearch::mock::MockSearchStore;
-        use crate::neo4j::mock::MockGraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
         use crate::test_helpers::{mock_app_state_with, test_project_named};
 
         let graph = MockGraphStore::new();
@@ -2886,8 +2895,8 @@ mod tests {
         let file_paths = vec![
             "src/api/handlers.rs",
             "src/api/routes.rs",
-            "src/neo4j/client.rs",
-            "src/neo4j/models.rs",
+            "src/indentiagraph/client.rs",
+            "src/indentiagraph/models.rs",
         ];
         graph
             .project_files
@@ -2898,7 +2907,7 @@ mod tests {
             .extend(file_paths.iter().map(|s| s.to_string()));
 
         for path in &file_paths {
-            let file = crate::neo4j::models::FileNode {
+            let file = crate::indentiagraph::models::FileNode {
                 path: path.to_string(),
                 language: "rust".to_string(),
                 hash: "test".to_string(),
@@ -2930,20 +2939,20 @@ mod tests {
                     component_id: 0,
                 },
                 FileAnalyticsUpdate {
-                    path: "src/neo4j/client.rs".to_string(),
+                    path: "src/indentiagraph/client.rs".to_string(),
                     pagerank: 0.9,
                     betweenness: 0.8,
                     community_id: 1,
-                    community_label: "neo4j".to_string(),
+                    community_label: "indentiagraph".to_string(),
                     clustering_coefficient: 0.6,
                     component_id: 0,
                 },
                 FileAnalyticsUpdate {
-                    path: "src/neo4j/models.rs".to_string(),
+                    path: "src/indentiagraph/models.rs".to_string(),
                     pagerank: 0.3,
                     betweenness: 0.05,
                     community_id: 1,
-                    community_label: "neo4j".to_string(),
+                    community_label: "indentiagraph".to_string(),
                     clustering_coefficient: 0.5,
                     component_id: 0,
                 },
@@ -2951,9 +2960,9 @@ mod tests {
             .await
             .unwrap();
 
-        let state = mock_app_state_with(graph, MockSearchStore::new());
+        let state = mock_app_state_with(graph);
 
-        let ctx = fetch_project_context(&state.neo4j, "topo-proj")
+        let ctx = fetch_project_context(&state.indentiagraph, "topo-proj")
             .await
             .unwrap();
 
@@ -2969,13 +2978,16 @@ mod tests {
             "should have communities header"
         );
         assert!(topo.contains("api"), "should mention api community");
-        assert!(topo.contains("neo4j"), "should mention neo4j community");
+        assert!(
+            topo.contains("indentiagraph"),
+            "should mention indentiagraph community"
+        );
 
         // Check bridges section
         assert!(topo.contains("Bridge Files"), "should have bridges header");
         assert!(
-            topo.contains("neo4j/client.rs"),
-            "neo4j/client.rs should be a bridge (highest betweenness)"
+            topo.contains("indentiagraph/client.rs"),
+            "indentiagraph/client.rs should be a bridge (highest betweenness)"
         );
 
         // Size check: < 2000 chars
@@ -2992,9 +3004,9 @@ mod tests {
 
         let state = mock_app_state();
         let project = test_project_named("no-gds-proj");
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
 
-        let ctx = fetch_project_context(&state.neo4j, "no-gds-proj")
+        let ctx = fetch_project_context(&state.indentiagraph, "no-gds-proj")
             .await
             .unwrap();
 
@@ -3014,8 +3026,7 @@ mod tests {
     #[tokio::test]
     async fn test_topology_section_in_json() {
         use crate::graph::models::FileAnalyticsUpdate;
-        use crate::meilisearch::mock::MockSearchStore;
-        use crate::neo4j::mock::MockGraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
         use crate::test_helpers::{mock_app_state_with, test_project_named};
 
         let graph = MockGraphStore::new();
@@ -3030,7 +3041,7 @@ mod tests {
             .or_default()
             .push("src/main.rs".to_string());
 
-        let file = crate::neo4j::models::FileNode {
+        let file = crate::indentiagraph::models::FileNode {
             path: "src/main.rs".to_string(),
             language: "rust".to_string(),
             hash: "test".to_string(),
@@ -3052,8 +3063,8 @@ mod tests {
             .await
             .unwrap();
 
-        let state = mock_app_state_with(graph, MockSearchStore::new());
-        let ctx = fetch_project_context(&state.neo4j, "json-topo")
+        let state = mock_app_state_with(graph);
+        let ctx = fetch_project_context(&state.indentiagraph, "json-topo")
             .await
             .unwrap();
 

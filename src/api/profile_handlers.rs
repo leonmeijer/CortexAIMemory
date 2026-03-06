@@ -50,7 +50,7 @@ pub async fn list_analysis_profiles(
 ) -> Result<Json<Vec<AnalysisProfile>>, AppError> {
     let profiles = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_analysis_profiles(query.project_id.as_deref())
         .await
         .map_err(AppError::Internal)?;
@@ -105,7 +105,7 @@ pub async fn create_analysis_profile(
 
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .create_analysis_profile(&profile)
         .await
         .map_err(AppError::Internal)?;
@@ -122,7 +122,7 @@ pub async fn get_analysis_profile(
 ) -> Result<Json<AnalysisProfile>, AppError> {
     let profile = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_analysis_profile(&profile_id)
         .await
         .map_err(AppError::Internal)?
@@ -143,7 +143,7 @@ pub async fn delete_analysis_profile(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .delete_analysis_profile(&profile_id)
         .await
         .map_err(|e| {

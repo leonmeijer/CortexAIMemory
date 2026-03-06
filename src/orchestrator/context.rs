@@ -1,8 +1,7 @@
 //! Context builder for agent tasks
 
-use crate::meilisearch::SearchStore;
-use crate::neo4j::models::*;
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::models::*;
+use crate::indentiagraph::GraphStore;
 use crate::notes::{EntityType, Note, NoteManager};
 use crate::plan::models::*;
 use crate::plan::PlanManager;
@@ -12,8 +11,7 @@ use uuid::Uuid;
 
 /// Builder for creating rich agent context
 pub struct ContextBuilder {
-    neo4j: Arc<dyn GraphStore>,
-    meili: Arc<dyn SearchStore>,
+    indentiagraph: Arc<dyn GraphStore>,
     plan_manager: Arc<PlanManager>,
     note_manager: Arc<NoteManager>,
 }
@@ -21,14 +19,12 @@ pub struct ContextBuilder {
 impl ContextBuilder {
     /// Create a new context builder
     pub fn new(
-        neo4j: Arc<dyn GraphStore>,
-        meili: Arc<dyn SearchStore>,
+        indentiagraph: Arc<dyn GraphStore>,
         plan_manager: Arc<PlanManager>,
         note_manager: Arc<NoteManager>,
     ) -> Self {
         Self {
-            neo4j,
-            meili,
+            indentiagraph,
             plan_manager,
             note_manager,
         }
@@ -104,14 +100,17 @@ impl ContextBuilder {
 
     /// Get context for a specific file
     pub async fn get_file_context(&self, file_path: &str) -> Result<FileContext> {
-        // Get file info from Neo4j
-        let file = self.neo4j.get_file(file_path).await?;
+        // Get file info from IndentiaGraph
+        let file = self.indentiagraph.get_file(file_path).await?;
 
         // Get symbols in this file
         let symbols = self.get_file_symbols(file_path).await?;
 
         // Get dependent files (files that import this file)
-        let dependent_files = self.neo4j.find_dependent_files(file_path, 3, None).await?;
+        let dependent_files = self
+            .indentiagraph
+            .find_dependent_files(file_path, 3, None)
+            .await?;
 
         // Get files this file imports
         let dependencies = self.get_file_imports(file_path).await?;
@@ -196,7 +195,7 @@ impl ContextBuilder {
 
     /// Get symbols defined in a file
     async fn get_file_symbols(&self, file_path: &str) -> Result<Vec<String>> {
-        let names = self.neo4j.get_file_symbol_names(file_path).await?;
+        let names = self.indentiagraph.get_file_symbol_names(file_path).await?;
         let mut symbols = Vec::new();
         symbols.extend(names.functions);
         symbols.extend(names.structs);
@@ -207,27 +206,47 @@ impl ContextBuilder {
 
     /// Get imports for a file
     async fn get_file_imports(&self, file_path: &str) -> Result<Vec<String>> {
-        let imports = self.neo4j.get_file_direct_imports(file_path).await?;
+        let imports = self
+            .indentiagraph
+            .get_file_direct_imports(file_path)
+            .await?;
         Ok(imports.into_iter().map(|i| i.path).collect())
     }
 
-    /// Search for similar code using Meilisearch
+    /// Search for similar code using graph full-text search.
     async fn search_similar_code(&self, query: &str, limit: usize) -> Result<Vec<CodeReference>> {
         let hits = self
-            .meili
-            .search_code_with_scores(query, limit, None, None, None)
+            .indentiagraph
+            .search_code_fts(query, limit, None, None)
             .await?;
 
-        let references = hits
+        let refs = hits
             .into_iter()
-            .map(|hit| CodeReference {
-                path: hit.document.path,
-                snippet: hit.document.docstrings.chars().take(500).collect(),
-                relevance: hit.score as f32,
+            .map(|hit| {
+                let snippet = if !hit.docstring.trim().is_empty() {
+                    hit.docstring
+                } else if !hit.symbols.is_empty() {
+                    format!("Symbols: {}", hit.symbols.join(", "))
+                } else {
+                    format!("Matched file path: {}", hit.path)
+                };
+
+                let snippet = if snippet.chars().count() > 220 {
+                    let truncated: String = snippet.chars().take(217).collect();
+                    format!("{}...", truncated)
+                } else {
+                    snippet
+                };
+
+                CodeReference {
+                    path: hit.path,
+                    snippet,
+                    relevance: hit.score as f32,
+                }
             })
             .collect();
 
-        Ok(references)
+        Ok(refs)
     }
 
     /// Generate a prompt for an agent
@@ -428,7 +447,7 @@ impl ContextBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::models::{
+    use crate::indentiagraph::models::{
         ConstraintNode, ConstraintType, DecisionNode, DecisionStatus, StepNode, StepStatus,
         TaskNode, TaskStatus,
     };

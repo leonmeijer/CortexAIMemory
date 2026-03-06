@@ -200,6 +200,11 @@ impl ToolHandler {
             ("note", "get_propagated_knowledge") => "get_propagated_knowledge",
             ("note", "get_context_knowledge") => "get_context_knowledge",
             ("note", "get_entity") => "get_entity_notes",
+            ("note", "add_episode") => "add_episode",
+            ("note", "get_episodes") => "get_episodes",
+            ("note", "search_episodes") => "search_episodes",
+            ("note", "search_at_time") => "search_notes_at_time",
+            ("note", "invalidate_temporal") => "invalidate_note_temporal",
 
             // Workspace
             ("workspace", "list") => "list_workspaces",
@@ -338,8 +343,6 @@ impl ToolHandler {
             ("admin", "start_watch") => "start_watch",
             ("admin", "stop_watch") => "stop_watch",
             ("admin", "watch_status") => "watch_status",
-            ("admin", "meilisearch_stats") => "get_meilisearch_stats",
-            ("admin", "delete_meilisearch_orphans") => "delete_meilisearch_orphans",
             ("admin", "cleanup_cross_project_calls") => "cleanup_cross_project_calls",
             ("admin", "cleanup_builtin_calls") => "cleanup_builtin_calls",
             ("admin", "migrate_calls_confidence") => "migrate_calls_confidence",
@@ -1803,6 +1806,93 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
+            // --- Episodic Memory (Graphiti-inspired) ---
+            "add_episode" => {
+                let episode_name = extract_string(args, "episode_name")?;
+                let content = extract_string(args, "content")?;
+                let mut body = serde_json::Map::new();
+                body.insert("name".to_string(), json!(episode_name));
+                body.insert("content".to_string(), json!(content));
+                if let Some(v) = args.get("episode_source").and_then(|v| v.as_str()) {
+                    body.insert("source".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("at_time").and_then(|v| v.as_str()) {
+                    body.insert("reference_time".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    body.insert("project_id".to_string(), json!(v));
+                }
+                if let Some(v) = args.get("group_id").and_then(|v| v.as_str()) {
+                    body.insert("group_id".to_string(), json!(v));
+                }
+                let result = http.post("/api/episodes", &Value::Object(body)).await?;
+                Ok(Some(result))
+            }
+
+            "get_episodes" => {
+                let mut query = Vec::new();
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("group_id").and_then(|v| v.as_str()) {
+                    query.push(("group_id".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = if query.is_empty() {
+                    http.get("/api/episodes").await?
+                } else {
+                    http.get_with_query("/api/episodes", &query).await?
+                };
+                Ok(Some(result))
+            }
+
+            "search_episodes" => {
+                let query_str = extract_string(args, "query")?;
+                let mut query = vec![("query".to_string(), query_str)];
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/episodes/search", &query).await?;
+                Ok(Some(result))
+            }
+
+            "search_notes_at_time" => {
+                let query_str = extract_string(args, "query")?;
+                let at_time = extract_string(args, "at_time")?;
+                let mut query = vec![
+                    ("query".to_string(), query_str),
+                    ("at_time".to_string(), at_time),
+                ];
+                if let Some(v) = args.get("project_id").and_then(|v| v.as_str()) {
+                    query.push(("project_id".to_string(), v.to_string()));
+                }
+                if let Some(v) = args.get("limit").and_then(|v| v.as_i64()) {
+                    query.push(("limit".to_string(), v.to_string()));
+                }
+                let result = http.get_with_query("/api/notes/at-time", &query).await?;
+                Ok(Some(result))
+            }
+
+            "invalidate_note_temporal" => {
+                let note_id = extract_id(args, "note_id")?;
+                let mut body = serde_json::Map::new();
+                if let Some(v) = args.get("at_time").and_then(|v| v.as_str()) {
+                    body.insert("at_time".to_string(), json!(v));
+                }
+                let result = http
+                    .post(
+                        &format!("/api/notes/{}/invalidate-temporal", note_id),
+                        &Value::Object(body),
+                    )
+                    .await?;
+                Ok(Some(result))
+            }
+
             // --- Admin (5) ---
             "update_staleness_scores" => {
                 let result = http.post("/api/notes/update-staleness", &json!({})).await?;
@@ -3232,16 +3322,6 @@ impl ToolHandler {
                 Ok(Some(result))
             }
 
-            "get_meilisearch_stats" => {
-                let result = http.get("/api/meilisearch/stats").await?;
-                Ok(Some(result))
-            }
-
-            "delete_meilisearch_orphans" => {
-                let result = http.delete("/api/meilisearch/orphans").await?;
-                Ok(Some(result))
-            }
-
             // ── P11: Admin & Sync (6 tools) ─────────────────────────────
 
             // --- Sync (1) ---
@@ -3615,6 +3695,11 @@ mod tests {
             ("confirm", "confirm_note"),
             ("invalidate", "invalidate_note"),
             ("supersede", "supersede_note"),
+            ("add_episode", "add_episode"),
+            ("get_episodes", "get_episodes"),
+            ("search_episodes", "search_episodes"),
+            ("search_at_time", "search_notes_at_time"),
+            ("invalidate_temporal", "invalidate_note_temporal"),
         ] {
             let args = json!({"action": action});
             let (name, _) = handler.resolve_mega_tool("note", &args).unwrap();
@@ -3716,7 +3801,6 @@ mod tests {
             ("component", "list"),
             ("chat", "list_sessions"),
             ("feature_graph", "list"),
-            ("admin", "meilisearch_stats"),
         ];
 
         for (tool, action) in mega_tools_with_action {
@@ -5502,26 +5586,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_http_get_meilisearch_stats() {
-        let (handler, _) = make_http_handler().await;
-        let result = handler
-            .handle("get_meilisearch_stats", Some(json!({})))
-            .await
-            .unwrap();
-        assert_eq!(result["method"], "GET");
-    }
-
-    #[tokio::test]
-    async fn test_http_delete_meilisearch_orphans() {
-        let (handler, _) = make_http_handler().await;
-        let result = handler
-            .handle("delete_meilisearch_orphans", Some(json!({})))
-            .await
-            .unwrap();
-        assert_eq!(result["method"], "DELETE");
-    }
-
-    #[tokio::test]
     async fn test_http_sync_directory() {
         let (handler, _) = make_http_handler().await;
         let result = handler
@@ -6222,7 +6286,7 @@ mod tests {
         let result = handler
             .handle(
                 "find_type_traits",
-                Some(json!({"type_name": "Neo4jClient"})),
+                Some(json!({"type_name": "IndentiaGraphClient"})),
             )
             .await
             .unwrap();
@@ -6234,7 +6298,10 @@ mod tests {
     async fn test_http_get_impl_blocks() {
         let (handler, _) = make_http_handler().await;
         let result = handler
-            .handle("get_impl_blocks", Some(json!({"type_name": "Neo4jClient"})))
+            .handle(
+                "get_impl_blocks",
+                Some(json!({"type_name": "IndentiaGraphClient"})),
+            )
             .await
             .unwrap();
         assert_eq!(result["method"], "GET");
@@ -7380,8 +7447,6 @@ mod tests {
             ("start_watch", "start_watch"),
             ("stop_watch", "stop_watch"),
             ("watch_status", "watch_status"),
-            ("meilisearch_stats", "get_meilisearch_stats"),
-            ("delete_meilisearch_orphans", "delete_meilisearch_orphans"),
             ("update_staleness_scores", "update_staleness_scores"),
             ("update_energy_scores", "update_energy_scores"),
             ("detect_skills", "detect_skills"),

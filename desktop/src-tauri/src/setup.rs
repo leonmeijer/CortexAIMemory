@@ -15,9 +15,9 @@ use std::path::PathBuf;
 pub struct SetupConfig {
     // Infrastructure
     pub infra_mode: String,
-    pub neo4j_uri: String,
-    pub neo4j_user: String,
-    pub neo4j_password: String,
+    pub indentiagraph_uri: String,
+    pub indentiagraph_user: String,
+    pub indentiagraph_password: String,
     pub meilisearch_url: String,
     pub meilisearch_key: String,
     pub server_port: u16,
@@ -161,7 +161,7 @@ struct YamlOutput {
     /// Persisted so that reconfigure mode can restore the exact wizard state.
     infra_mode: String,
     server: ServerSection,
-    neo4j: Neo4jSection,
+    indentiagraph: IndentiaGraphSection,
     meilisearch: MeilisearchSection,
     #[serde(skip_serializing_if = "Option::is_none")]
     nats: Option<NatsSection>,
@@ -190,7 +190,7 @@ struct ServerSection {
 }
 
 #[derive(Debug, Serialize)]
-struct Neo4jSection {
+struct IndentiaGraphSection {
     uri: String,
     user: String,
     password: String,
@@ -364,9 +364,9 @@ pub struct DependencyStatus {
     pub infra_mode: String,
     /// Whether NATS is enabled (from config.yaml, defaults to true).
     pub nats_enabled: bool,
-    /// Neo4j password from config.yaml (needed by start_docker_services).
+    /// IndentiaGraph password from config.yaml (needed by start_docker_services).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub neo4j_password: Option<String>,
+    pub indentiagraph_password: Option<String>,
     /// Meilisearch key from config.yaml (needed by start_docker_services).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meilisearch_key: Option<String>,
@@ -398,7 +398,7 @@ pub async fn check_dependencies(
     let config_path = config_path();
     let config_exists = config_path.exists();
 
-    let (setup_completed, infra_mode, nats_enabled, neo4j_password, meilisearch_key) =
+    let (setup_completed, infra_mode, nats_enabled, indentiagraph_password, meilisearch_key) =
         if config_exists {
             match std::fs::read_to_string(&config_path) {
                 Ok(contents) => {
@@ -410,17 +410,17 @@ pub async fn check_dependencies(
                                 .clone()
                                 .unwrap_or_else(|| "docker".to_string());
                             let nats = yaml.nats.url.is_some();
-                            let neo4j_pw = if yaml.neo4j.password.is_empty() {
+                            let indentiagraph_pw = if yaml.indentiagraph.password.is_empty() {
                                 None
                             } else {
-                                Some(yaml.neo4j.password.clone())
+                                Some(yaml.indentiagraph.password.clone())
                             };
                             let meili_key = if yaml.meilisearch.key.is_empty() {
                                 None
                             } else {
                                 Some(yaml.meilisearch.key.clone())
                             };
-                            (setup, mode, nats, neo4j_pw, meili_key)
+                            (setup, mode, nats, indentiagraph_pw, meili_key)
                         }
                         Err(e) => {
                             tracing::warn!("Failed to parse config.yaml: {}", e);
@@ -449,7 +449,7 @@ pub async fn check_dependencies(
         setup_completed,
         infra_mode,
         nats_enabled,
-        neo4j_password,
+        indentiagraph_password,
         meilisearch_key,
         os,
         arch,
@@ -490,13 +490,13 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
         .and_then(|contents| serde_yaml::from_str(&contents).ok());
 
     // Build YAML structure — preserve secrets from existing config when fields are empty
-    let neo4j_password = if !config.neo4j_password.is_empty() {
-        config.neo4j_password.clone()
+    let indentiagraph_password = if !config.indentiagraph_password.is_empty() {
+        config.indentiagraph_password.clone()
     } else if let Some(ref old) = existing {
-        if old.neo4j.password.is_empty() {
+        if old.indentiagraph.password.is_empty() {
             random_secret(24)
         } else {
-            old.neo4j.password.clone()
+            old.indentiagraph.password.clone()
         }
     } else {
         random_secret(24)
@@ -682,10 +682,10 @@ pub fn generate_config(config: SetupConfig) -> Result<String, String> {
             frontend_path: "./dist".into(),
             public_url,
         },
-        neo4j: Neo4jSection {
-            uri: config.neo4j_uri.clone(),
-            user: config.neo4j_user.clone(),
-            password: neo4j_password,
+        indentiagraph: IndentiaGraphSection {
+            uri: config.indentiagraph_uri.clone(),
+            user: config.indentiagraph_user.clone(),
+            password: indentiagraph_password,
         },
         meilisearch: MeilisearchSection {
             url: config.meilisearch_url.clone(),
@@ -912,7 +912,7 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
     // Determine infra mode: read from YAML (new configs), fallback to heuristic (old configs)
     let infra_mode = yaml.infra_mode.clone().unwrap_or_else(|| {
         // Heuristic fallback for config.yaml files generated before infra_mode was persisted
-        if yaml.neo4j.uri.contains("localhost") || yaml.neo4j.uri.contains("127.0.0.1") {
+        if yaml.indentiagraph.uri.contains("localhost") || yaml.indentiagraph.uri.contains("127.0.0.1") {
             "docker".into()
         } else {
             "external".into()
@@ -939,7 +939,7 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
     let mut allowed_email_domain = String::new();
     let mut allowed_emails = String::new();
     let mut has_oidc_secret = false;
-    let has_neo4j_password = !yaml.neo4j.password.is_empty();
+    let has_indentiagraph_password = !yaml.indentiagraph.password.is_empty();
     let has_meilisearch_key = !yaml.meilisearch.key.is_empty();
 
     if let Some(ref auth) = yaml.auth {
@@ -1002,9 +1002,9 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
 
     Ok(ReadConfigResponse {
         infra_mode,
-        neo4j_uri: yaml.neo4j.uri,
-        neo4j_user: yaml.neo4j.user,
-        neo4j_password: String::new(), // redacted
+        indentiagraph_uri: yaml.indentiagraph.uri,
+        indentiagraph_user: yaml.indentiagraph.user,
+        indentiagraph_password: String::new(), // redacted
         meilisearch_url: yaml.meilisearch.url,
         meilisearch_key: String::new(), // redacted
         server_port: yaml.server.port,
@@ -1047,7 +1047,7 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
         embedding_dimensions: yaml.embeddings.dimensions.unwrap_or(768) as u32,
         has_embedding_api_key: yaml.embeddings.api_key.as_ref().is_some_and(|k| !k.is_empty()),
         has_oidc_secret,
-        has_neo4j_password,
+        has_indentiagraph_password,
         has_meilisearch_key,
     })
 }
@@ -1061,9 +1061,9 @@ pub fn read_config() -> Result<ReadConfigResponse, String> {
 #[serde(rename_all = "camelCase")]
 pub struct ReadConfigResponse {
     pub infra_mode: String,
-    pub neo4j_uri: String,
-    pub neo4j_user: String,
-    pub neo4j_password: String,
+    pub indentiagraph_uri: String,
+    pub indentiagraph_user: String,
+    pub indentiagraph_password: String,
     pub meilisearch_url: String,
     pub meilisearch_key: String,
     pub server_port: u16,
@@ -1106,7 +1106,7 @@ pub struct ReadConfigResponse {
     pub embedding_dimensions: u32,
     // Indicators for existing secrets (reconfigure mode)
     pub has_oidc_secret: bool,
-    pub has_neo4j_password: bool,
+    pub has_indentiagraph_password: bool,
     pub has_meilisearch_key: bool,
     pub has_embedding_api_key: bool,
 }
@@ -1129,9 +1129,9 @@ pub fn generate_default_config() -> Result<PathBuf, String> {
             frontend_path: "./dist".into(),
             public_url: None,
         },
-        neo4j: Neo4jSection {
-            uri: "bolt://localhost:7687".into(),
-            user: "neo4j".into(),
+        indentiagraph: IndentiaGraphSection {
+            uri: "ws://localhost:8000".into(),
+            user: "indentiagraph".into(),
             password: random_secret(24),
         },
         meilisearch: MeilisearchSection {

@@ -197,7 +197,7 @@ pub struct AddMemberBody {
 #[derive(Debug, serde::Serialize)]
 pub struct SkillMembersResponse {
     pub notes: Vec<crate::notes::Note>,
-    pub decisions: Vec<crate::neo4j::models::DecisionNode>,
+    pub decisions: Vec<crate::indentiagraph::models::DecisionNode>,
 }
 
 /// Request body for activating a skill
@@ -248,7 +248,7 @@ pub async fn list_skills(
 
     let (skills, total) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_skills(query.project_id, status_filter, limit, offset)
         .await
         .map_err(AppError::Internal)?;
@@ -295,7 +295,7 @@ pub async fn create_skill(
 
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .create_skill(&skill)
         .await
         .map_err(AppError::Internal)?;
@@ -315,7 +315,7 @@ pub async fn get_skill(
 ) -> Result<Json<SkillNode>, AppError> {
     let skill = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_skill(skill_id)
         .await
         .map_err(AppError::Internal)?
@@ -334,7 +334,7 @@ pub async fn update_skill(
 ) -> Result<Json<SkillNode>, AppError> {
     let mut skill = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_skill(skill_id)
         .await
         .map_err(AppError::Internal)?
@@ -395,7 +395,7 @@ pub async fn update_skill(
 
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .update_skill(&skill)
         .await
         .map_err(AppError::Internal)?;
@@ -416,14 +416,14 @@ pub async fn delete_skill(
     // Get project_id before deletion for cache invalidation
     let skill = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_skill(skill_id)
         .await
         .map_err(AppError::Internal)?;
 
     let deleted = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .delete_skill(skill_id)
         .await
         .map_err(AppError::Internal)?;
@@ -452,7 +452,7 @@ pub async fn get_skill_members(
 ) -> Result<Json<SkillMembersResponse>, AppError> {
     let (notes, decisions) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_skill_members(skill_id)
         .await
         .map_err(AppError::Internal)?;
@@ -477,7 +477,7 @@ pub async fn add_skill_member(
     // Pre-check skill existence to return 404 instead of silent 201
     let skill = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_skill(skill_id)
         .await
         .map_err(AppError::Internal)?
@@ -485,7 +485,7 @@ pub async fn add_skill_member(
 
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .add_skill_member(skill_id, &body.entity_type, body.entity_id)
         .await
         .map_err(AppError::Internal)?;
@@ -512,14 +512,14 @@ pub async fn remove_skill_member(
     // Get skill for project_id (needed for cache invalidation)
     let skill = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_skill(skill_id)
         .await
         .map_err(AppError::Internal)?;
 
     let removed = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .remove_skill_member(skill_id, &entity_type, entity_id)
         .await
         .map_err(AppError::Internal)?;
@@ -558,7 +558,7 @@ pub async fn activate_skill(
     // The error message from activate_skill("Skill not found: <id>") is sufficient.
     let context = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .activate_skill(skill_id, &body.query)
         .await
         .map_err(|e| {
@@ -587,7 +587,7 @@ pub async fn export_skill(
 ) -> Result<Json<crate::skills::SkillPackage>, AppError> {
     let package = crate::skills::export_skill(
         skill_id,
-        state.orchestrator.neo4j(),
+        state.orchestrator.indentiagraph(),
         query.source_project_name,
     )
     .await
@@ -621,7 +621,7 @@ pub async fn import_skill(
     let result = crate::skills::import_skill(
         &body.package,
         body.project_id,
-        state.orchestrator.neo4j(),
+        state.orchestrator.indentiagraph(),
         strategy,
     )
     .await
@@ -655,7 +655,7 @@ pub async fn get_skill_health(
 ) -> Result<Json<crate::skills::SkillHealthMetrics>, AppError> {
     let skill = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_skill(skill_id)
         .await
         .map_err(AppError::Internal)?
@@ -676,7 +676,7 @@ mod tests {
 
     #[test]
     fn test_validate_trigger_patterns_valid_regex() {
-        let triggers = vec![SkillTrigger::regex("neo4j|cypher", 0.6)];
+        let triggers = vec![SkillTrigger::regex("indentiagraph|cypher", 0.6)];
         assert!(validate_trigger_patterns(&triggers).is_ok());
     }
 
@@ -699,7 +699,7 @@ mod tests {
 
     #[test]
     fn test_validate_trigger_patterns_valid_glob() {
-        let triggers = vec![SkillTrigger::file_glob("src/neo4j/**", 0.8)];
+        let triggers = vec![SkillTrigger::file_glob("src/indentiagraph/**", 0.8)];
         assert!(validate_trigger_patterns(&triggers).is_ok());
     }
 
@@ -885,7 +885,11 @@ mod tests {
         let app_state = mock_app_state();
         let project = test_project();
         let project_id = project.id;
-        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_project(&project)
+            .await
+            .unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -964,10 +968,14 @@ mod tests {
     async fn test_get_skill() {
         let app_state = mock_app_state();
         let project = test_project();
-        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_project(&project)
+            .await
+            .unwrap();
         let skill = SkillNode::new(project.id, "My Skill");
         let skill_id = skill.id;
-        app_state.neo4j.create_skill(&skill).await.unwrap();
+        app_state.indentiagraph.create_skill(&skill).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -1014,10 +1022,14 @@ mod tests {
     async fn test_delete_skill() {
         let app_state = mock_app_state();
         let project = test_project();
-        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_project(&project)
+            .await
+            .unwrap();
         let skill = SkillNode::new(project.id, "To Delete");
         let skill_id = skill.id;
-        app_state.neo4j.create_skill(&skill).await.unwrap();
+        app_state.indentiagraph.create_skill(&skill).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -1051,10 +1063,14 @@ mod tests {
     async fn test_get_skill_members_empty() {
         let app_state = mock_app_state();
         let project = test_project();
-        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_project(&project)
+            .await
+            .unwrap();
         let skill = SkillNode::new(project.id, "Skill With No Members");
         let skill_id = skill.id;
-        app_state.neo4j.create_skill(&skill).await.unwrap();
+        app_state.indentiagraph.create_skill(&skill).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -1091,10 +1107,14 @@ mod tests {
     async fn test_update_skill() {
         let app_state = mock_app_state();
         let project = test_project();
-        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_project(&project)
+            .await
+            .unwrap();
         let skill = SkillNode::new(project.id, "Original Name");
         let skill_id = skill.id;
-        app_state.neo4j.create_skill(&skill).await.unwrap();
+        app_state.indentiagraph.create_skill(&skill).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),
@@ -1136,10 +1156,14 @@ mod tests {
     async fn test_get_skill_health() {
         let app_state = mock_app_state();
         let project = test_project();
-        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_project(&project)
+            .await
+            .unwrap();
         let skill = SkillNode::new(project.id, "Health Check");
         let skill_id = skill.id;
-        app_state.neo4j.create_skill(&skill).await.unwrap();
+        app_state.indentiagraph.create_skill(&skill).await.unwrap();
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
             orchestrator.clone(),

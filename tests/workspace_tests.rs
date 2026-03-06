@@ -1,9 +1,9 @@
 //! Integration tests for workspace functionality
 //!
-//! These tests require Neo4j and Meilisearch to be running.
+//! These tests require IndentiaGraph to be running.
 //! Run with: cargo test --test workspace_tests
 
-use project_orchestrator::neo4j::models::*;
+use project_orchestrator::indentiagraph::models::*;
 use project_orchestrator::{AppState, Config};
 use uuid::Uuid;
 
@@ -11,14 +11,13 @@ use uuid::Uuid;
 fn test_config() -> Config {
     Config {
         setup_completed: true,
-        neo4j_uri: std::env::var("NEO4J_URI").unwrap_or_else(|_| "bolt://localhost:7687".into()),
-        neo4j_user: std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into()),
-        neo4j_password: std::env::var("NEO4J_PASSWORD")
-            .unwrap_or_else(|_| "orchestrator123".into()),
-        meilisearch_url: std::env::var("MEILISEARCH_URL")
-            .unwrap_or_else(|_| "http://localhost:7700".into()),
-        meilisearch_key: std::env::var("MEILISEARCH_KEY")
-            .unwrap_or_else(|_| "orchestrator-meili-key-change-me".into()),
+        indentiagraph_uri: std::env::var("INDENTIAGRAPH_URI")
+            .unwrap_or_else(|_| "ws://localhost:8000".into()),
+        indentiagraph_user: std::env::var("INDENTIAGRAPH_USER").unwrap_or_else(|_| "root".into()),
+        indentiagraph_password: std::env::var("INDENTIAGRAPH_PASSWORD")
+            .unwrap_or_else(|_| "root".into()),
+        surreal_namespace: std::env::var("SURREALDB_NAMESPACE").unwrap_or_else(|_| "cortex".into()),
+        surreal_database: std::env::var("SURREALDB_DATABASE").unwrap_or_else(|_| "memory".into()),
         nats_url: None,
         workspace_path: ".".into(),
         server_port: 8080,
@@ -48,34 +47,7 @@ fn test_config() -> Config {
 
 /// Check if backends are available
 async fn backends_available() -> bool {
-    let config = test_config();
-
-    // Check Meilisearch
-    let meili_ok = reqwest::get(format!("{}/health", config.meilisearch_url))
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
-
-    if !meili_ok {
-        eprintln!("Meilisearch not available at {}", config.meilisearch_url);
-        return false;
-    }
-
-    // Check Neo4j
-    let neo4j_ok = neo4rs::Graph::new(
-        &config.neo4j_uri,
-        &config.neo4j_user,
-        &config.neo4j_password,
-    )
-    .await
-    .is_ok();
-
-    if !neo4j_ok {
-        eprintln!("Neo4j not available at {}", config.neo4j_uri);
-        return false;
-    }
-
-    true
+    AppState::new(test_config()).await.is_ok()
 }
 
 // ============================================================================
@@ -103,7 +75,7 @@ async fn test_workspace_crud() {
         metadata: serde_json::json!({"test": true}),
     };
 
-    let result = state.neo4j.create_workspace(&workspace).await;
+    let result = state.indentiagraph.create_workspace(&workspace).await;
     assert!(
         result.is_ok(),
         "Should create workspace: {:?}",
@@ -111,14 +83,18 @@ async fn test_workspace_crud() {
     );
 
     // Get workspace by ID
-    let retrieved = state.neo4j.get_workspace(workspace.id).await.unwrap();
+    let retrieved = state
+        .indentiagraph
+        .get_workspace(workspace.id)
+        .await
+        .unwrap();
     assert!(retrieved.is_some(), "Should retrieve workspace by ID");
     let retrieved = retrieved.unwrap();
     assert_eq!(retrieved.name, workspace.name);
 
     // Get workspace by slug
     let by_slug = state
-        .neo4j
+        .indentiagraph
         .get_workspace_by_slug(&workspace.slug)
         .await
         .unwrap();
@@ -126,7 +102,7 @@ async fn test_workspace_crud() {
 
     // Update workspace
     let result = state
-        .neo4j
+        .indentiagraph
         .update_workspace(
             workspace.id,
             Some("Updated Workspace".to_string()),
@@ -137,7 +113,7 @@ async fn test_workspace_crud() {
     assert!(result.is_ok(), "Should update workspace");
 
     let updated = state
-        .neo4j
+        .indentiagraph
         .get_workspace(workspace.id)
         .await
         .unwrap()
@@ -145,14 +121,18 @@ async fn test_workspace_crud() {
     assert_eq!(updated.name, "Updated Workspace");
 
     // List workspaces
-    let workspaces = state.neo4j.list_workspaces().await.unwrap();
+    let workspaces = state.indentiagraph.list_workspaces().await.unwrap();
     assert!(workspaces.iter().any(|w| w.id == workspace.id));
 
     // Delete workspace
-    let result = state.neo4j.delete_workspace(workspace.id).await;
+    let result = state.indentiagraph.delete_workspace(workspace.id).await;
     assert!(result.is_ok(), "Should delete workspace");
 
-    let deleted = state.neo4j.get_workspace(workspace.id).await.unwrap();
+    let deleted = state
+        .indentiagraph
+        .get_workspace(workspace.id)
+        .await
+        .unwrap();
     assert!(deleted.is_none(), "Workspace should be deleted");
 }
 
@@ -176,7 +156,11 @@ async fn test_workspace_project_association() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create project
     let project = ProjectNode {
@@ -190,18 +174,18 @@ async fn test_workspace_project_association() {
         analytics_computed_at: None,
         last_co_change_computed_at: None,
     };
-    state.neo4j.create_project(&project).await.unwrap();
+    state.indentiagraph.create_project(&project).await.unwrap();
 
     // Add project to workspace
     let result = state
-        .neo4j
+        .indentiagraph
         .add_project_to_workspace(workspace.id, project.id)
         .await;
     assert!(result.is_ok(), "Should add project to workspace");
 
     // List workspace projects
     let projects = state
-        .neo4j
+        .indentiagraph
         .list_workspace_projects(workspace.id)
         .await
         .unwrap();
@@ -209,19 +193,23 @@ async fn test_workspace_project_association() {
     assert_eq!(projects[0].id, project.id);
 
     // Get project workspace
-    let ws = state.neo4j.get_project_workspace(project.id).await.unwrap();
+    let ws = state
+        .indentiagraph
+        .get_project_workspace(project.id)
+        .await
+        .unwrap();
     assert!(ws.is_some());
     assert_eq!(ws.unwrap().id, workspace.id);
 
     // Remove project from workspace
     let result = state
-        .neo4j
+        .indentiagraph
         .remove_project_from_workspace(workspace.id, project.id)
         .await;
     assert!(result.is_ok(), "Should remove project from workspace");
 
     let projects = state
-        .neo4j
+        .indentiagraph
         .list_workspace_projects(workspace.id)
         .await
         .unwrap();
@@ -229,11 +217,15 @@ async fn test_workspace_project_association() {
 
     // Cleanup
     state
-        .neo4j
+        .indentiagraph
         .delete_project(project.id, &project.name)
         .await
         .unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -260,7 +252,11 @@ async fn test_workspace_milestone_crud() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create workspace milestone
     let milestone = WorkspaceMilestoneNode {
@@ -275,7 +271,10 @@ async fn test_workspace_milestone_crud() {
         tags: vec!["test".to_string()],
     };
 
-    let result = state.neo4j.create_workspace_milestone(&milestone).await;
+    let result = state
+        .indentiagraph
+        .create_workspace_milestone(&milestone)
+        .await;
     assert!(
         result.is_ok(),
         "Should create milestone: {:?}",
@@ -284,7 +283,7 @@ async fn test_workspace_milestone_crud() {
 
     // Get milestone
     let retrieved = state
-        .neo4j
+        .indentiagraph
         .get_workspace_milestone(milestone.id)
         .await
         .unwrap();
@@ -293,7 +292,7 @@ async fn test_workspace_milestone_crud() {
 
     // List milestones
     let milestones = state
-        .neo4j
+        .indentiagraph
         .list_workspace_milestones(workspace.id)
         .await
         .unwrap();
@@ -301,7 +300,7 @@ async fn test_workspace_milestone_crud() {
 
     // Update milestone
     state
-        .neo4j
+        .indentiagraph
         .update_workspace_milestone(
             milestone.id,
             Some("Updated Milestone".to_string()),
@@ -313,7 +312,7 @@ async fn test_workspace_milestone_crud() {
         .unwrap();
 
     let updated = state
-        .neo4j
+        .indentiagraph
         .get_workspace_milestone(milestone.id)
         .await
         .unwrap()
@@ -322,11 +321,15 @@ async fn test_workspace_milestone_crud() {
 
     // Cleanup
     state
-        .neo4j
+        .indentiagraph
         .delete_workspace_milestone(milestone.id)
         .await
         .unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -353,7 +356,11 @@ async fn test_resource_crud() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create resource
     let resource = ResourceNode {
@@ -372,25 +379,33 @@ async fn test_resource_crud() {
         metadata: serde_json::json!({}),
     };
 
-    let result = state.neo4j.create_resource(&resource).await;
+    let result = state.indentiagraph.create_resource(&resource).await;
     assert!(result.is_ok(), "Should create resource: {:?}", result.err());
 
     // Get resource
-    let retrieved = state.neo4j.get_resource(resource.id).await.unwrap();
+    let retrieved = state.indentiagraph.get_resource(resource.id).await.unwrap();
     assert!(retrieved.is_some());
     assert_eq!(retrieved.unwrap().name, resource.name);
 
     // List workspace resources
     let resources = state
-        .neo4j
+        .indentiagraph
         .list_workspace_resources(workspace.id)
         .await
         .unwrap();
     assert_eq!(resources.len(), 1);
 
     // Cleanup
-    state.neo4j.delete_resource(resource.id).await.unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_resource(resource.id)
+        .await
+        .unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -413,7 +428,11 @@ async fn test_resource_project_links() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     let api_project = ProjectNode {
         id: Uuid::new_v4(),
@@ -426,7 +445,11 @@ async fn test_resource_project_links() {
         analytics_computed_at: None,
         last_co_change_computed_at: None,
     };
-    state.neo4j.create_project(&api_project).await.unwrap();
+    state
+        .indentiagraph
+        .create_project(&api_project)
+        .await
+        .unwrap();
 
     let frontend_project = ProjectNode {
         id: Uuid::new_v4(),
@@ -439,7 +462,11 @@ async fn test_resource_project_links() {
         analytics_computed_at: None,
         last_co_change_computed_at: None,
     };
-    state.neo4j.create_project(&frontend_project).await.unwrap();
+    state
+        .indentiagraph
+        .create_project(&frontend_project)
+        .await
+        .unwrap();
 
     // Create resource
     let resource = ResourceNode {
@@ -457,23 +484,27 @@ async fn test_resource_project_links() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_resource(&resource).await.unwrap();
+    state
+        .indentiagraph
+        .create_resource(&resource)
+        .await
+        .unwrap();
 
     // Link projects
     state
-        .neo4j
+        .indentiagraph
         .link_project_implements_resource(api_project.id, resource.id)
         .await
         .unwrap();
     state
-        .neo4j
+        .indentiagraph
         .link_project_uses_resource(frontend_project.id, resource.id)
         .await
         .unwrap();
 
     // Get implementers
     let implementers = state
-        .neo4j
+        .indentiagraph
         .get_resource_implementers(resource.id)
         .await
         .unwrap();
@@ -482,7 +513,7 @@ async fn test_resource_project_links() {
 
     // Get consumers
     let consumers = state
-        .neo4j
+        .indentiagraph
         .get_resource_consumers(resource.id)
         .await
         .unwrap();
@@ -490,18 +521,26 @@ async fn test_resource_project_links() {
     assert_eq!(consumers[0].id, frontend_project.id);
 
     // Cleanup
-    state.neo4j.delete_resource(resource.id).await.unwrap();
     state
-        .neo4j
+        .indentiagraph
+        .delete_resource(resource.id)
+        .await
+        .unwrap();
+    state
+        .indentiagraph
         .delete_project(api_project.id, &api_project.name)
         .await
         .unwrap();
     state
-        .neo4j
+        .indentiagraph
         .delete_project(frontend_project.id, &frontend_project.name)
         .await
         .unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -528,7 +567,11 @@ async fn test_component_crud() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create component
     let component = ComponentNode {
@@ -543,7 +586,7 @@ async fn test_component_crud() {
         tags: vec!["api".to_string(), "backend".to_string()],
     };
 
-    let result = state.neo4j.create_component(&component).await;
+    let result = state.indentiagraph.create_component(&component).await;
     assert!(
         result.is_ok(),
         "Should create component: {:?}",
@@ -551,17 +594,33 @@ async fn test_component_crud() {
     );
 
     // Get component
-    let retrieved = state.neo4j.get_component(component.id).await.unwrap();
+    let retrieved = state
+        .indentiagraph
+        .get_component(component.id)
+        .await
+        .unwrap();
     assert!(retrieved.is_some());
     assert_eq!(retrieved.unwrap().name, component.name);
 
     // List components
-    let components = state.neo4j.list_components(workspace.id).await.unwrap();
+    let components = state
+        .indentiagraph
+        .list_components(workspace.id)
+        .await
+        .unwrap();
     assert_eq!(components.len(), 1);
 
     // Cleanup
-    state.neo4j.delete_component(component.id).await.unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_component(component.id)
+        .await
+        .unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -584,7 +643,11 @@ async fn test_component_dependencies() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create components
     let api = ComponentNode {
@@ -598,7 +661,7 @@ async fn test_component_dependencies() {
         created_at: chrono::Utc::now(),
         tags: vec![],
     };
-    state.neo4j.create_component(&api).await.unwrap();
+    state.indentiagraph.create_component(&api).await.unwrap();
 
     let db = ComponentNode {
         id: Uuid::new_v4(),
@@ -611,18 +674,18 @@ async fn test_component_dependencies() {
         created_at: chrono::Utc::now(),
         tags: vec![],
     };
-    state.neo4j.create_component(&db).await.unwrap();
+    state.indentiagraph.create_component(&db).await.unwrap();
 
     // Add dependency
     let result = state
-        .neo4j
+        .indentiagraph
         .add_component_dependency(api.id, db.id, Some("tcp".to_string()), true)
         .await;
     assert!(result.is_ok(), "Should add dependency");
 
     // Get topology
     let topology = state
-        .neo4j
+        .indentiagraph
         .get_workspace_topology(workspace.id)
         .await
         .unwrap();
@@ -635,15 +698,19 @@ async fn test_component_dependencies() {
 
     // Remove dependency
     state
-        .neo4j
+        .indentiagraph
         .remove_component_dependency(api.id, db.id)
         .await
         .unwrap();
 
     // Cleanup
-    state.neo4j.delete_component(api.id).await.unwrap();
-    state.neo4j.delete_component(db.id).await.unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state.indentiagraph.delete_component(api.id).await.unwrap();
+    state.indentiagraph.delete_component(db.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -666,7 +733,11 @@ async fn test_component_project_mapping() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create project
     let project = ProjectNode {
@@ -680,7 +751,7 @@ async fn test_component_project_mapping() {
         analytics_computed_at: None,
         last_co_change_computed_at: None,
     };
-    state.neo4j.create_project(&project).await.unwrap();
+    state.indentiagraph.create_project(&project).await.unwrap();
 
     // Create component
     let component = ComponentNode {
@@ -694,18 +765,22 @@ async fn test_component_project_mapping() {
         created_at: chrono::Utc::now(),
         tags: vec![],
     };
-    state.neo4j.create_component(&component).await.unwrap();
+    state
+        .indentiagraph
+        .create_component(&component)
+        .await
+        .unwrap();
 
     // Map component to project
     let result = state
-        .neo4j
+        .indentiagraph
         .map_component_to_project(component.id, project.id)
         .await;
     assert!(result.is_ok(), "Should map component to project");
 
     // Get topology and check mapping
     let topology = state
-        .neo4j
+        .indentiagraph
         .get_workspace_topology(workspace.id)
         .await
         .unwrap();
@@ -713,13 +788,21 @@ async fn test_component_project_mapping() {
     assert_eq!(topology[0].1, Some("API Codebase".to_string()));
 
     // Cleanup
-    state.neo4j.delete_component(component.id).await.unwrap();
     state
-        .neo4j
+        .indentiagraph
+        .delete_component(component.id)
+        .await
+        .unwrap();
+    state
+        .indentiagraph
         .delete_project(project.id, &project.name)
         .await
         .unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -746,7 +829,11 @@ async fn test_workspace_milestone_task_association() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create milestone
     let milestone = WorkspaceMilestoneNode {
@@ -761,12 +848,12 @@ async fn test_workspace_milestone_task_association() {
         tags: vec![],
     };
     state
-        .neo4j
+        .indentiagraph
         .create_workspace_milestone(&milestone)
         .await
         .unwrap();
 
-    // Create a plan and task (using neo4j::models types from wildcard import)
+    // Create a plan and task (using indentiagraph::models types from wildcard import)
     let plan = PlanNode {
         id: Uuid::new_v4(),
         title: "Test Plan".to_string(),
@@ -777,7 +864,7 @@ async fn test_workspace_milestone_task_association() {
         created_by: "test".to_string(),
         project_id: None,
     };
-    state.neo4j.create_plan(&plan).await.unwrap();
+    state.indentiagraph.create_plan(&plan).await.unwrap();
 
     let task = TaskNode {
         id: Uuid::new_v4(),
@@ -796,18 +883,22 @@ async fn test_workspace_milestone_task_association() {
         acceptance_criteria: vec![],
         affected_files: vec![],
     };
-    state.neo4j.create_task(plan.id, &task).await.unwrap();
+    state
+        .indentiagraph
+        .create_task(plan.id, &task)
+        .await
+        .unwrap();
 
     // Add task to milestone
     let result = state
-        .neo4j
+        .indentiagraph
         .add_task_to_workspace_milestone(milestone.id, task.id)
         .await;
     assert!(result.is_ok(), "Should add task to milestone");
 
     // Get milestone tasks
     let tasks = state
-        .neo4j
+        .indentiagraph
         .get_workspace_milestone_tasks(milestone.id)
         .await
         .unwrap();
@@ -820,7 +911,7 @@ async fn test_workspace_milestone_task_association() {
 
     // Get milestone progress
     let (total, completed, in_progress, pending) = state
-        .neo4j
+        .indentiagraph
         .get_workspace_milestone_progress(milestone.id)
         .await
         .unwrap();
@@ -830,13 +921,17 @@ async fn test_workspace_milestone_task_association() {
     assert_eq!(in_progress, 0);
 
     // Cleanup
-    state.neo4j.delete_plan(plan.id).await.unwrap();
+    state.indentiagraph.delete_plan(plan.id).await.unwrap();
     state
-        .neo4j
+        .indentiagraph
         .delete_workspace_milestone(milestone.id)
         .await
         .unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -863,7 +958,11 @@ async fn test_resource_full_flow() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create resource with full metadata
     let resource = ResourceNode {
@@ -881,11 +980,15 @@ async fn test_resource_full_flow() {
         updated_at: None,
         metadata: serde_json::json!({"key": "value", "nested": {"a": 1}}),
     };
-    state.neo4j.create_resource(&resource).await.unwrap();
+    state
+        .indentiagraph
+        .create_resource(&resource)
+        .await
+        .unwrap();
 
     // Verify all fields
     let retrieved = state
-        .neo4j
+        .indentiagraph
         .get_resource(resource.id)
         .await
         .unwrap()
@@ -903,15 +1006,23 @@ async fn test_resource_full_flow() {
 
     // List and verify
     let resources = state
-        .neo4j
+        .indentiagraph
         .list_workspace_resources(workspace.id)
         .await
         .unwrap();
     assert_eq!(resources.len(), 1);
 
     // Cleanup
-    state.neo4j.delete_resource(resource.id).await.unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_resource(resource.id)
+        .await
+        .unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -938,7 +1049,11 @@ async fn test_component_full_flow() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create component with full config
     let component = ComponentNode {
@@ -952,11 +1067,15 @@ async fn test_component_full_flow() {
         created_at: chrono::Utc::now(),
         tags: vec!["production".to_string(), "critical".to_string()],
     };
-    state.neo4j.create_component(&component).await.unwrap();
+    state
+        .indentiagraph
+        .create_component(&component)
+        .await
+        .unwrap();
 
     // Verify all fields
     let retrieved = state
-        .neo4j
+        .indentiagraph
         .get_component(component.id)
         .await
         .unwrap()
@@ -970,12 +1089,24 @@ async fn test_component_full_flow() {
     assert!(retrieved.tags.contains(&"critical".to_string()));
 
     // List and verify
-    let components = state.neo4j.list_components(workspace.id).await.unwrap();
+    let components = state
+        .indentiagraph
+        .list_components(workspace.id)
+        .await
+        .unwrap();
     assert_eq!(components.len(), 1);
 
     // Cleanup
-    state.neo4j.delete_component(component.id).await.unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_component(component.id)
+        .await
+        .unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1002,11 +1133,15 @@ async fn test_workspace_metadata_update() {
         updated_at: None,
         metadata: serde_json::json!({"key1": "value1"}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Update with new metadata
     let result = state
-        .neo4j
+        .indentiagraph
         .update_workspace(
             workspace.id,
             None,
@@ -1018,7 +1153,7 @@ async fn test_workspace_metadata_update() {
 
     // Verify
     let updated = state
-        .neo4j
+        .indentiagraph
         .get_workspace(workspace.id)
         .await
         .unwrap()
@@ -1027,7 +1162,11 @@ async fn test_workspace_metadata_update() {
     assert_eq!(updated.metadata["nested"]["a"], 1);
 
     // Cleanup
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1054,7 +1193,11 @@ async fn test_multiple_projects_in_workspace() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create multiple projects
     let mut project_ids = Vec::new();
@@ -1070,9 +1213,9 @@ async fn test_multiple_projects_in_workspace() {
             analytics_computed_at: None,
             last_co_change_computed_at: None,
         };
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
         state
-            .neo4j
+            .indentiagraph
             .add_project_to_workspace(workspace.id, project.id)
             .await
             .unwrap();
@@ -1081,7 +1224,7 @@ async fn test_multiple_projects_in_workspace() {
 
     // Verify all projects are associated
     let projects = state
-        .neo4j
+        .indentiagraph
         .list_workspace_projects(workspace.id)
         .await
         .unwrap();
@@ -1089,13 +1232,13 @@ async fn test_multiple_projects_in_workspace() {
 
     // Remove one project
     state
-        .neo4j
+        .indentiagraph
         .remove_project_from_workspace(workspace.id, project_ids[0])
         .await
         .unwrap();
 
     let remaining = state
-        .neo4j
+        .indentiagraph
         .list_workspace_projects(workspace.id)
         .await
         .unwrap();
@@ -1104,12 +1247,16 @@ async fn test_multiple_projects_in_workspace() {
     // Cleanup
     for id in project_ids {
         state
-            .neo4j
+            .indentiagraph
             .delete_project(id, "test-project")
             .await
             .unwrap();
     }
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1136,7 +1283,11 @@ async fn test_resource_all_types() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Test each resource type
     let resource_types = vec![
@@ -1168,13 +1319,17 @@ async fn test_resource_all_types() {
             updated_at: None,
             metadata: serde_json::json!({}),
         };
-        state.neo4j.create_resource(&resource).await.unwrap();
+        state
+            .indentiagraph
+            .create_resource(&resource)
+            .await
+            .unwrap();
         resource_ids.push(resource.id);
     }
 
     // Verify all created
     let resources = state
-        .neo4j
+        .indentiagraph
         .list_workspace_resources(workspace.id)
         .await
         .unwrap();
@@ -1182,9 +1337,13 @@ async fn test_resource_all_types() {
 
     // Cleanup
     for id in resource_ids {
-        state.neo4j.delete_resource(id).await.unwrap();
+        state.indentiagraph.delete_resource(id).await.unwrap();
     }
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1211,7 +1370,11 @@ async fn test_component_all_types() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Test each component type
     let component_types = vec![
@@ -1239,19 +1402,31 @@ async fn test_component_all_types() {
             created_at: chrono::Utc::now(),
             tags: vec![],
         };
-        state.neo4j.create_component(&component).await.unwrap();
+        state
+            .indentiagraph
+            .create_component(&component)
+            .await
+            .unwrap();
         component_ids.push(component.id);
     }
 
     // Verify all created
-    let components = state.neo4j.list_components(workspace.id).await.unwrap();
+    let components = state
+        .indentiagraph
+        .list_components(workspace.id)
+        .await
+        .unwrap();
     assert_eq!(components.len(), 9);
 
     // Cleanup
     for id in component_ids {
-        state.neo4j.delete_component(id).await.unwrap();
+        state.indentiagraph.delete_component(id).await.unwrap();
     }
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }
 
 // ============================================================================
@@ -1278,7 +1453,11 @@ async fn test_complex_component_topology() {
         updated_at: None,
         metadata: serde_json::json!({}),
     };
-    state.neo4j.create_workspace(&workspace).await.unwrap();
+    state
+        .indentiagraph
+        .create_workspace(&workspace)
+        .await
+        .unwrap();
 
     // Create components: Gateway -> API -> DB, Cache
     let gateway = ComponentNode {
@@ -1292,7 +1471,11 @@ async fn test_complex_component_topology() {
         created_at: chrono::Utc::now(),
         tags: vec![],
     };
-    state.neo4j.create_component(&gateway).await.unwrap();
+    state
+        .indentiagraph
+        .create_component(&gateway)
+        .await
+        .unwrap();
 
     let api = ComponentNode {
         id: Uuid::new_v4(),
@@ -1305,7 +1488,7 @@ async fn test_complex_component_topology() {
         created_at: chrono::Utc::now(),
         tags: vec![],
     };
-    state.neo4j.create_component(&api).await.unwrap();
+    state.indentiagraph.create_component(&api).await.unwrap();
 
     let db = ComponentNode {
         id: Uuid::new_v4(),
@@ -1318,7 +1501,7 @@ async fn test_complex_component_topology() {
         created_at: chrono::Utc::now(),
         tags: vec![],
     };
-    state.neo4j.create_component(&db).await.unwrap();
+    state.indentiagraph.create_component(&db).await.unwrap();
 
     let cache = ComponentNode {
         id: Uuid::new_v4(),
@@ -1331,28 +1514,28 @@ async fn test_complex_component_topology() {
         created_at: chrono::Utc::now(),
         tags: vec![],
     };
-    state.neo4j.create_component(&cache).await.unwrap();
+    state.indentiagraph.create_component(&cache).await.unwrap();
 
     // Create dependencies
     state
-        .neo4j
+        .indentiagraph
         .add_component_dependency(gateway.id, api.id, Some("http".to_string()), true)
         .await
         .unwrap();
     state
-        .neo4j
+        .indentiagraph
         .add_component_dependency(api.id, db.id, Some("postgres".to_string()), true)
         .await
         .unwrap();
     state
-        .neo4j
+        .indentiagraph
         .add_component_dependency(api.id, cache.id, Some("redis".to_string()), false)
         .await
         .unwrap();
 
     // Get full topology
     let topology = state
-        .neo4j
+        .indentiagraph
         .get_workspace_topology(workspace.id)
         .await
         .unwrap();
@@ -1374,9 +1557,21 @@ async fn test_complex_component_topology() {
     assert_eq!(db_entry.2.len(), 0);
 
     // Cleanup
-    state.neo4j.delete_component(gateway.id).await.unwrap();
-    state.neo4j.delete_component(api.id).await.unwrap();
-    state.neo4j.delete_component(db.id).await.unwrap();
-    state.neo4j.delete_component(cache.id).await.unwrap();
-    state.neo4j.delete_workspace(workspace.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_component(gateway.id)
+        .await
+        .unwrap();
+    state.indentiagraph.delete_component(api.id).await.unwrap();
+    state.indentiagraph.delete_component(db.id).await.unwrap();
+    state
+        .indentiagraph
+        .delete_component(cache.id)
+        .await
+        .unwrap();
+    state
+        .indentiagraph
+        .delete_workspace(workspace.id)
+        .await
+        .unwrap();
 }

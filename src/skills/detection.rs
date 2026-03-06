@@ -324,7 +324,7 @@ pub fn deduplicate_candidates(
 ///
 /// Returns the list of created or updated SkillNode IDs.
 pub async fn persist_detected_skills(
-    graph_store: &dyn crate::neo4j::traits::GraphStore,
+    graph_store: &dyn crate::indentiagraph::traits::GraphStore,
     outcomes: &[DeduplicationOutcome],
     notes: &HashMap<String, crate::notes::Note>,
     project_id: Uuid,
@@ -613,7 +613,7 @@ pub struct DetectSkillsPipelineResult {
 /// This function is idempotent — re-running updates existing skills
 /// rather than creating duplicates.
 pub async fn detect_skills_pipeline(
-    graph_store: &dyn crate::neo4j::traits::GraphStore,
+    graph_store: &dyn crate::indentiagraph::traits::GraphStore,
     project_id: Uuid,
     config: &SkillDetectionConfig,
 ) -> anyhow::Result<DetectSkillsPipelineResult> {
@@ -1006,6 +1006,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            valid_at: None,
+            invalid_at: None,
         }
     }
 
@@ -1061,26 +1063,26 @@ mod tests {
                 "00000000-0000-0000-0000-000000000001",
                 0.5,
                 crate::notes::NoteImportance::Medium,
-                vec!["neo4j", "cypher"],
+                vec!["indentiagraph", "cypher"],
             ),
             make_test_note(
                 "00000000-0000-0000-0000-000000000002",
                 0.5,
                 crate::notes::NoteImportance::Medium,
-                vec!["neo4j", "graph"],
+                vec!["indentiagraph", "graph"],
             ),
             make_test_note(
                 "00000000-0000-0000-0000-000000000003",
                 0.5,
                 crate::notes::NoteImportance::Medium,
-                vec!["neo4j"],
+                vec!["indentiagraph"],
             ),
         ];
 
         let skill = cluster_to_skill(&candidate, &notes, uuid::Uuid::nil(), 10);
         assert!(
-            skill.name.contains("Neo4j"),
-            "Expected 'Neo4j' in skill name '{}'",
+            skill.name.contains("IndentiaGraph"),
+            "Expected 'IndentiaGraph' in skill name '{}'",
             skill.name
         );
     }
@@ -1219,9 +1221,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipeline_runs_auto_anchor_prelude() {
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::{FileNode, ProjectNode};
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::{FileNode, ProjectNode};
+        use crate::indentiagraph::traits::GraphStore;
         use crate::notes::models::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
         use chrono::Utc;
 
@@ -1275,6 +1277,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            valid_at: None,
+            invalid_at: None,
         };
         store.create_note(&note).await.unwrap();
 
@@ -1414,7 +1418,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipeline_auto_anchor_no_project_still_works() {
-        use crate::neo4j::mock::MockGraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
 
         let store = MockGraphStore::new();
         let fake_project_id = Uuid::new_v4();

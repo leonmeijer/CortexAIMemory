@@ -1069,7 +1069,7 @@ pub fn compute_all_extended(
 
     // --- Step 10: Topology Rule Check (post-validation) ---
     let (_topo_result, topo_timing) = timed_step("topology_check", || {
-        // TODO(Plan 3): check_topology_rules(project_id) — requires Neo4j, not in-memory
+        // TODO(Plan 3): check_topology_rules(project_id) — requires IndentiaGraph, not in-memory
         grail_stats.violations_found = 0;
         Ok(())
     });
@@ -1287,7 +1287,7 @@ fn normalized_shannon_entropy(counts: &[usize]) -> f64 {
 /// Uses log-percentiles for power-law metrics (degree, pagerank) and
 /// linear percentiles for uniform metrics (betweenness, type_count).
 ///
-/// Dimensions requiring Neo4j-only data (d9: avg_complexity, d10: ratio_public,
+/// Dimensions requiring IndentiaGraph-only data (d9: avg_complexity, d10: ratio_public,
 /// d11: ratio_async) are set to 0.0 and enriched later in the pipeline.
 pub fn compute_structural_fingerprint(
     graph: &CodeGraph,
@@ -1309,7 +1309,7 @@ pub fn compute_structural_fingerprint(
         function_count: f64,
         type_count: f64,
         // d9 (avg_complexity), d10 (ratio_public), d11 (ratio_async) = 0.0
-        // (enriched from Neo4j in pipeline step)
+        // (enriched from IndentiaGraph in pipeline step)
         fan_ratio: f64,
         co_changer_count: f64,
         community_role_raw: f64,      // will be encoded as 0.0/0.5/1.0
@@ -1487,12 +1487,12 @@ pub fn compute_structural_fingerprint(
         fingerprint[5] = betweenness_pct[i];
         fingerprint[6] = raw_metrics[i].clustering; // raw 0-1
 
-        // d7-d8: code content (d9 = avg_complexity left at 0.0, enriched from Neo4j)
+        // d7-d8: code content (d9 = avg_complexity left at 0.0, enriched from IndentiaGraph)
         fingerprint[7] = function_count_pct[i];
         fingerprint[8] = type_count_pct[i];
         // fingerprint[9] = 0.0; // avg_complexity_pct — enriched later
 
-        // d10-d11: code style (left at 0.0, enriched from Neo4j)
+        // d10-d11: code style (left at 0.0, enriched from IndentiaGraph)
         // fingerprint[10] = 0.0; // ratio_public — enriched later
         // fingerprint[11] = 0.0; // ratio_async — enriched later
 

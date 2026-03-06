@@ -265,10 +265,10 @@
         <span class="check-label">Docker Desktop</span>
       </div>
     </div>
-    <div class="check-item" id="check-neo4j">
+    <div class="check-item" id="check-indentiagraph">
       <div class="check-icon"><div class="spinner"></div></div>
       <div class="check-content">
-        <span class="check-label">Neo4j</span>
+        <span class="check-label">IndentiaGraph</span>
       </div>
     </div>
     <div class="check-item" id="check-meilisearch">
@@ -457,7 +457,7 @@
         if (deps.infraMode === 'external') {
           // External mode: skip Docker, but check service connectivity
           setCheck('check-docker', 'skipped', 'External mode');
-          setCheck('check-neo4j', '', 'Checking connectivity...');
+          setCheck('check-indentiagraph', '', 'Checking connectivity...');
           setCheck('check-meilisearch', '', 'Checking connectivity...');
           setCheck('check-nats', '', 'Checking connectivity...');
           setStatus('Checking services...');
@@ -469,7 +469,7 @@
         if (!deps.setupCompleted) {
           // Backend runs in minimal mode (no DB), skip service checks
           setCheck('check-docker', 'skipped', 'Setup pending');
-          setCheck('check-neo4j', 'skipped', 'Setup pending');
+          setCheck('check-indentiagraph', 'skipped', 'Setup pending');
           setCheck('check-meilisearch', 'skipped', 'Setup pending');
           setCheck('check-nats', 'skipped', 'Setup pending');
           setStatus('Starting backend (setup mode)...');
@@ -486,7 +486,7 @@
         setCheck('check-config', 'warning');
         setCheck('check-claude', 'warning', 'Could not check');
         setCheck('check-docker', 'warning', 'Could not check');
-        setCheck('check-neo4j', 'warning');
+        setCheck('check-indentiagraph', 'warning');
         setCheck('check-meilisearch', 'warning');
         setCheck('check-nats', 'warning');
         setStatus('Starting backend...');
@@ -509,7 +509,7 @@
         // Docker Desktop is installed but daemon is not running
         setCheck('check-docker', 'warning', 'Docker Desktop is not running',
           `<button class="check-action" onclick="invoke('open_docker_desktop').catch(()=>{})">Open</button>`);
-        setCheck('check-neo4j', '', 'Waiting for Docker...');
+        setCheck('check-indentiagraph', '', 'Waiting for Docker...');
         setCheck('check-meilisearch', '', 'Waiting for Docker...');
         setCheck('check-nats', '', 'Waiting for Docker...');
         setStatus('Please start Docker Desktop');
@@ -521,7 +521,7 @@
         // Docker not installed
         setCheck('check-docker', 'error', 'Docker is required to run services',
           `<button class="check-action" onclick="installDocker()">Install</button>`);
-        setCheck('check-neo4j', 'error', 'Requires Docker');
+        setCheck('check-indentiagraph', 'error', 'Requires Docker');
         setCheck('check-meilisearch', 'error', 'Requires Docker');
         setCheck('check-nats', 'error', 'Requires Docker');
         setStatus('Docker is required');
@@ -585,14 +585,14 @@
     // ========================================================================
 
     async function startServices(deps) {
-      setCheck('check-neo4j', '', 'Starting...');
+      setCheck('check-indentiagraph', '', 'Starting...');
       setCheck('check-meilisearch', '', 'Starting...');
       setCheck('check-nats', '', 'Starting...');
       setStatus('Starting services...');
 
       // Build config for start_docker_services
       const config = {
-        neo4jPassword: deps.neo4jPassword || '',
+        indentiagraphPassword: deps.indentiagraphPassword || '',
         meilisearchKey: deps.meilisearchKey || '',
         natsEnabled: true,
       };
@@ -620,7 +620,7 @@
       const serviceStartTime = Date.now();
       const SERVICE_TIMEOUT = 60000; // 60s per-service warning
 
-      let neo4jReady = false;
+      let indentiagraphReady = false;
       let meiliReady = false;
       let natsReady = false;
 
@@ -628,20 +628,20 @@
         try {
           const health = await invoke('check_services_health', { natsEnabled: true });
 
-          // -- Neo4j --
-          if (!neo4jReady) {
-            if (health.neo4j === 'healthy') {
-              setCheck('check-neo4j', 'success');
-              neo4jReady = true;
-            } else if (health.neo4j === 'starting' || health.neo4j === 'notrunning') {
+          // -- IndentiaGraph --
+          if (!indentiagraphReady) {
+            if (health.indentiagraph === 'healthy') {
+              setCheck('check-indentiagraph', 'success');
+              indentiagraphReady = true;
+            } else if (health.indentiagraph === 'starting' || health.indentiagraph === 'notrunning') {
               const elapsed = Date.now() - serviceStartTime;
               if (elapsed > SERVICE_TIMEOUT) {
-                setCheck('check-neo4j', 'warning', 'Taking longer than expected...');
+                setCheck('check-indentiagraph', 'warning', 'Taking longer than expected...');
               } else {
-                setCheck('check-neo4j', '', 'Starting...');
+                setCheck('check-indentiagraph', '', 'Starting...');
               }
-            } else if (health.neo4j === 'unhealthy') {
-              setCheck('check-neo4j', 'error', 'Unhealthy');
+            } else if (health.indentiagraph === 'unhealthy') {
+              setCheck('check-indentiagraph', 'error', 'Unhealthy');
             }
           }
 
@@ -678,7 +678,7 @@
           }
 
           // All services ready?
-          if (neo4jReady && meiliReady && natsReady) {
+          if (indentiagraphReady && meiliReady && natsReady) {
             setStatus('Services ready, starting backend...');
             await pollBackendHealth();
             return;
@@ -742,9 +742,9 @@
           if (health) {
             // Update service statuses from the enriched /health response
             if (health.services) {
-              setCheck('check-neo4j',
-                health.services.neo4j === 'connected' ? 'success' : 'error',
-                health.services.neo4j === 'connected' ? 'Connected' : 'Unreachable');
+              setCheck('check-indentiagraph',
+                health.services.indentiagraph === 'connected' ? 'success' : 'error',
+                health.services.indentiagraph === 'connected' ? 'Connected' : 'Unreachable');
               setCheck('check-meilisearch',
                 health.services.meilisearch === 'connected' ? 'success' : 'error',
                 health.services.meilisearch === 'connected' ? 'Connected' : 'Unreachable');
@@ -760,7 +760,7 @@
               }
             } else {
               // Fallback for old /health format (no services field)
-              setCheck('check-neo4j', 'skipped', 'Status unavailable');
+              setCheck('check-indentiagraph', 'skipped', 'Status unavailable');
               setCheck('check-meilisearch', 'skipped', 'Status unavailable');
               setCheck('check-nats', 'skipped', 'Status unavailable');
             }

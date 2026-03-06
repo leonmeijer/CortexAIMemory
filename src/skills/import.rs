@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use uuid::Uuid;
 
-use crate::neo4j::traits::GraphStore;
+use crate::indentiagraph::traits::GraphStore;
 use crate::notes::models::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::skills::models::{SkillNode, SkillStatus};
 use crate::skills::package::{validate_package, PortableDecision, SkillPackage};
@@ -387,6 +387,8 @@ fn portable_note_to_note(
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        valid_at: None,
+        invalid_at: None,
     })
 }
 
@@ -441,6 +443,8 @@ fn decision_to_note(
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        valid_at: None,
+        invalid_at: None,
     })
 }
 
@@ -481,7 +485,7 @@ async fn create_import_synapses(graph_store: &dyn GraphStore, note_ids: &[Uuid])
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::mock::MockGraphStore;
+    use crate::indentiagraph::mock::MockGraphStore;
     use crate::skills::models::SkillTrigger;
     use crate::skills::package::*;
 
@@ -501,11 +505,11 @@ mod tests {
                 },
             },
             skill: PortableSkill {
-                name: "Neo4j Performance".to_string(),
+                name: "IndentiaGraph Performance".to_string(),
                 description: "Query optimization knowledge".to_string(),
-                trigger_patterns: vec![SkillTrigger::regex("neo4j|cypher", 0.7)],
+                trigger_patterns: vec![SkillTrigger::regex("indentiagraph|cypher", 0.7)],
                 context_template: None,
-                tags: vec!["neo4j".to_string()],
+                tags: vec!["indentiagraph".to_string()],
                 cohesion: 0.75,
             },
             notes: vec![
@@ -513,20 +517,20 @@ mod tests {
                     note_type: "guideline".to_string(),
                     importance: "high".to_string(),
                     content: "Always use UNWIND for batch operations".to_string(),
-                    tags: vec!["neo4j".to_string()],
+                    tags: vec!["indentiagraph".to_string()],
                 },
                 PortableNote {
                     note_type: "gotcha".to_string(),
                     importance: "critical".to_string(),
                     content: "Connection pool leak if not closed".to_string(),
-                    tags: vec!["neo4j".to_string()],
+                    tags: vec!["indentiagraph".to_string()],
                 },
             ],
             decisions: vec![PortableDecision {
-                description: "Use Neo4j 5.x driver".to_string(),
+                description: "Use IndentiaGraph 5.x driver".to_string(),
                 rationale: "Better async support".to_string(),
-                alternatives: vec!["Neo4j 4.x".to_string()],
-                chosen_option: Some("neo4j-rust-driver 0.8".to_string()),
+                alternatives: vec!["IndentiaGraph 4.x".to_string()],
+                chosen_option: Some("indentiagraph-rust-driver 0.8".to_string()),
             }],
         }
     }
@@ -550,7 +554,7 @@ mod tests {
 
         // Verify the skill was created
         let skill = store.get_skill(result.skill_id).await.unwrap().unwrap();
-        assert_eq!(skill.name, "Neo4j Performance");
+        assert_eq!(skill.name, "IndentiaGraph Performance");
         assert_eq!(skill.status, SkillStatus::Imported);
         assert!(skill.imported_at.is_some());
         assert!(!skill.is_validated);
@@ -594,7 +598,7 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Create an existing skill with the same name
-        let existing = SkillNode::new(project_id, "Neo4j Performance");
+        let existing = SkillNode::new(project_id, "IndentiaGraph Performance");
         store.create_skill(&existing).await.unwrap();
 
         // Try to import — should fail with Skip strategy
@@ -610,7 +614,7 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Create an existing skill with the same name
-        let existing = SkillNode::new(project_id, "Neo4j Performance");
+        let existing = SkillNode::new(project_id, "IndentiaGraph Performance");
         let existing_id = existing.id;
         store.create_skill(&existing).await.unwrap();
 
@@ -636,7 +640,7 @@ mod tests {
         let project_id = Uuid::new_v4();
 
         // Create an existing skill
-        let existing = SkillNode::new(project_id, "Neo4j Performance");
+        let existing = SkillNode::new(project_id, "IndentiaGraph Performance");
         let old_id = existing.id;
         store.create_skill(&existing).await.unwrap();
 

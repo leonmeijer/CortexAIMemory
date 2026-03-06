@@ -21,7 +21,7 @@
 
 use crate::auth::jwt::Claims;
 use crate::auth::refresh;
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::GraphStore;
 use crate::AuthConfig;
 use axum::extract::ws::{Message, WebSocket};
 use std::collections::HashMap;
@@ -133,7 +133,7 @@ pub enum CookieAuthResult {
 pub async fn ws_authenticate(
     headers: &axum::http::HeaderMap,
     auth_config: &Option<AuthConfig>,
-    neo4j: &Arc<dyn GraphStore>,
+    indentiagraph: &Arc<dyn GraphStore>,
     ticket: Option<&str>,
     ticket_store: &Arc<WsTicketStore>,
 ) -> CookieAuthResult {
@@ -147,7 +147,7 @@ pub async fn ws_authenticate(
     };
 
     // 2. Try cookie first (primary path — works in normal browsers)
-    let cookie_result = try_cookie_auth(headers, config, neo4j).await;
+    let cookie_result = try_cookie_auth(headers, config, indentiagraph).await;
     if let Some(result) = cookie_result {
         return result;
     }
@@ -175,7 +175,7 @@ pub async fn ws_authenticate(
 async fn try_cookie_auth(
     headers: &axum::http::HeaderMap,
     config: &AuthConfig,
-    neo4j: &Arc<dyn GraphStore>,
+    indentiagraph: &Arc<dyn GraphStore>,
 ) -> Option<CookieAuthResult> {
     // Extract cookie from HTTP headers
     let cookie_header = headers
@@ -186,7 +186,7 @@ async fn try_cookie_auth(
 
     // Validate the refresh token in DB (checks expiry + revoked)
     let token_hash = refresh::hash_token(&raw_token);
-    let token_node = match neo4j.validate_refresh_token(&token_hash).await {
+    let token_node = match indentiagraph.validate_refresh_token(&token_hash).await {
         Ok(Some(node)) => node,
         Ok(None) => {
             warn!("WS cookie auth: invalid or expired refresh token");
@@ -204,10 +204,10 @@ async fn try_cookie_auth(
     };
 
     // Look up user info to build Claims
-    let (user_id, email, name) = match neo4j.get_user_by_id(token_node.user_id).await {
+    let (user_id, email, name) = match indentiagraph.get_user_by_id(token_node.user_id).await {
         Ok(Some(user)) => (user.id, user.email, user.name),
         Ok(None) => {
-            // Root account fallback — root users are not stored in Neo4j
+            // Root account fallback — root users are not stored in IndentiaGraph
             if let Some(ref root) = config.root_account {
                 let root_id = Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes());
                 if root_id == token_node.user_id {
@@ -347,7 +347,7 @@ pub async fn wait_ready_then_auth_ok(socket: &mut WebSocket, claims: &Claims) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::mock::MockGraphStore;
+    use crate::indentiagraph::mock::MockGraphStore;
     use crate::test_helpers::test_auth_config;
     use axum::http::HeaderMap;
 
@@ -356,7 +356,7 @@ mod tests {
         Arc::new(WsTicketStore::new())
     }
 
-    /// Create a mock Neo4j with a user and a valid refresh token.
+    /// Create a mock IndentiaGraph with a user and a valid refresh token.
     /// Returns (mock, user_id, raw_token).
     async fn setup_mock_with_user_and_token() -> (Arc<MockGraphStore>, Uuid, String) {
         let mock = Arc::new(MockGraphStore::new());

@@ -1,0 +1,28 @@
+[Unit]
+Description=Cortex AI Memory — AI agent orchestrator
+Documentation=https://github.com/this-rs/cortex-ai-memory
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=simple
+User=cortex
+Group=cortex
+ExecStart=/usr/bin/cortex serve
+WorkingDirectory=/var/lib/cortex
+EnvironmentFile=-/etc/cortex/env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cortex
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/cortex
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

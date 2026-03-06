@@ -36,8 +36,8 @@ Clone and start the orchestrator:
 git clone https://github.com/this-rs/project-orchestrator.git
 cd project-orchestrator
 
-# Start Neo4j and Meilisearch
-docker compose up -d neo4j meilisearch
+# Start IndentiaGraph and Meilisearch
+docker compose up -d indentiagraph meilisearch
 
 # Wait for services to be healthy (about 30 seconds)
 docker compose ps
@@ -47,7 +47,7 @@ You should see both services as "healthy":
 
 ```
 NAME                    STATUS
-orchestrator-neo4j      running (healthy)
+orchestrator-indentiagraph      running (healthy)
 orchestrator-meilisearch running (healthy)
 ```
 
@@ -87,9 +87,9 @@ Create or edit `~/.claude/mcp.json`:
     "project-orchestrator": {
       "command": "/full/path/to/mcp_server",
       "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "orchestrator123",
+        "INDENTIAGRAPH_URI": "ws://localhost:8000",
+        "INDENTIAGRAPH_USER": "indentiagraph",
+        "INDENTIAGRAPH_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
         "MEILISEARCH_KEY": "orchestrator-meili-key-change-me"
       }
@@ -110,9 +110,9 @@ Add to your Cursor `settings.json`:
     "project-orchestrator": {
       "command": "/full/path/to/mcp_server",
       "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "orchestrator123",
+        "INDENTIAGRAPH_URI": "ws://localhost:8000",
+        "INDENTIAGRAPH_USER": "indentiagraph",
+        "INDENTIAGRAPH_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
         "MEILISEARCH_KEY": "orchestrator-meili-key-change-me"
       }
@@ -502,7 +502,7 @@ Sync the {project} project
 Check services are running:
 ```bash
 docker compose ps
-docker compose logs neo4j
+docker compose logs indentiagraph
 docker compose logs meilisearch
 ```
 

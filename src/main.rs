@@ -1,6 +1,6 @@
-//! Project Orchestrator - Main Server
+//! CortexAIMemory - Main Server
 //!
-//! An AI agent orchestrator with Neo4j, Meilisearch, and Tree-sitter.
+//! AI memory and orchestration with graph storage and Tree-sitter.
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -9,8 +9,8 @@ use std::path::PathBuf;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
-#[command(name = "orchestrator")]
-#[command(about = "AI Agent Orchestrator Server")]
+#[command(name = "cortex")]
+#[command(about = "CortexAIMemory server")]
 struct Cli {
     /// Path to config.yaml (default: auto-detect)
     #[arg(short, long, global = true)]
@@ -22,7 +22,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Start the orchestrator server
+    /// Start the Cortex server
     Serve {
         /// Port to listen on
         #[arg(short, long, default_value = "8080")]
@@ -140,7 +140,7 @@ fn run_setup_claude(url: Option<&str>, port: u16) {
         Ok(setup_claude::SetupResult::AlreadyConfigured {
             allowed_tools_configured,
         }) => {
-            println!("  Project Orchestrator is already configured in Claude Code.");
+            println!("  Cortex is already configured in Claude Code.");
             if allowed_tools_configured {
                 println!("  MCP tools pre-approved in settings.json.");
             } else {
@@ -153,14 +153,14 @@ fn run_setup_claude(url: Option<&str>, port: u16) {
             eprintln!();
             eprintln!("  You can configure it manually:");
             eprintln!(
-                "    claude mcp add project-orchestrator --transport sse --url {}",
+                "    claude mcp add cortex --transport sse --url {}",
                 fallback_url
             );
             eprintln!();
             eprintln!("  Or add to ~/.claude/mcp.json:");
             eprintln!("    {{");
             eprintln!("      \"mcpServers\": {{");
-            eprintln!("        \"project-orchestrator\": {{");
+            eprintln!("        \"cortex\": {{");
             eprintln!("          \"type\": \"sse\",");
             eprintln!("          \"url\": \"{}\"", fallback_url);
             eprintln!("        }}");
@@ -205,7 +205,7 @@ async fn run_update(check_only: bool) -> Result<()> {
 
     if check_only {
         println!();
-        println!("Run `orchestrator update` to install this update.");
+        println!("Run `cortex update` to install this update.");
         return Ok(());
     }
 
@@ -227,7 +227,7 @@ async fn run_update(check_only: bool) -> Result<()> {
     match update::perform_update(&info).await? {
         update::UpdateStatus::Updated { from, to } => {
             println!("  Successfully updated from v{} to v{}!", from, to);
-            println!("  Please restart orchestrator to use the new version.");
+            println!("  Please restart cortex to use the new version.");
         }
         update::UpdateStatus::AlreadyUpToDate => {
             println!("  Already up to date.");

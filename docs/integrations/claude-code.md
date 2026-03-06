@@ -45,9 +45,9 @@ Add the following to your `mcp.json`:
     "project-orchestrator": {
       "command": "/path/to/mcp_server",
       "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "orchestrator123",
+        "INDENTIAGRAPH_URI": "ws://localhost:8000",
+        "INDENTIAGRAPH_USER": "indentiagraph",
+        "INDENTIAGRAPH_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
         "MEILISEARCH_KEY": "orchestrator-meili-key-change-me"
       }
@@ -68,9 +68,9 @@ You can also pass configuration via arguments:
     "project-orchestrator": {
       "command": "/path/to/mcp_server",
       "args": [
-        "--neo4j-uri", "bolt://localhost:7687",
-        "--neo4j-user", "neo4j",
-        "--neo4j-password", "orchestrator123",
+        "--indentiagraph-uri", "ws://localhost:8000",
+        "--indentiagraph-user", "indentiagraph",
+        "--indentiagraph-password", "orchestrator123",
         "--meilisearch-url", "http://localhost:7700",
         "--meilisearch-key", "orchestrator-meili-key-change-me"
       ]
@@ -380,7 +380,7 @@ Add `RUST_LOG=debug` to your MCP configuration:
       "command": "/path/to/mcp_server",
       "env": {
         "RUST_LOG": "debug",
-        "NEO4J_URI": "bolt://localhost:7687",
+        "INDENTIAGRAPH_URI": "ws://localhost:8000",
         ...
       }
     }
@@ -398,7 +398,7 @@ Ensure the backend services are running:
 
 ```bash
 docker compose ps
-docker compose up -d neo4j meilisearch
+docker compose up -d indentiagraph meilisearch
 ```
 
 **"Tool not found" errors**
@@ -436,9 +436,9 @@ MCP server logs go to stderr. To capture them:
     "project-orchestrator": {
       "command": "/Users/me/.local/bin/mcp_server",
       "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "orchestrator123",
+        "INDENTIAGRAPH_URI": "ws://localhost:8000",
+        "INDENTIAGRAPH_USER": "indentiagraph",
+        "INDENTIAGRAPH_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
         "MEILISEARCH_KEY": "orchestrator-meili-key-change-me",
         "NATS_URL": "nats://localhost:4222",

@@ -1,6 +1,6 @@
 ---
 name: project-orchestrator
-description: AI agent orchestrator with Neo4j knowledge graph, Meilisearch search, and Tree-sitter parsing. Use for coordinating multiple coding agents on complex projects with shared context and plans.
+description: AI agent orchestrator with IndentiaGraph knowledge graph, Meilisearch search, and Tree-sitter parsing. Use for coordinating multiple coding agents on complex projects with shared context and plans.
 metadata:
   clawdbot:
     emoji: "🎯"
@@ -15,7 +15,7 @@ Coordinate multiple AI coding agents with a shared knowledge base.
 ## Features
 
 - **Multi-Project Support**: Manage multiple codebases with isolated data
-- **Neo4j Knowledge Graph**: Code structure, relationships, plans, decisions
+- **IndentiaGraph Knowledge Graph**: Code structure, relationships, plans, decisions
 - **Meilisearch**: Fast semantic search across code and decisions
 - **Tree-sitter**: Precise code parsing for 16 languages
 - **Plan Management**: Structured tasks with dependencies and constraints
@@ -231,7 +231,7 @@ curl "http://localhost:8080/api/code/symbols/src%2Flib.rs"
 curl "http://localhost:8080/api/code/references?symbol=AppState&limit=20"
 
 # Get file dependencies (imports and dependents)
-curl "http://localhost:8080/api/code/dependencies/src%2Fneo4j%2Fclient.rs"
+curl "http://localhost:8080/api/code/dependencies/src%2Findentiagraph%2Fclient.rs"
 
 # Get call graph for a function
 curl "http://localhost:8080/api/code/callgraph?function=handle_request&depth=2&direction=both"
@@ -254,7 +254,7 @@ curl "http://localhost:8080/api/code/trait-impls?trait_name=Module"
 curl "http://localhost:8080/api/code/type-traits?type_name=Orchestrator"
 
 # Get all impl blocks for a type
-curl "http://localhost:8080/api/code/impl-blocks?type_name=Neo4jClient"
+curl "http://localhost:8080/api/code/impl-blocks?type_name=IndentiaGraphClient"
 ```
 
 ## For Agents
@@ -296,9 +296,9 @@ Environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI |
-| `NEO4J_USER` | `neo4j` | Neo4j username |
-| `NEO4J_PASSWORD` | `orchestrator123` | Neo4j password |
+| `INDENTIAGRAPH_URI` | `ws://localhost:8000` | IndentiaGraph connection URI |
+| `INDENTIAGRAPH_USER` | `indentiagraph` | IndentiaGraph username |
+| `INDENTIAGRAPH_PASSWORD` | `orchestrator123` | IndentiaGraph password |
 | `MEILISEARCH_URL` | `http://localhost:7700` | Meilisearch URL |
 | `MEILISEARCH_KEY` | `orchestrator-meili-key-change-me` | Meilisearch API key |
 | `WORKSPACE_PATH` | `.` | Default workspace path |
@@ -316,7 +316,7 @@ Environment variables:
         ┌─────────────────────┼─────────────────────┐
         ▼                     ▼                     ▼
 ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
-│    NEO4J      │     │  MEILISEARCH  │     │  TREE-SITTER  │
+│    INDENTIAGRAPH      │     │  MEILISEARCH  │     │  TREE-SITTER  │
 │   (7687)      │     │    (7700)     │     │   (in-proc)   │
 │               │     │               │     │               │
 │ • Code graph  │     │ • Code search │     │ • AST parsing │

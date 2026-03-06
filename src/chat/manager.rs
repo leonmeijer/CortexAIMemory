@@ -5,8 +5,8 @@
 //! Architecture:
 //! - Each session spawns an `InteractiveClient` (Nexus SDK) subprocess
 //! - Messages are streamed via `broadcast::channel` to WebSocket subscribers
-//! - Structured events are persisted in Neo4j with sequence numbers for replay
-//! - Inactive sessions are persisted in Neo4j with `cli_session_id` for resume
+//! - Structured events are persisted in IndentiaGraph with sequence numbers for replay
+//! - Inactive sessions are persisted in IndentiaGraph with `cli_session_id` for resume
 //! - A cleanup task periodically closes timed-out sessions
 
 use super::config::ChatConfig;
@@ -15,15 +15,16 @@ use super::types::{
     classify_api_error, truncate_snippet, ChatEvent, ChatEventPage, ChatRequest,
     CreateSessionResponse, MessageSearchHit, MessageSearchResult,
 };
-use crate::meilisearch::SearchStore;
-use crate::neo4j::models::ChatEventRecord;
-use crate::neo4j::models::ChatSessionNode;
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::models::ChatEventRecord;
+use crate::indentiagraph::models::ChatSessionNode;
+use crate::indentiagraph::GraphStore;
 use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
+#[cfg(feature = "nexus-memory")]
+use nexus_claude::memory::ContextInjector;
 use nexus_claude::{
     build_hook_response_json, dispatch_hook_from_registry, is_hook_callback,
-    memory::{ContextInjector, ConversationMemoryManager, MemoryConfig},
+    memory::{ConversationMemoryManager, MemoryConfig, MessageDocument},
     ClaudeCodeOptions, ContentBlock, ContentValue, InteractiveClient, McpServerConfig, Message,
     PermissionMode, StreamDelta, StreamEventData,
 };
@@ -38,6 +39,20 @@ use uuid::Uuid;
 
 use crate::expand_tilde;
 use nexus_claude::ToolsConfig;
+
+#[cfg(not(feature = "nexus-memory"))]
+pub(crate) struct ContextInjector;
+
+#[cfg(not(feature = "nexus-memory"))]
+impl ContextInjector {
+    async fn new(_config: MemoryConfig) -> Result<Self> {
+        bail!("nexus-memory feature is disabled");
+    }
+
+    async fn store_messages(&self, _messages: &[MessageDocument]) -> Result<()> {
+        Ok(())
+    }
+}
 
 /// Broadcast channel buffer size for WebSocket subscribers
 const BROADCAST_BUFFER: usize = 256;
@@ -129,8 +144,6 @@ pub(crate) struct RuntimeEnvConfig {
 /// Manages chat sessions and their lifecycle
 pub struct ChatManager {
     pub(crate) graph: Arc<dyn GraphStore>,
-    #[allow(dead_code)]
-    pub(crate) search: Arc<dyn SearchStore>,
     pub(crate) config: ChatConfig,
     pub(crate) active_sessions: Arc<RwLock<HashMap<String, ActiveSession>>>,
     /// Nexus memory injector for conversation persistence
@@ -219,12 +232,8 @@ impl nexus_claude::HookCallback for CompactionNotifier {
 }
 
 impl ChatManager {
-    /// Create a ChatManager without memory support (for tests or when Meilisearch is unavailable)
-    pub fn new_without_memory(
-        graph: Arc<dyn GraphStore>,
-        search: Arc<dyn SearchStore>,
-        config: ChatConfig,
-    ) -> Self {
+    /// Create a ChatManager without memory support (for tests or minimal deployments)
+    pub fn new_without_memory(graph: Arc<dyn GraphStore>, config: ChatConfig) -> Self {
         let permission_config = Arc::new(RwLock::new(config.permission.clone()));
         let env_config = Arc::new(RwLock::new(RuntimeEnvConfig {
             process_path: config.process_path.clone(),
@@ -234,7 +243,6 @@ impl ChatManager {
         }));
         Self {
             graph,
-            search,
             config,
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             context_injector: None,
@@ -248,15 +256,9 @@ impl ChatManager {
     }
 
     /// Create a new ChatManager with conversation memory support
-    pub async fn new(
-        graph: Arc<dyn GraphStore>,
-        search: Arc<dyn SearchStore>,
-        config: ChatConfig,
-    ) -> Self {
+    pub async fn new(graph: Arc<dyn GraphStore>, config: ChatConfig) -> Self {
         // Initialize ContextInjector for conversation memory persistence
         let memory_config = MemoryConfig {
-            meilisearch_url: config.meilisearch_url.clone(),
-            meilisearch_key: Some(config.meilisearch_key.clone()),
             enabled: true,
             ..MemoryConfig::default()
         };
@@ -270,6 +272,12 @@ impl ChatManager {
                 None
             }
         };
+        // Disable ConversationMemoryManager when no backing injector is available.
+        // This prevents unflushed pending message buffers from accumulating in memory.
+        let memory_config = context_injector
+            .as_ref()
+            .map(|_| memory_config)
+            .filter(|cfg| cfg.enabled);
 
         let permission_config = Arc::new(RwLock::new(config.permission.clone()));
         let env_config = Arc::new(RwLock::new(RuntimeEnvConfig {
@@ -280,11 +288,10 @@ impl ChatManager {
         }));
         Self {
             graph,
-            search,
             config,
             active_sessions: Arc::new(RwLock::new(HashMap::new())),
             context_injector,
-            memory_config: Some(memory_config),
+            memory_config,
             event_emitter: None,
             nats: None,
             permission_config,
@@ -375,7 +382,7 @@ impl ChatManager {
     ///
     /// Reads the existing file as a `serde_yaml::Value` tree, updates only the
     /// `chat.permissions` subtree, and writes back atomically (tmp + rename).
-    /// This preserves all other config sections (auth, server, neo4j, etc.)
+    /// This preserves all other config sections (auth, server, indentiagraph, etc.)
     /// without needing `Serialize` on those structs.
     fn persist_permission_to_yaml(
         yaml_path: &std::path::Path,
@@ -949,7 +956,7 @@ impl ChatManager {
 
                             auto_continue.store(enabled, Ordering::Relaxed);
 
-                            // Persist to Neo4j
+                            // Persist to IndentiaGraph
                             if let Ok(uuid) = Uuid::parse_str(&session_id) {
                                 if let Err(e) = graph.set_session_auto_continue(uuid, enabled).await
                                 {
@@ -1021,7 +1028,7 @@ impl ChatManager {
                                 }
 
                                 // Persist user_message event
-                                let user_event = crate::neo4j::models::ChatEventRecord {
+                                let user_event = crate::indentiagraph::models::ChatEventRecord {
                                     id: Uuid::new_v4(),
                                     session_id: uuid,
                                     seq: next_seq.fetch_add(1, Ordering::SeqCst),
@@ -1121,7 +1128,7 @@ impl ChatManager {
     ///
     /// Two-layer architecture:
     /// 1. Hardcoded base (BASE_SYSTEM_PROMPT) — protocols, data model, git, statuses
-    /// 2. Dynamic context — oneshot Opus refines raw Neo4j data, fallback to markdown
+    /// 2. Dynamic context — oneshot Opus refines raw IndentiaGraph data, fallback to markdown
     pub async fn build_system_prompt(
         &self,
         project_slug: Option<&str>,
@@ -1137,7 +1144,7 @@ impl ChatManager {
             return format!("{}\n\n---\n\n{}", BASE_SYSTEM_PROMPT, TOOL_REFERENCE);
         };
 
-        // Fetch raw context from Neo4j
+        // Fetch raw context from IndentiaGraph
         let ctx = match fetch_project_context(&self.graph, slug).await {
             Ok(ctx) => ctx,
             Err(e) => {
@@ -1363,18 +1370,39 @@ impl ChatManager {
         let mcp_path = self.config.mcp_server_path.to_string_lossy().to_string();
 
         let mut env = HashMap::new();
-        // Neo4j/MeiliSearch env vars — kept for non-CRUD processes that still
+        // IndentiaGraph env vars — kept for non-CRUD processes that still
         // call the database directly (e.g., sync, code parsing, analytics).
-        env.insert("NEO4J_URI".into(), self.config.neo4j_uri.clone());
-        env.insert("NEO4J_USER".into(), self.config.neo4j_user.clone());
-        env.insert("NEO4J_PASSWORD".into(), self.config.neo4j_password.clone());
         env.insert(
-            "MEILISEARCH_URL".into(),
-            self.config.meilisearch_url.clone(),
+            "INDENTIAGRAPH_URI".into(),
+            self.config.indentiagraph_uri.clone(),
         );
         env.insert(
-            "MEILISEARCH_KEY".into(),
-            self.config.meilisearch_key.clone(),
+            "INDENTIAGRAPH_USER".into(),
+            self.config.indentiagraph_user.clone(),
+        );
+        env.insert(
+            "INDENTIAGRAPH_PASSWORD".into(),
+            self.config.indentiagraph_password.clone(),
+        );
+        env.insert(
+            "SURREALDB_URL".into(),
+            self.config.indentiagraph_uri.clone(),
+        );
+        env.insert(
+            "SURREALDB_USERNAME".into(),
+            self.config.indentiagraph_user.clone(),
+        );
+        env.insert(
+            "SURREALDB_PASSWORD".into(),
+            self.config.indentiagraph_password.clone(),
+        );
+        env.insert(
+            "SURREALDB_NAMESPACE".into(),
+            std::env::var("SURREALDB_NAMESPACE").unwrap_or_else(|_| "cortex".into()),
+        );
+        env.insert(
+            "SURREALDB_DATABASE".into(),
+            std::env::var("SURREALDB_DATABASE").unwrap_or_else(|_| "memory".into()),
         );
 
         // Inject session token + server URL for MCP HTTP wrapper mode.
@@ -1687,7 +1715,7 @@ impl ChatManager {
     // Session lifecycle
     // ========================================================================
 
-    /// Create a new chat session: persist to Neo4j, spawn CLI subprocess, start streaming
+    /// Create a new chat session: persist to IndentiaGraph, spawn CLI subprocess, start streaming
     pub async fn create_session(&self, request: &ChatRequest) -> Result<CreateSessionResponse> {
         // Check max sessions
         {
@@ -1706,7 +1734,7 @@ impl ChatManager {
             .build_system_prompt(request.project_slug.as_deref(), &request.message)
             .await;
 
-        // Persist session in Neo4j
+        // Persist session in IndentiaGraph
         // Resolve add_dirs from explicit request, workspace, or empty
         let resolved_add_dirs = self
             .resolve_add_dirs(
@@ -1818,7 +1846,7 @@ impl ChatManager {
                 session_id, conversation_id
             );
 
-            // Persist conversation_id in Neo4j
+            // Persist conversation_id in IndentiaGraph
             let _ = self
                 .graph
                 .update_chat_session(
@@ -2136,7 +2164,7 @@ impl ChatManager {
             mm.record_user_message(&prompt);
         }
 
-        // Events are persisted in Neo4j — the WebSocket replay handles late-joining clients.
+        // Events are persisted in IndentiaGraph — the WebSocket replay handles late-joining clients.
 
         // Variables that persist across retry iterations (needed after the retry loop)
         let session_uuid = Uuid::parse_str(&session_id).ok();
@@ -2529,7 +2557,7 @@ impl ChatManager {
                                     ..
                                 } = msg
                                 {
-                                    // Update Neo4j with cli_session_id and cost
+                                    // Update IndentiaGraph with cli_session_id and cost
                                     if let Some(uuid) = session_uuid {
                                         let _ = graph
                                             .update_chat_session(
@@ -2864,7 +2892,7 @@ impl ChatManager {
         }
 
         // Lock-free interrupt: send the CLI interrupt signal IMMEDIATELY via stdin_tx
-        // BEFORE the Neo4j persistence and memory manager ops (T2 fix for Gaps 3, 6).
+        // BEFORE the IndentiaGraph persistence and memory manager ops (T2 fix for Gaps 3, 6).
         // This avoids taking the client Mutex lock which could be contended.
         if interrupt_flag.load(Ordering::SeqCst) {
             if let Some(ref tx) = stdin_tx_for_auto_allow {
@@ -2898,7 +2926,7 @@ impl ChatManager {
                     emit_chat(event, &events_tx, &nats, &session_id);
                 }
 
-                // Persist ToolCancelled events in Neo4j
+                // Persist ToolCancelled events in IndentiaGraph
                 if let Some(uuid) = session_uuid {
                     let mut cancel_records = Vec::new();
                     for event in &cancel_events {
@@ -3010,9 +3038,9 @@ impl ChatManager {
             debug!("Stream completed for session {}", session_id);
         }
 
-        // Batch-persist all collected events to Neo4j.
+        // Batch-persist all collected events to IndentiaGraph.
         // This runs AFTER is_streaming=false so the frontend gets the signal immediately
-        // even if Neo4j is slow (GC pause, disk I/O, etc.).
+        // even if IndentiaGraph is slow (GC pause, disk I/O, etc.).
         if let Some(uuid) = session_uuid {
             if !events_to_persist.is_empty() {
                 if let Err(e) = graph.store_chat_events(uuid, events_to_persist).await {
@@ -3030,11 +3058,11 @@ impl ChatManager {
             if !assistant_text.is_empty() {
                 let mut mm = mm.lock().await;
                 mm.record_assistant_message(&assistant_text);
+                let pending = mm.take_pending_messages();
 
-                // Store pending messages via ContextInjector
-                if let Some(ref injector) = context_injector {
-                    let pending = mm.take_pending_messages();
-                    if !pending.is_empty() {
+                if !pending.is_empty() {
+                    // Store pending messages via ContextInjector if enabled.
+                    if let Some(ref injector) = context_injector {
                         if let Err(e) = injector.store_messages(&pending).await {
                             warn!("Failed to store messages for session {}: {}", session_id, e);
                         } else {
@@ -3044,6 +3072,12 @@ impl ChatManager {
                                 session_id
                             );
                         }
+                    } else {
+                        debug!(
+                            "Discarded {} pending memory messages for session {} (injector disabled)",
+                            pending.len(),
+                            session_id
+                        );
                     }
                 }
             }
@@ -3286,7 +3320,7 @@ impl ChatManager {
 
         // No stream in progress — persist and broadcast immediately
 
-        // Update message count in Neo4j
+        // Update message count in IndentiaGraph
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             if let Ok(Some(node)) = self.graph.get_chat_session(uuid).await {
                 let _ = self
@@ -3497,10 +3531,10 @@ impl ChatManager {
             nats.publish_chat_event(session_id, decision_event.clone());
         }
 
-        // Persist to Neo4j
+        // Persist to IndentiaGraph
         if let Some(uuid) = session_uuid {
             let seq = next_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let record = crate::neo4j::models::ChatEventRecord {
+            let record = crate::indentiagraph::models::ChatEventRecord {
                 id: uuid::Uuid::new_v4(),
                 session_id: uuid,
                 seq,
@@ -3524,7 +3558,7 @@ impl ChatManager {
     /// Change the permission mode of an active CLI session mid-conversation.
     ///
     /// Sends a `set_permission_mode` control request to the Claude CLI subprocess,
-    /// updates the in-memory `ActiveSession`, and persists the change to Neo4j.
+    /// updates the in-memory `ActiveSession`, and persists the change to IndentiaGraph.
     ///
     /// **IMPORTANT**: This method sends the control request via the cloned `stdin_tx`
     /// sender — **without** taking the `client` Mutex lock. This is critical because
@@ -3587,7 +3621,7 @@ impl ChatManager {
             "Permission mode changed for session (via stdin_tx, lock-free)"
         );
 
-        // Persist to Neo4j
+        // Persist to IndentiaGraph
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             if let Err(e) = self
                 .graph
@@ -3597,7 +3631,7 @@ impl ChatManager {
                 warn!(
                     session_id = %session_id,
                     error = %e,
-                    "Failed to persist permission mode change to Neo4j (non-fatal)"
+                    "Failed to persist permission mode change to IndentiaGraph (non-fatal)"
                 );
             }
         }
@@ -3675,7 +3709,7 @@ impl ChatManager {
     /// Toggle auto-continue for an active session.
     ///
     /// Updates the in-memory `ActiveSession.auto_continue` AtomicBool,
-    /// persists the change to Neo4j, and broadcasts a `ChatEvent::AutoContinueStateChanged`
+    /// persists the change to IndentiaGraph, and broadcasts a `ChatEvent::AutoContinueStateChanged`
     /// so that all connected frontends can sync their toggle UI.
     ///
     /// Unlike `set_session_permission_mode`, this does NOT send a control request to the
@@ -3683,7 +3717,7 @@ impl ChatManager {
     ///
     /// Works whether the session is active (CLI spawned) or idle (just viewing).
     /// - Active: updates in-memory AtomicBool + broadcasts locally + NATS
-    /// - Idle: persists to Neo4j + broadcasts via NATS only (no local broadcast channel)
+    /// - Idle: persists to IndentiaGraph + broadcasts via NATS only (no local broadcast channel)
     pub async fn set_auto_continue(&self, session_id: &str, enabled: bool) -> Result<()> {
         // Try to update in-memory state if session is active
         let maybe_events_tx = {
@@ -3698,13 +3732,13 @@ impl ChatManager {
             }
         };
 
-        // Persist to Neo4j (always — whether active or idle)
+        // Persist to IndentiaGraph (always — whether active or idle)
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             if let Err(e) = self.graph.set_session_auto_continue(uuid, enabled).await {
                 warn!(
                     session_id = %session_id,
                     error = %e,
-                    "Failed to persist auto_continue change to Neo4j (non-fatal)"
+                    "Failed to persist auto_continue change to IndentiaGraph (non-fatal)"
                 );
             }
         }
@@ -3738,7 +3772,7 @@ impl ChatManager {
 
     /// Get the current auto-continue state for a session.
     ///
-    /// Reads from the in-memory ActiveSession if local, otherwise falls back to Neo4j.
+    /// Reads from the in-memory ActiveSession if local, otherwise falls back to IndentiaGraph.
     pub async fn get_auto_continue_state(&self, session_id: &str) -> Result<bool> {
         // Try local active session first
         let sessions = self.active_sessions.read().await;
@@ -3749,7 +3783,7 @@ impl ChatManager {
         }
         drop(sessions);
 
-        // Fallback to Neo4j
+        // Fallback to IndentiaGraph
         if let Ok(uuid) = Uuid::parse_str(session_id) {
             return self.graph.get_session_auto_continue(uuid).await;
         }
@@ -3769,12 +3803,12 @@ impl ChatManager {
     ) -> Result<()> {
         let uuid = Uuid::parse_str(session_id).context("Invalid session ID")?;
 
-        // Load session from Neo4j
+        // Load session from IndentiaGraph
         let session_node = self
             .graph
             .get_chat_session(uuid)
             .await
-            .context("Failed to fetch session from Neo4j")?
+            .context("Failed to fetch session from IndentiaGraph")?
             .ok_or_else(|| anyhow!("Session {} not found in database", session_id))?;
 
         let cli_session_id = session_node.cli_session_id.as_deref();
@@ -3901,7 +3935,7 @@ impl ChatManager {
             None
         };
 
-        // Initialize next_seq from Neo4j (resume existing event history)
+        // Initialize next_seq from IndentiaGraph (resume existing event history)
         let latest_seq = self
             .graph
             .get_latest_chat_event_seq(uuid)
@@ -4049,10 +4083,10 @@ impl ChatManager {
 
     /// Retrieve full event history for a session (including tool_use, tool_result, etc.).
     ///
-    /// Reads structured `ChatEventRecord` from Neo4j (the same data the WebSocket
+    /// Reads structured `ChatEventRecord` from IndentiaGraph (the same data the WebSocket
     /// replay uses), so every event type is preserved — not just text.
     ///
-    /// Falls back to Meilisearch `nexus_messages` for pre-migration sessions that
+    /// Falls back to legacy indexed message data for pre-migration sessions that
     /// have no ChatEvent nodes yet (text only, no tool_use).
     pub async fn get_session_messages(
         &self,
@@ -4066,13 +4100,13 @@ impl ChatManager {
         self.graph
             .get_chat_session(uuid)
             .await
-            .context("Failed to fetch session from Neo4j")?
+            .context("Failed to fetch session from IndentiaGraph")?
             .ok_or_else(|| anyhow!("Session {} not found", session_id))?;
 
         let limit_val = limit.unwrap_or(200) as i64;
         let offset_val = offset.unwrap_or(0) as i64;
 
-        // Try Neo4j ChatEvent nodes first (new format — has tool_use, etc.)
+        // Try IndentiaGraph ChatEvent nodes first (new format — has tool_use, etc.)
         let total_count = self.graph.count_chat_events(uuid).await?;
 
         if total_count > 0 {
@@ -4092,77 +4126,6 @@ impl ChatManager {
             });
         }
 
-        // Fallback: pre-migration sessions — read from Meilisearch (text only)
-        let session_node = self.graph.get_chat_session(uuid).await?.unwrap();
-        if let Some(conversation_id) = session_node.conversation_id {
-            let meili_client = meilisearch_sdk::client::Client::new(
-                &self.config.meilisearch_url,
-                Some(&self.config.meilisearch_key),
-            )
-            .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
-
-            let index = meili_client.index("nexus_messages");
-            let filter = format!("conversation_id = \"{}\"", conversation_id);
-
-            let results: meilisearch_sdk::search::SearchResults<
-                nexus_claude::memory::MessageDocument,
-            > = index
-                .search()
-                .with_query("")
-                .with_filter(&filter)
-                .with_sort(&["created_at:asc"])
-                .with_limit(limit_val as usize)
-                .with_offset(offset_val as usize)
-                .execute()
-                .await
-                .map_err(|e| anyhow!("Meilisearch query failed: {}", e))?;
-
-            let meili_total = results.estimated_total_hits.unwrap_or(0);
-
-            // Convert MessageDocument → ChatEventRecord (text-only approximation)
-            let events: Vec<ChatEventRecord> = results
-                .hits
-                .into_iter()
-                .enumerate()
-                .map(|(i, hit)| {
-                    let msg = hit.result;
-                    let event_type = if msg.role == "user" {
-                        "user_message"
-                    } else {
-                        "assistant_text"
-                    };
-                    let chat_event = if msg.role == "user" {
-                        ChatEvent::UserMessage {
-                            content: msg.content.clone(),
-                        }
-                    } else {
-                        ChatEvent::AssistantText {
-                            content: msg.content.clone(),
-                            parent_tool_use_id: None,
-                        }
-                    };
-                    ChatEventRecord {
-                        id: Uuid::new_v4(),
-                        session_id: uuid,
-                        seq: (offset_val + i as i64 + 1),
-                        event_type: event_type.to_string(),
-                        data: serde_json::to_string(&chat_event).unwrap_or_default(),
-                        created_at: chrono::Utc::now(),
-                    }
-                })
-                .collect();
-
-            let has_more = offset_val as usize + events.len() < meili_total;
-
-            return Ok(ChatEventPage {
-                events,
-                total_count: meili_total,
-                has_more,
-                offset: offset_val as usize,
-                limit: limit_val as usize,
-            });
-        }
-
         // No events anywhere
         Ok(ChatEventPage {
             events: vec![],
@@ -4173,181 +4136,150 @@ impl ChatManager {
         })
     }
 
-    /// Backfill title/preview for sessions that have a conversation_id but no title.
-    /// Uses Meilisearch to fetch the first user message from each conversation.
-    pub async fn backfill_previews_from_meilisearch(&self) -> Result<usize> {
-        let injector = match self.context_injector.as_ref() {
-            Some(i) => i,
-            None => return Ok(0),
-        };
-
-        // Get all sessions without title
-        let sessions = self
-            .graph
-            .list_chat_sessions(None, None, 200, 0)
-            .await
-            .context("Failed to list sessions")?;
-
-        let mut count = 0;
-        for session in &sessions.0 {
-            // Skip sessions that already have a title
-            if session.title.is_some() {
-                continue;
-            }
-            // Need a conversation_id to look up messages
-            let conv_id = match &session.conversation_id {
-                Some(c) => c.clone(),
-                None => continue,
-            };
-
-            // Load the first user message from Meilisearch
-            let loaded = match injector.load_conversation(&conv_id, Some(1), Some(0)).await {
-                Ok(l) => l,
-                Err(_) => continue,
-            };
-
-            let first_user_msg = loaded
-                .messages
-                .iter()
-                .find(|m| m.role == "user")
-                .map(|m| m.content.clone());
-
-            if let Some(content) = first_user_msg {
-                let chars: Vec<char> = content.chars().collect();
-                let title = if chars.len() > 80 {
-                    format!("{}...", chars[..77].iter().collect::<String>().trim_end())
-                } else {
-                    content.clone()
-                };
-                let preview = if chars.len() > 200 {
-                    format!("{}...", chars[..197].iter().collect::<String>().trim_end())
-                } else {
-                    content
-                };
-                let _ = self
-                    .graph
-                    .update_chat_session(
-                        session.id,
-                        None,
-                        Some(title),
-                        None,
-                        None,
-                        None,
-                        Some(preview),
-                    )
-                    .await;
-                count += 1;
-            }
-        }
-
-        Ok(count)
-    }
-
-    /// Search messages across all sessions via Meilisearch full-text search.
-    ///
-    /// Queries the `nexus_messages` index directly (bypassing the nexus SDK's
-    /// `retrieve_context` which applies token_budget / max_context_items limits
-    /// designed for LLM context injection, not UI search).
+    /// Search messages across sessions using persisted ChatEvent records.
     pub async fn search_messages(
         &self,
         query: &str,
         limit: usize,
         project_slug: Option<&str>,
     ) -> Result<Vec<MessageSearchResult>> {
-        use nexus_claude::memory::MessageDocument;
-        use std::collections::HashMap as StdHashMap;
-
-        // Build a direct Meilisearch client from our config
-        let meili_client = meilisearch_sdk::client::Client::new(
-            &self.config.meilisearch_url,
-            Some(&self.config.meilisearch_key),
-        )
-        .map_err(|e| anyhow!("Failed to create Meilisearch client: {}", e))?;
-
-        let index = meili_client.index("nexus_messages");
-
-        // Query Meilisearch directly — no token budget, no max_context_items
-        let search_results: meilisearch_sdk::search::SearchResults<MessageDocument> = index
-            .search()
-            .with_query(query)
-            .with_limit(limit * 5) // Fetch extra to allow grouping by session
-            .with_show_ranking_score(true)
-            .execute()
-            .await
-            .map_err(|e| anyhow!("Meilisearch search failed: {}", e))?;
-
-        if search_results.hits.is_empty() {
+        if query.trim().is_empty() || limit == 0 {
             return Ok(vec![]);
         }
 
-        // Group results by conversation_id
-        let mut by_conversation: StdHashMap<String, Vec<MessageSearchHit>> = StdHashMap::new();
-        for hit in &search_results.hits {
-            let doc = &hit.result;
-            let score = hit.ranking_score.unwrap_or(0.0);
-            let search_hit = MessageSearchHit {
-                message_id: doc.id.clone(),
-                role: doc.role.clone(),
-                content_snippet: truncate_snippet(&doc.content, 300),
-                turn_index: doc.turn_index,
-                created_at: doc.created_at,
-                score,
-            };
-            by_conversation
-                .entry(doc.conversation_id.clone())
-                .or_default()
-                .push(search_hit);
-        }
+        let query_lc = query.to_lowercase();
+        let mut grouped = Vec::new();
 
-        // Resolve conversation_id → session metadata from Neo4j
-        let (all_sessions, _) = self.graph.list_chat_sessions(None, None, 200, 0).await?;
-        let session_lookup: StdHashMap<String, &crate::neo4j::models::ChatSessionNode> =
-            all_sessions
-                .iter()
-                .filter_map(|s| s.conversation_id.as_ref().map(|cid| (cid.clone(), s)))
-                .collect();
+        const SESSION_PAGE_SIZE: usize = 100;
+        const EVENT_PAGE_SIZE: i64 = 500;
 
-        // Build grouped results
-        let mut results: Vec<MessageSearchResult> = Vec::new();
-        for (conv_id, hits) in by_conversation {
-            let session_info = session_lookup.get(&conv_id);
-
-            // Filter by project_slug if specified
-            if let Some(filter_slug) = project_slug {
-                if let Some(session) = session_info {
-                    if session.project_slug.as_deref() != Some(filter_slug) {
-                        continue;
-                    }
-                } else {
-                    continue; // No session found, skip
-                }
+        let mut session_offset = 0usize;
+        loop {
+            let (sessions, total_sessions) = self
+                .graph
+                .list_chat_sessions(project_slug, None, SESSION_PAGE_SIZE, session_offset)
+                .await?;
+            if sessions.is_empty() {
+                break;
             }
 
-            let best_score = hits.iter().map(|h| h.score).fold(0.0_f64, f64::max);
+            for session in sessions {
+                let total_events = self.graph.count_chat_events(session.id).await?;
+                if total_events <= 0 {
+                    continue;
+                }
 
-            results.push(MessageSearchResult {
-                session_id: session_info.map(|s| s.id.to_string()).unwrap_or_default(),
-                session_title: session_info.and_then(|s| s.title.clone()),
-                session_preview: session_info.and_then(|s| s.preview.clone()),
-                project_slug: session_info.and_then(|s| s.project_slug.clone()),
-                workspace_slug: session_info.and_then(|s| s.workspace_slug.clone()),
-                conversation_id: conv_id,
-                hits,
-                best_score,
-            });
+                let mut hits = Vec::new();
+                let mut event_offset = 0i64;
+                while event_offset < total_events {
+                    let events = self
+                        .graph
+                        .get_chat_events_paginated(session.id, event_offset, EVENT_PAGE_SIZE)
+                        .await?;
+                    if events.is_empty() {
+                        break;
+                    }
+
+                    for event in events {
+                        if let Some(text) = Self::extract_searchable_text(&event) {
+                            let text_lc = text.to_lowercase();
+                            if text_lc.contains(&query_lc) {
+                                let score = Self::score_message_match(&text_lc, &query_lc);
+                                hits.push(MessageSearchHit {
+                                    message_id: event.id.to_string(),
+                                    role: if event.event_type == "user_message" {
+                                        "user".to_string()
+                                    } else {
+                                        "assistant".to_string()
+                                    },
+                                    content_snippet: truncate_snippet(&text, 220),
+                                    turn_index: event.seq.max(0) as usize,
+                                    created_at: event.created_at.timestamp(),
+                                    score,
+                                });
+                            }
+                        }
+                    }
+
+                    event_offset += EVENT_PAGE_SIZE;
+                }
+
+                if hits.is_empty() {
+                    continue;
+                }
+
+                hits.sort_by(|a, b| {
+                    b.score
+                        .partial_cmp(&a.score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| b.created_at.cmp(&a.created_at))
+                });
+
+                let best_score = hits.first().map(|h| h.score).unwrap_or(0.0);
+                grouped.push(MessageSearchResult {
+                    session_id: session.id.to_string(),
+                    session_title: session.title,
+                    session_preview: session.preview,
+                    project_slug: session.project_slug,
+                    workspace_slug: session.workspace_slug,
+                    conversation_id: session.conversation_id.unwrap_or_default(),
+                    hits,
+                    best_score,
+                });
+            }
+
+            session_offset += SESSION_PAGE_SIZE;
+            if session_offset >= total_sessions {
+                break;
+            }
         }
 
-        // Sort by best_score descending
-        results.sort_by(|a, b| {
+        grouped.sort_by(|a, b| {
             b.best_score
                 .partial_cmp(&a.best_score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        grouped.truncate(limit);
+        Ok(grouped)
+    }
 
-        // Limit to requested number of sessions
-        results.truncate(limit);
+    fn extract_searchable_text(event: &ChatEventRecord) -> Option<String> {
+        let value = serde_json::from_str::<serde_json::Value>(&event.data).ok()?;
+        if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+            if !content.trim().is_empty() {
+                return Some(content.to_string());
+            }
+        }
+        if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
+            if !message.trim().is_empty() {
+                return Some(message.to_string());
+            }
+        }
+        if let Some(text) = value.get("text").and_then(|v| v.as_str()) {
+            if !text.trim().is_empty() {
+                return Some(text.to_string());
+            }
+        }
+        if let Some(result_text) = value.get("result_text").and_then(|v| v.as_str()) {
+            if !result_text.trim().is_empty() {
+                return Some(result_text.to_string());
+            }
+        }
+        if let Some(s) = value.as_str() {
+            if !s.trim().is_empty() {
+                return Some(s.to_string());
+            }
+        }
+        None
+    }
 
-        Ok(results)
+    fn score_message_match(text_lc: &str, query_lc: &str) -> f64 {
+        if query_lc.is_empty() {
+            return 0.0;
+        }
+        let occurrences = text_lc.match_indices(query_lc).count().max(1) as f64;
+        let density = (query_lc.len() as f64 / text_lc.len().max(query_lc.len()) as f64).min(1.0);
+        occurrences + density
     }
 
     /// Subscribe to a session's broadcast channel (used by WebSocket handler)
@@ -4700,7 +4632,7 @@ fn parse_permission_control_msg(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::models::ChatSessionNode;
+    use crate::indentiagraph::models::{ChatEventRecord, ChatSessionNode};
     use crate::test_helpers::{mock_app_state, test_chat_session, test_project};
     use nexus_claude::{
         AssistantMessage, ContentBlock, ContentValue, TextContent, ThinkingContent,
@@ -4715,11 +4647,9 @@ mod tests {
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),
-            neo4j_uri: "bolt://localhost:7687".into(),
-            neo4j_user: "neo4j".into(),
-            neo4j_password: "test".into(),
-            meilisearch_url: "http://localhost:7700".into(),
-            meilisearch_key: "key".into(),
+            indentiagraph_uri: "ws://localhost:8000".into(),
+            indentiagraph_user: "indentiagraph".into(),
+            indentiagraph_password: "test".into(),
             nats_url: None,
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
@@ -4740,7 +4670,7 @@ mod tests {
     #[test]
     fn test_resolve_model_with_override() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         assert_eq!(
             manager.resolve_model(Some("claude-sonnet-4-6")),
@@ -4751,7 +4681,7 @@ mod tests {
     #[test]
     fn test_resolve_model_default() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         assert_eq!(manager.resolve_model(None), "claude-sonnet-4-6");
     }
@@ -4761,7 +4691,7 @@ mod tests {
         // Default config uses "default" permission mode (safe-by-default)
         // and pre-approves MCP tools out of the box
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let opts = manager
             .build_options(
@@ -4789,7 +4719,7 @@ mod tests {
             allowed_tools: vec!["Bash(git *)".into(), "Read".into()],
             disallowed_tools: vec!["Bash(rm -rf *)".into()],
         };
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let manager = ChatManager::new_without_memory(state.indentiagraph, config);
 
         let opts = manager
             .build_options(
@@ -4812,7 +4742,7 @@ mod tests {
     async fn test_build_options_with_permission_override() {
         // Global config is Default, session overrides to BypassPermissions
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let opts = manager
             .build_options(
@@ -4850,7 +4780,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_permission_config_returns_defaults() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let config = manager.get_permission_config().await;
         assert_eq!(config.mode, "default");
@@ -4862,7 +4792,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_permission_config_changes_mode() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let new_config = crate::chat::config::PermissionConfig {
             mode: "default".into(),
@@ -4883,7 +4813,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_permission_config_rejects_invalid_mode() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let bad_config = crate::chat::config::PermissionConfig {
             mode: "yolo".into(),
@@ -4898,7 +4828,7 @@ mod tests {
     #[tokio::test]
     async fn test_update_permission_config_affects_build_options() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         // Initially Default (safe-by-default)
         let opts = manager
@@ -4948,7 +4878,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_system_prompt_no_project() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let prompt = manager.build_system_prompt(None, "test").await;
         assert!(prompt.contains("Project Orchestrator"));
@@ -4960,9 +4890,9 @@ mod tests {
     async fn test_build_system_prompt_with_project() {
         let state = mock_app_state();
         let project = test_project();
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
 
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let prompt = manager
             .build_system_prompt(Some(&project.slug), "help me plan")
             .await;
@@ -4978,7 +4908,7 @@ mod tests {
     #[tokio::test]
     async fn test_session_not_active_by_default() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         assert!(!manager.is_session_active("nonexistent").await);
     }
@@ -4990,7 +4920,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_options_basic() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let options = manager
             .build_options(
@@ -5014,7 +4944,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_options_with_resume() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let options = manager
             .build_options(
@@ -5036,7 +4966,7 @@ mod tests {
     async fn test_build_options_mcp_server_config() {
         let state = mock_app_state();
         let config = test_config();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let manager = ChatManager::new_without_memory(state.indentiagraph, config);
 
         let options = manager
             .build_options("/tmp", "model", "prompt", None, None, None, &[], None)
@@ -5047,11 +4977,9 @@ mod tests {
             McpServerConfig::Stdio { command, env, .. } => {
                 assert_eq!(command, "/usr/bin/mcp_server");
                 let env = env.as_ref().unwrap();
-                assert_eq!(env.get("NEO4J_URI").unwrap(), "bolt://localhost:7687");
-                assert_eq!(env.get("NEO4J_USER").unwrap(), "neo4j");
-                assert_eq!(env.get("NEO4J_PASSWORD").unwrap(), "test");
-                assert_eq!(env.get("MEILISEARCH_URL").unwrap(), "http://localhost:7700");
-                assert_eq!(env.get("MEILISEARCH_KEY").unwrap(), "key");
+                assert_eq!(env.get("INDENTIAGRAPH_URI").unwrap(), "ws://localhost:8000");
+                assert_eq!(env.get("INDENTIAGRAPH_USER").unwrap(), "indentiagraph");
+                assert_eq!(env.get("INDENTIAGRAPH_PASSWORD").unwrap(), "test");
             }
             _ => panic!("Expected Stdio MCP config"),
         }
@@ -5060,7 +4988,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_options_with_hooks() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         // Build hooks map with a CompactionNotifier
         let (tx, _rx) = broadcast::channel::<ChatEvent>(16);
@@ -5098,7 +5026,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_options_without_hooks() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let opts = manager
             .build_options("/tmp", "model", "prompt", None, None, None, &[], None)
@@ -5115,7 +5043,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_add_dirs_explicit() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let dirs = vec!["/path/a".to_string(), "/path/b".to_string()];
         let result = manager
@@ -5128,7 +5056,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_add_dirs_empty() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager.resolve_add_dirs("/tmp", None, None, None).await;
         assert!(result.is_empty());
@@ -5140,36 +5068,36 @@ mod tests {
 
         // Create a workspace and projects
         let ws = crate::test_helpers::test_workspace();
-        state.neo4j.create_workspace(&ws).await.unwrap();
+        state.indentiagraph.create_workspace(&ws).await.unwrap();
 
         let mut p1 = crate::test_helpers::test_project();
         p1.root_path = "/home/user/proj-a".to_string();
-        state.neo4j.create_project(&p1).await.unwrap();
+        state.indentiagraph.create_project(&p1).await.unwrap();
         state
-            .neo4j
+            .indentiagraph
             .add_project_to_workspace(ws.id, p1.id)
             .await
             .unwrap();
 
         let mut p2 = crate::test_helpers::test_project();
         p2.root_path = "/home/user/proj-b".to_string();
-        state.neo4j.create_project(&p2).await.unwrap();
+        state.indentiagraph.create_project(&p2).await.unwrap();
         state
-            .neo4j
+            .indentiagraph
             .add_project_to_workspace(ws.id, p2.id)
             .await
             .unwrap();
 
         let mut p3 = crate::test_helpers::test_project();
         p3.root_path = "/home/user/proj-cwd".to_string();
-        state.neo4j.create_project(&p3).await.unwrap();
+        state.indentiagraph.create_project(&p3).await.unwrap();
         state
-            .neo4j
+            .indentiagraph
             .add_project_to_workspace(ws.id, p3.id)
             .await
             .unwrap();
 
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         // cwd matches p3, so only p1 and p2 should be returned
         let result = manager
@@ -5185,7 +5113,7 @@ mod tests {
     #[tokio::test]
     async fn test_resolve_add_dirs_workspace_not_found() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager
             .resolve_add_dirs("/tmp", None, Some("nonexistent-ws"), None)
@@ -5196,7 +5124,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_options_with_add_dirs() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let dirs = ["/extra/dir1".to_string(), "/extra/dir2".to_string()];
         let opts = manager
@@ -5215,7 +5143,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_options_without_add_dirs() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let opts = manager
             .build_options("/tmp", "model", "prompt", None, None, None, &[], None)
@@ -5740,18 +5668,18 @@ mod tests {
     async fn test_build_system_prompt_with_active_plans() {
         let state = mock_app_state();
         let project = test_project();
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
 
         // Create an active plan linked to the project
         let plan = crate::test_helpers::test_plan();
-        state.neo4j.create_plan(&plan).await.unwrap();
+        state.indentiagraph.create_plan(&plan).await.unwrap();
         state
-            .neo4j
+            .indentiagraph
             .link_plan_to_project(plan.id, project.id)
             .await
             .unwrap();
 
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let prompt = manager
             .build_system_prompt(Some(&project.slug), "check the plan")
             .await;
@@ -5771,7 +5699,7 @@ mod tests {
     #[tokio::test]
     async fn test_active_session_count_empty() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         assert_eq!(manager.active_session_count().await, 0);
     }
@@ -5783,7 +5711,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_nonexistent_session() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager.subscribe("nonexistent").await;
         assert!(result.is_err());
@@ -5795,7 +5723,7 @@ mod tests {
         // interrupt() no longer errors for non-local sessions — it always succeeds
         // because it may need to publish to NATS for cross-instance interrupt routing.
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager.interrupt("nonexistent").await;
         assert!(
@@ -5807,7 +5735,7 @@ mod tests {
     #[tokio::test]
     async fn test_close_nonexistent_session() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager.close_session("nonexistent").await;
         assert!(result.is_err());
@@ -5816,7 +5744,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_message_nonexistent_session() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager.send_message("nonexistent", "hello").await;
         assert!(result.is_err());
@@ -5825,7 +5753,7 @@ mod tests {
     #[tokio::test]
     async fn test_resume_session_invalid_uuid() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager.resume_session("not-a-uuid", "hello", None).await;
         assert!(result.is_err());
@@ -5838,7 +5766,7 @@ mod tests {
     #[tokio::test]
     async fn test_resume_session_not_in_db() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let id = Uuid::new_v4().to_string();
         let result = manager.resume_session(&id, "hello", None).await;
@@ -5857,9 +5785,13 @@ mod tests {
         // but the error should NOT be "no CLI session ID".
         let state = mock_app_state();
         let session = test_chat_session(None); // no cli_session_id
-        state.neo4j.create_chat_session(&session).await.unwrap();
+        state
+            .indentiagraph
+            .create_chat_session(&session)
+            .await
+            .unwrap();
 
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager
             .resume_session(&session.id.to_string(), "hello", None)
@@ -5881,7 +5813,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_crud_lifecycle() {
         let state = mock_app_state();
-        let graph = &state.neo4j;
+        let graph = &state.indentiagraph;
 
         // Create
         let session = test_chat_session(Some("my-project"));
@@ -5925,7 +5857,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_list_with_filter() {
         let state = mock_app_state();
-        let graph = &state.neo4j;
+        let graph = &state.indentiagraph;
 
         let s1 = test_chat_session(Some("project-a"));
         let s2 = test_chat_session(Some("project-a"));
@@ -5960,9 +5892,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_search_messages_returns_matching_sessions() {
+        let state = mock_app_state();
+        let graph = &state.indentiagraph;
+        let manager = ChatManager::new_without_memory(state.indentiagraph.clone(), test_config());
+
+        let auth_session = test_chat_session(Some("project-a"));
+        let billing_session = test_chat_session(Some("project-b"));
+        graph.create_chat_session(&auth_session).await.unwrap();
+        graph.create_chat_session(&billing_session).await.unwrap();
+
+        graph
+            .store_chat_events(
+                auth_session.id,
+                vec![
+                    ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: auth_session.id,
+                        seq: 1,
+                        event_type: "user_message".to_string(),
+                        data: serde_json::to_string(&ChatEvent::UserMessage {
+                            content: "Auth token refresh failed".to_string(),
+                        })
+                        .unwrap(),
+                        created_at: chrono::Utc::now(),
+                    },
+                    ChatEventRecord {
+                        id: Uuid::new_v4(),
+                        session_id: auth_session.id,
+                        seq: 2,
+                        event_type: "assistant_text".to_string(),
+                        data: serde_json::to_string(&ChatEvent::AssistantText {
+                            content: "Investigating auth refresh flow".to_string(),
+                            parent_tool_use_id: None,
+                        })
+                        .unwrap(),
+                        created_at: chrono::Utc::now(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+
+        graph
+            .store_chat_events(
+                billing_session.id,
+                vec![ChatEventRecord {
+                    id: Uuid::new_v4(),
+                    session_id: billing_session.id,
+                    seq: 1,
+                    event_type: "user_message".to_string(),
+                    data: serde_json::to_string(&ChatEvent::UserMessage {
+                        content: "Refactor billing collector".to_string(),
+                    })
+                    .unwrap(),
+                    created_at: chrono::Utc::now(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let results = manager.search_messages("auth", 10, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, auth_session.id.to_string());
+        assert!(!results[0].hits.is_empty());
+        assert!(results[0].hits[0]
+            .content_snippet
+            .to_lowercase()
+            .contains("auth"));
+    }
+
+    #[tokio::test]
+    async fn test_search_messages_project_filter() {
+        let state = mock_app_state();
+        let graph = &state.indentiagraph;
+        let manager = ChatManager::new_without_memory(state.indentiagraph.clone(), test_config());
+
+        let session_a = test_chat_session(Some("project-a"));
+        let session_b = test_chat_session(Some("project-b"));
+        graph.create_chat_session(&session_a).await.unwrap();
+        graph.create_chat_session(&session_b).await.unwrap();
+
+        let event_a = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: session_a.id,
+            seq: 1,
+            event_type: "user_message".to_string(),
+            data: serde_json::to_string(&ChatEvent::UserMessage {
+                content: "Retry auth handshake".to_string(),
+            })
+            .unwrap(),
+            created_at: chrono::Utc::now(),
+        };
+        let event_b = ChatEventRecord {
+            id: Uuid::new_v4(),
+            session_id: session_b.id,
+            seq: 1,
+            event_type: "user_message".to_string(),
+            data: serde_json::to_string(&ChatEvent::UserMessage {
+                content: "Retry auth handshake".to_string(),
+            })
+            .unwrap(),
+            created_at: chrono::Utc::now(),
+        };
+        graph
+            .store_chat_events(session_a.id, vec![event_a])
+            .await
+            .unwrap();
+        graph
+            .store_chat_events(session_b.id, vec![event_b])
+            .await
+            .unwrap();
+
+        let filtered = manager
+            .search_messages("handshake", 10, Some("project-a"))
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].session_id, session_a.id.to_string());
+    }
+
+    #[tokio::test]
     async fn test_chat_session_update_partial() {
         let state = mock_app_state();
-        let graph = &state.neo4j;
+        let graph = &state.indentiagraph;
 
         let session = test_chat_session(None);
         graph.create_chat_session(&session).await.unwrap();
@@ -5989,7 +6042,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_update_nonexistent() {
         let state = mock_app_state();
-        let graph = &state.neo4j;
+        let graph = &state.indentiagraph;
 
         let result = graph
             .update_chat_session(uuid::Uuid::new_v4(), None, None, None, None, None, None)
@@ -6001,7 +6054,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_delete_nonexistent() {
         let state = mock_app_state();
-        let graph = &state.neo4j;
+        let graph = &state.indentiagraph;
 
         let deleted = graph
             .delete_chat_session(uuid::Uuid::new_v4())
@@ -6045,7 +6098,7 @@ mod tests {
     #[test]
     fn test_new_without_memory_has_no_injector() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         assert!(manager.context_injector.is_none());
         assert!(manager.memory_config.is_none());
@@ -6058,7 +6111,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_session_messages_no_injector() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         // Session doesn't exist in mock store — should get "not found"
         let result = manager
@@ -6071,7 +6124,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_session_messages_invalid_uuid() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager.get_session_messages("not-a-uuid", None, None).await;
         assert!(result.is_err());
@@ -6089,16 +6142,16 @@ mod tests {
     #[tokio::test]
     async fn test_get_session_messages_returns_tool_use_events() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(
-            state.neo4j.clone(),
-            state.meili.clone(),
-            test_config(),
-        );
+        let manager = ChatManager::new_without_memory(state.indentiagraph.clone(), test_config());
 
         // Create a session
         let session = test_chat_session(None);
         let session_id = session.id;
-        state.neo4j.create_chat_session(&session).await.unwrap();
+        state
+            .indentiagraph
+            .create_chat_session(&session)
+            .await
+            .unwrap();
 
         // Store events including tool_use and tool_result
         let events = vec![
@@ -6155,7 +6208,7 @@ mod tests {
             },
         ];
         state
-            .neo4j
+            .indentiagraph
             .store_chat_events(session_id, events)
             .await
             .unwrap();
@@ -6198,15 +6251,15 @@ mod tests {
     #[tokio::test]
     async fn test_get_session_messages_pagination() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(
-            state.neo4j.clone(),
-            state.meili.clone(),
-            test_config(),
-        );
+        let manager = ChatManager::new_without_memory(state.indentiagraph.clone(), test_config());
 
         let session = test_chat_session(None);
         let session_id = session.id;
-        state.neo4j.create_chat_session(&session).await.unwrap();
+        state
+            .indentiagraph
+            .create_chat_session(&session)
+            .await
+            .unwrap();
 
         // Store 5 events
         let events: Vec<ChatEventRecord> = (1..=5)
@@ -6224,7 +6277,7 @@ mod tests {
             })
             .collect();
         state
-            .neo4j
+            .indentiagraph
             .store_chat_events(session_id, events)
             .await
             .unwrap();
@@ -6260,16 +6313,16 @@ mod tests {
     #[tokio::test]
     async fn test_get_session_messages_empty_session() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(
-            state.neo4j.clone(),
-            state.meili.clone(),
-            test_config(),
-        );
+        let manager = ChatManager::new_without_memory(state.indentiagraph.clone(), test_config());
 
         // Create session with no events
         let session = test_chat_session(None);
         let session_id = session.id;
-        state.neo4j.create_chat_session(&session).await.unwrap();
+        state
+            .indentiagraph
+            .create_chat_session(&session)
+            .await
+            .unwrap();
 
         let page = manager
             .get_session_messages(&session_id.to_string(), None, None)
@@ -6288,7 +6341,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_update_conversation_id() {
         let state = mock_app_state();
-        let graph = &state.neo4j;
+        let graph = &state.indentiagraph;
 
         let session = test_chat_session(None);
         graph.create_chat_session(&session).await.unwrap();
@@ -6318,7 +6371,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_create_with_conversation_id() {
         let state = mock_app_state();
-        let graph = &state.neo4j;
+        let graph = &state.indentiagraph;
 
         let mut session = test_chat_session(Some("proj"));
         session.conversation_id = Some("conv-init-456".into());
@@ -6331,7 +6384,7 @@ mod tests {
     #[tokio::test]
     async fn test_chat_session_conversation_id_survives_other_updates() {
         let state = mock_app_state();
-        let graph = &state.neo4j;
+        let graph = &state.indentiagraph;
 
         let session = test_chat_session(None);
         graph.create_chat_session(&session).await.unwrap();
@@ -6430,7 +6483,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_streaming_snapshot_nonexistent_session() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let (is_streaming, text, events) = manager.get_streaming_snapshot("nonexistent").await;
         assert!(!is_streaming);
@@ -6495,7 +6548,7 @@ mod tests {
         };
 
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         manager
             .active_sessions
@@ -6532,7 +6585,7 @@ mod tests {
         };
 
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         manager
             .active_sessions
@@ -6561,7 +6614,7 @@ mod tests {
         };
 
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let session_id = Uuid::new_v4().to_string();
 
         manager
@@ -6588,7 +6641,7 @@ mod tests {
         };
 
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let session_id = Uuid::new_v4().to_string();
 
         manager
@@ -6811,25 +6864,11 @@ mod tests {
         }
 
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         assert!(manager.event_emitter.is_none());
 
         let manager = manager.with_event_emitter(Arc::new(DummyEmitter));
         assert!(manager.event_emitter.is_some());
-    }
-
-    // ====================================================================
-    // backfill_previews_from_meilisearch — early return when no injector
-    // ====================================================================
-
-    #[tokio::test]
-    async fn test_backfill_previews_no_injector_returns_zero() {
-        let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
-        // new_without_memory => context_injector is None => should return Ok(0)
-        let result = manager.backfill_previews_from_meilisearch().await;
-        assert!(result.is_ok());
-        assert_eq!(result.unwrap(), 0);
     }
 
     // ====================================================================
@@ -6841,11 +6880,15 @@ mod tests {
         let state = mock_app_state();
         let session = test_chat_session(Some("test-proj"));
         let session_id = session.id;
-        state.neo4j.create_chat_session(&session).await.unwrap();
+        state
+            .indentiagraph
+            .create_chat_session(&session)
+            .await
+            .unwrap();
 
         // Update title
         let updated = state
-            .neo4j
+            .indentiagraph
             .update_chat_session(
                 session_id,
                 None,
@@ -6868,10 +6911,14 @@ mod tests {
         let state = mock_app_state();
         let session = test_chat_session(None);
         let session_id = session.id;
-        state.neo4j.create_chat_session(&session).await.unwrap();
+        state
+            .indentiagraph
+            .create_chat_session(&session)
+            .await
+            .unwrap();
 
         let updated = state
-            .neo4j
+            .indentiagraph
             .update_chat_session(
                 session_id,
                 None,
@@ -6895,10 +6942,14 @@ mod tests {
         let state = mock_app_state();
         let session = test_chat_session(None);
         let session_id = session.id;
-        state.neo4j.create_chat_session(&session).await.unwrap();
+        state
+            .indentiagraph
+            .create_chat_session(&session)
+            .await
+            .unwrap();
 
         let updated = state
-            .neo4j
+            .indentiagraph
             .update_chat_session(session_id, None, None, Some(42), Some(1.50), None, None)
             .await
             .unwrap();
@@ -6913,7 +6964,7 @@ mod tests {
         let state = mock_app_state();
         let fake_id = Uuid::new_v4();
         let updated = state
-            .neo4j
+            .indentiagraph
             .update_chat_session(fake_id, None, None, None, None, None, None)
             .await
             .unwrap();
@@ -6925,10 +6976,14 @@ mod tests {
         let state = mock_app_state();
         let session = test_chat_session(None);
         let session_id = session.id;
-        state.neo4j.create_chat_session(&session).await.unwrap();
+        state
+            .indentiagraph
+            .create_chat_session(&session)
+            .await
+            .unwrap();
 
         let updated = state
-            .neo4j
+            .indentiagraph
             .update_chat_session(
                 session_id,
                 Some("cli-session-xyz".into()),
@@ -6954,11 +7009,15 @@ mod tests {
         session.title = Some("Original title".into());
         session.preview = Some("Original preview".into());
         let session_id = session.id;
-        state.neo4j.create_chat_session(&session).await.unwrap();
+        state
+            .indentiagraph
+            .create_chat_session(&session)
+            .await
+            .unwrap();
 
         // Update only message_count — should preserve title and preview
         let updated = state
-            .neo4j
+            .indentiagraph
             .update_chat_session(session_id, None, None, Some(10), None, None, None)
             .await
             .unwrap();
@@ -6976,7 +7035,7 @@ mod tests {
     #[tokio::test]
     async fn test_backfill_session_previews_mock_returns_zero() {
         let state = mock_app_state();
-        let result = state.neo4j.backfill_chat_session_previews().await;
+        let result = state.indentiagraph.backfill_chat_session_previews().await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 0);
     }
@@ -7059,7 +7118,7 @@ mod tests {
     async fn test_try_remote_send_no_nats() {
         // ChatManager without NATS → try_remote_send should return Ok(false) immediately
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         // No NATS configured → should return false (fallback needed)
         assert!(manager.nats.is_none());
@@ -7074,7 +7133,7 @@ mod tests {
     async fn test_try_remote_send_all_message_types_no_nats() {
         // Verify all message types return Ok(false) without NATS
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         for msg_type in &["user_message", "permission_response", "input_response"] {
             let result = manager
@@ -7089,7 +7148,7 @@ mod tests {
     async fn test_interrupt_no_local_session_no_nats() {
         // interrupt() should succeed silently when session is not local and no NATS
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         // No session active, no NATS → should return Ok (no error)
         let result = manager.interrupt("nonexistent-session").await;
@@ -7103,7 +7162,7 @@ mod tests {
     async fn test_spawn_nats_rpc_listener_noop_without_nats() {
         // Verifies that spawn_nats_rpc_listener is a no-op without NATS (no panic, no error)
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         // This should be a complete no-op — no NATS means early return
         manager.spawn_nats_rpc_listener(
@@ -7119,7 +7178,7 @@ mod tests {
         // When a session is active locally, is_session_active returns true
         // → the routing logic should choose send_message (local path)
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         // No active sessions → is_session_active should return false
         assert!(!manager.is_session_active("some-session").await);
@@ -7146,7 +7205,7 @@ mod tests {
         // Write an existing config.yaml with other sections
         std::fs::write(
             &yaml_path,
-            "server:\n  port: 9090\nneo4j:\n  uri: bolt://db:7687\nchat:\n  default_model: claude-sonnet\n",
+            "server:\n  port: 9090\nindentiagraph:\n  uri: ws://db:8000\nchat:\n  default_model: claude-sonnet\n",
         )
         .unwrap();
 
@@ -7169,9 +7228,9 @@ mod tests {
             "server.port should be preserved"
         );
         assert_eq!(
-            doc["neo4j"]["uri"].as_str().unwrap(),
-            "bolt://db:7687",
-            "neo4j.uri should be preserved"
+            doc["indentiagraph"]["uri"].as_str().unwrap(),
+            "ws://db:8000",
+            "indentiagraph.uri should be preserved"
         );
         // Existing chat fields preserved
         assert_eq!(
@@ -7258,9 +7317,12 @@ mod tests {
 
         // Reload via Config::from_yaml_and_env
         // Clear env vars that would override
-        std::env::remove_var("CHAT_PERMISSION_MODE");
-        std::env::remove_var("CHAT_ALLOWED_TOOLS");
-        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        // SAFETY: test-only env var manipulation
+        unsafe {
+            std::env::remove_var("CHAT_PERMISSION_MODE");
+            std::env::remove_var("CHAT_ALLOWED_TOOLS");
+            std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        }
 
         let config = crate::Config::from_yaml_and_env(Some(&yaml_path)).unwrap();
         let loaded_perm = config
@@ -7307,7 +7369,7 @@ mod tests {
         std::fs::write(&yaml_path, "chat:\n  default_model: test\n").unwrap();
 
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config())
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config())
             .with_config_yaml_path(yaml_path.clone());
 
         let new_perm = super::super::config::PermissionConfig {
@@ -7696,7 +7758,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_permission_response_no_session_errors() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager
             .send_permission_response("nonexistent-session-id", "req-001", true)
@@ -7714,7 +7776,7 @@ mod tests {
     #[tokio::test]
     async fn test_interrupt_no_session_errors() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager.interrupt("nonexistent-session-id").await;
         // The manager falls back to NATS publish when no local session exists.
@@ -7733,7 +7795,7 @@ mod tests {
     #[tokio::test]
     async fn test_interrupt_sets_flag_atomically() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let (session, _handle) = mock_active_session(false);
         let flag = session.interrupt_flag.clone();
 
@@ -7768,7 +7830,7 @@ mod tests {
     #[tokio::test]
     async fn test_interrupt_does_not_wait_for_client_lock() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let (session, _handle) = mock_active_session(true);
         let flag = session.interrupt_flag.clone();
         let client_lock = session.client.clone();
@@ -7805,7 +7867,7 @@ mod tests {
     #[tokio::test]
     async fn test_interrupt_during_active_stream() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let (session, _handle) = mock_active_session(true);
         let interrupt_flag = session.interrupt_flag.clone();
         let is_streaming = session.is_streaming.clone();
@@ -7838,7 +7900,7 @@ mod tests {
     #[tokio::test]
     async fn test_interrupt_latency_benchmark() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let iterations = 100u32;
         let mut flags = Vec::with_capacity(iterations as usize);
@@ -7883,7 +7945,7 @@ mod tests {
     #[tokio::test]
     async fn test_double_interrupt_is_idempotent() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let (session, _handle) = mock_active_session(false);
         let flag = session.interrupt_flag.clone();
 
@@ -7909,7 +7971,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_permission_response_allow_via_mock() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let (mut session, _handle) = mock_active_session(false);
 
         // Create a stdin channel to capture the control response
@@ -7966,7 +8028,7 @@ mod tests {
     #[tokio::test]
     async fn test_send_permission_response_deny_via_mock() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let (mut session, _handle) = mock_active_session(false);
 
         // Create a stdin channel to capture the control response
@@ -8012,7 +8074,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_session_model_sends_control_request_via_stdin() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let (mut session, _handle) = mock_active_session(false);
 
         // Create a stdin channel to capture the control request
@@ -8073,7 +8135,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_session_model_fails_without_stdin() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
         let (session, _handle) = mock_active_session(false);
         // stdin_tx is None by default
 
@@ -8098,7 +8160,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_session_model_fails_for_unknown_session() {
         let state = mock_app_state();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, test_config());
+        let manager = ChatManager::new_without_memory(state.indentiagraph, test_config());
 
         let result = manager
             .set_session_model("nonexistent-session", "claude-opus-4-20250514")
@@ -8378,7 +8440,7 @@ mod tests {
         let mut config = test_config();
         config.process_path = Some("/test/path:/usr/bin:/bin".into());
         config.claude_cli_path = Some("/test/claude".into());
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let manager = ChatManager::new_without_memory(state.indentiagraph, config);
 
         let options = manager
             .build_options(
@@ -8414,7 +8476,7 @@ mod tests {
     async fn test_build_options_without_path_no_injection() {
         let state = mock_app_state();
         let config = test_config(); // process_path=None, claude_cli_path=None
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let manager = ChatManager::new_without_memory(state.indentiagraph, config);
 
         let options = manager
             .build_options(
@@ -8449,7 +8511,7 @@ mod tests {
     async fn test_runtime_env_config_update_methods() {
         let state = mock_app_state();
         let config = test_config();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let manager = ChatManager::new_without_memory(state.indentiagraph, config);
 
         // Initial state: all None / false
         let env = manager.get_env_config().await;
@@ -8486,7 +8548,7 @@ mod tests {
     async fn test_runtime_env_config_affects_build_options() {
         let state = mock_app_state();
         let config = test_config();
-        let manager = ChatManager::new_without_memory(state.neo4j, state.meili, config);
+        let manager = ChatManager::new_without_memory(state.indentiagraph, config);
 
         // Initially no PATH injection
         let options = manager

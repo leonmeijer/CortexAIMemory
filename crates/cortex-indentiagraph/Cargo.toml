@@ -1,0 +1,43 @@
+[package]
+name = "cortex-indentiagraph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "IndentiaGraph (SurrealDB) backend for CortexAIMemory GraphStore"
+
+[dependencies]
+cortex-core = { path = "../cortex-core" }
+cortex-graph = { path = "../cortex-graph" }
+
+# SurrealDB v3
+surrealdb = { version = "3.0.2", default-features = false, features = [
+    "kv-mem",
+    "kv-surrealkv",
+    "protocol-ws",
+    "rustls",
+] }
+
+# Async
+tokio = { version = "1.49", features = ["full"] }
+async-trait = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# SurrealDB types (for derive macros)
+surrealdb-types = "3"
+
+# Utilities
+uuid = { workspace = true }
+chrono = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1"
+regex = "1"
+glob = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tempfile = "3"

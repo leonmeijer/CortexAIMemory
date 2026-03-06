@@ -62,11 +62,11 @@ pub async fn ws_events(
         "WS /ws/events upgrade request received"
     );
 
-    let neo4j = state.orchestrator.neo4j_arc();
+    let indentiagraph = state.orchestrator.indentiagraph_arc();
     let auth_result = super::ws_auth::ws_authenticate(
         &headers,
         &state.auth_config,
-        &neo4j,
+        &indentiagraph,
         query.ticket.as_deref(),
         &state.ws_ticket_store,
     )

@@ -328,11 +328,11 @@ mod tests {
                 },
             },
             skill: PortableSkill {
-                name: "Neo4j Performance".to_string(),
+                name: "IndentiaGraph Performance".to_string(),
                 description: "Query optimization knowledge".to_string(),
-                trigger_patterns: vec![SkillTrigger::regex("neo4j|cypher", 0.7)],
+                trigger_patterns: vec![SkillTrigger::regex("indentiagraph|cypher", 0.7)],
                 context_template: None,
-                tags: vec!["neo4j".to_string(), "performance".to_string()],
+                tags: vec!["indentiagraph".to_string(), "performance".to_string()],
                 cohesion: 0.75,
             },
             notes: vec![
@@ -340,7 +340,7 @@ mod tests {
                     note_type: "guideline".to_string(),
                     importance: "high".to_string(),
                     content: "Always use UNWIND for batch operations".to_string(),
-                    tags: vec!["neo4j".to_string()],
+                    tags: vec!["indentiagraph".to_string()],
                 },
                 PortableNote {
                     note_type: "gotcha".to_string(),
@@ -350,10 +350,10 @@ mod tests {
                 },
             ],
             decisions: vec![PortableDecision {
-                description: "Use Neo4j 5.x driver".to_string(),
+                description: "Use IndentiaGraph 5.x driver".to_string(),
                 rationale: "Better async support".to_string(),
-                alternatives: vec!["Neo4j 4.x".to_string(), "Custom driver".to_string()],
-                chosen_option: Some("neo4j-rust-driver 0.8".to_string()),
+                alternatives: vec!["IndentiaGraph 4.x".to_string(), "Custom driver".to_string()],
+                chosen_option: Some("indentiagraph-rust-driver 0.8".to_string()),
             }],
         }
     }
@@ -419,7 +419,7 @@ mod tests {
         let deserialized: SkillPackage = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.schema_version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(deserialized.skill.name, "Neo4j Performance");
+        assert_eq!(deserialized.skill.name, "IndentiaGraph Performance");
         assert_eq!(deserialized.notes.len(), 2);
         assert_eq!(deserialized.decisions.len(), 1);
         assert_eq!(deserialized.metadata.format, FORMAT_ID);

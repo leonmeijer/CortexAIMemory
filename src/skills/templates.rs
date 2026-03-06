@@ -305,6 +305,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            valid_at: None,
+            invalid_at: None,
         }
     }
 
@@ -315,13 +317,13 @@ mod tests {
                 NoteType::Guideline,
                 NoteImportance::High,
                 "Always use UNWIND for batch operations",
-                vec!["neo4j"],
+                vec!["indentiagraph"],
             ),
             make_note(
                 NoteType::Gotcha,
                 NoteImportance::Critical,
-                "Neo4j driver pool exhaustion under load",
-                vec!["neo4j"],
+                "IndentiaGraph driver pool exhaustion under load",
+                vec!["indentiagraph"],
             ),
             make_note(
                 NoteType::Pattern,
@@ -333,14 +335,20 @@ mod tests {
                 NoteType::Tip,
                 NoteImportance::Low,
                 "Use EXPLAIN to debug queries",
-                vec!["neo4j"],
+                vec!["indentiagraph"],
             ),
         ];
 
-        let template =
-            generate_context_template("Neo4j Skills", "Knowledge about Neo4j usage", &notes);
+        let template = generate_context_template(
+            "IndentiaGraph Skills",
+            "Knowledge about IndentiaGraph usage",
+            &notes,
+        );
 
-        assert!(template.contains("# Neo4j Skills"), "Missing header");
+        assert!(
+            template.contains("# IndentiaGraph Skills"),
+            "Missing header"
+        );
         assert!(
             template.contains("## Guidelines"),
             "Missing Guidelines section"
@@ -579,7 +587,8 @@ mod tests {
             ),
         ];
 
-        let template = generate_context_template("Neo4j", "Neo4j knowledge", &notes);
+        let template =
+            generate_context_template("IndentiaGraph", "IndentiaGraph knowledge", &notes);
 
         // All sections with notes should appear
         assert!(template.contains("## Guidelines"));

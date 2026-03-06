@@ -1,7 +1,7 @@
 //! Project API handlers
 
 use crate::api::{PaginatedResponse, PaginationParams, SearchFilter};
-use crate::neo4j::models::ProjectNode;
+use crate::indentiagraph::models::ProjectNode;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -67,7 +67,7 @@ pub async fn list_projects(
 
     let (projects, total) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_projects_filtered(
             query.search_filter.search.as_deref(),
             query.pagination.validated_limit(),
@@ -81,13 +81,13 @@ pub async fn list_projects(
     for project in &projects {
         let file_count = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .count_project_files(project.id)
             .await
             .unwrap_or(0);
         let plan_count = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .count_project_plans(project.id)
             .await
             .unwrap_or(0);
@@ -124,7 +124,7 @@ pub async fn create_project(
     // Check if slug already exists
     if state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&slug)
         .await?
         .is_some()
@@ -171,20 +171,20 @@ pub async fn get_project(
 ) -> Result<Json<ProjectResponse>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
     let file_count = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .count_project_files(project.id)
         .await
         .unwrap_or(0);
     let plan_count = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .count_project_plans(project.id)
         .await
         .unwrap_or(0);
@@ -218,12 +218,12 @@ pub async fn update_project(
 ) -> Result<StatusCode, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
-    // Use orchestrator.update_project() instead of neo4j() directly so that
+    // Use orchestrator.update_project() instead of indentiagraph() directly so that
     // a CrudEvent::Updated is emitted — the ProjectWatcherBridge listens for
     // root_path changes to re-register the project on the file watcher.
     state
@@ -241,7 +241,7 @@ pub async fn delete_project(
 ) -> Result<StatusCode, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
@@ -276,7 +276,7 @@ pub async fn sync_project(
 ) -> Result<Json<SyncProjectResponse>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
@@ -292,7 +292,7 @@ pub async fn sync_project(
     // Update last_synced timestamp
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .update_project_synced(project.id)
         .await?;
 
@@ -324,10 +324,10 @@ pub async fn list_project_plans(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
     Query(query): Query<ProjectPlansQuery>,
-) -> Result<Json<PaginatedResponse<crate::neo4j::models::PlanNode>>, AppError> {
+) -> Result<Json<PaginatedResponse<crate::indentiagraph::models::PlanNode>>, AppError> {
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
@@ -340,7 +340,7 @@ pub async fn list_project_plans(
 
     let (plans, total) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_plans_for_project(project.id, status_filter, limit, offset)
         .await?;
 
@@ -358,28 +358,18 @@ pub struct ProjectCodeSearchQuery {
 pub async fn search_project_code(
     State(state): State<OrchestratorState>,
     Path(slug): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<ProjectCodeSearchQuery>,
-) -> Result<Json<Vec<crate::meilisearch::indexes::CodeDocument>>, AppError> {
+    axum::extract::Query(_query): axum::extract::Query<ProjectCodeSearchQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, AppError> {
     // Verify project exists
     let _project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project '{}' not found", slug)))?;
 
-    let results = state
-        .orchestrator
-        .meili()
-        .search_code_in_project(
-            &query.q,
-            query.limit.unwrap_or(10),
-            query.language.as_deref(),
-            Some(&slug),
-        )
-        .await?;
-
-    Ok(Json(results))
+    // Full-text search will be implemented via SurrealDB BM25 indexes
+    Ok(Json(vec![]))
 }
 
 // ============================================================================
@@ -466,7 +456,7 @@ mod tests {
 
     use crate::api::handlers::ServerState;
     use crate::api::routes::create_router;
-    use crate::neo4j::models::FileNode;
+    use crate::indentiagraph::models::FileNode;
     use crate::orchestrator::watcher::FileWatcher;
     use crate::orchestrator::Orchestrator;
     use crate::test_helpers::{
@@ -538,7 +528,11 @@ mod tests {
 
         // Seed a project with files and plans
         let project = test_project_named("my-proj");
-        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_project(&project)
+            .await
+            .unwrap();
 
         // Add 2 files
         for i in 0..2 {
@@ -550,9 +544,9 @@ mod tests {
                 last_parsed: chrono::Utc::now(),
                 project_id: Some(project.id),
             };
-            app_state.neo4j.upsert_file(&file).await.unwrap();
+            app_state.indentiagraph.upsert_file(&file).await.unwrap();
             app_state
-                .neo4j
+                .indentiagraph
                 .link_file_to_project(&path, project.id)
                 .await
                 .unwrap();
@@ -560,9 +554,9 @@ mod tests {
 
         // Add 1 plan (Draft)
         let plan = crate::test_helpers::test_plan_for_project(project.id);
-        app_state.neo4j.create_plan(&plan).await.unwrap();
+        app_state.indentiagraph.create_plan(&plan).await.unwrap();
         app_state
-            .neo4j
+            .indentiagraph
             .link_plan_to_project(plan.id, project.id)
             .await
             .unwrap();
@@ -607,7 +601,11 @@ mod tests {
         let app_state = mock_app_state();
 
         let project = test_project_named("detail-proj");
-        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_project(&project)
+            .await
+            .unwrap();
 
         // Add 3 files
         for i in 0..3 {
@@ -619,9 +617,9 @@ mod tests {
                 last_parsed: chrono::Utc::now(),
                 project_id: Some(project.id),
             };
-            app_state.neo4j.upsert_file(&file).await.unwrap();
+            app_state.indentiagraph.upsert_file(&file).await.unwrap();
             app_state
-                .neo4j
+                .indentiagraph
                 .link_file_to_project(&path, project.id)
                 .await
                 .unwrap();

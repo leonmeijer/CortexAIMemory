@@ -15,7 +15,7 @@ use std::path::PathBuf;
 
 const GITHUB_REPO_OWNER: &str = "this-rs";
 const GITHUB_REPO_NAME: &str = "project-orchestrator";
-const BINARY_NAME: &str = "orchestrator";
+const BINARY_NAME: &str = "cortex";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ============================================================================
@@ -299,7 +299,7 @@ pub async fn perform_update(info: &UpdateInfo) -> Result<UpdateStatus> {
     })
 }
 
-/// Extract the orchestrator binary from a tar.gz or zip archive.
+/// Extract the cortex binary from a tar.gz or zip archive.
 fn extract_binary_from_archive(archive_bytes: &[u8]) -> Result<Vec<u8>> {
     #[cfg(not(target_os = "windows"))]
     {

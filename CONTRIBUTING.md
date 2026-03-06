@@ -46,7 +46,7 @@ Thank you for your interest in contributing to Project Orchestrator! This docume
 - Write tests for new functionality
 - Ensure all tests pass before submitting a PR: `cargo test`
 - **Unit tests** use mock backends (`MockGraphStore`, `MockSearchStore`) — no external services needed
-- **Integration tests** require Neo4j and Meilisearch running
+- **Integration tests** require IndentiaGraph and Meilisearch running
 - Current test count: **1992 tests** (unit + integration)
 
 ### Commit Messages
@@ -72,7 +72,7 @@ Types:
 Examples:
 ```
 feat(workspace): add multi-project support
-fix(neo4j): handle connection timeout gracefully
+fix(indentiagraph): handle connection timeout gracefully
 docs(api): update REST endpoint documentation
 test(mcp): add unit tests for workspace handlers
 ```
@@ -108,7 +108,7 @@ src/
 ├── config/        # YAML configuration system with env var overrides
 ├── events/        # Event bus: CRUD notifications via WebSocket + NATS inter-process sync
 ├── mcp/           # MCP server and tool definitions (19 mega-tools)
-├── neo4j/         # Neo4j client, models, GraphStore trait + mock
+├── indentiagraph/         # IndentiaGraph client, models, GraphStore trait + mock
 ├── meilisearch/   # Search client, SearchStore trait + mock
 ├── parser/        # Tree-sitter code parsing (16 languages)
 ├── plan/          # Plan and task management

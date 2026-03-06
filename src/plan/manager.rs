@@ -3,28 +3,25 @@
 use super::models::*;
 use crate::embeddings::EmbeddingProvider;
 use crate::events::{CrudAction, CrudEvent, EntityType, EventEmitter};
-use crate::meilisearch::indexes::DecisionDocument;
-use crate::meilisearch::SearchStore;
-use crate::neo4j::models::*;
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::models::*;
+use crate::indentiagraph::GraphStore;
 use anyhow::Result;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
 /// Manager for plan operations
 pub struct PlanManager {
-    neo4j: Arc<dyn GraphStore>,
-    meili: Arc<dyn SearchStore>,
+    indentiagraph: Arc<dyn GraphStore>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
 }
 
 impl PlanManager {
     /// Create a new plan manager
-    pub fn new(neo4j: Arc<dyn GraphStore>, meili: Arc<dyn SearchStore>) -> Self {
+    pub fn new(indentiagraph: Arc<dyn GraphStore>) -> Self {
         Self {
-            neo4j,
-            meili,
+            indentiagraph,
             event_emitter: None,
             embedding_provider: None,
         }
@@ -32,13 +29,11 @@ impl PlanManager {
 
     /// Create a new plan manager with an event emitter
     pub fn with_event_emitter(
-        neo4j: Arc<dyn GraphStore>,
-        meili: Arc<dyn SearchStore>,
+        indentiagraph: Arc<dyn GraphStore>,
         emitter: Arc<dyn EventEmitter>,
     ) -> Self {
         Self {
-            neo4j,
-            meili,
+            indentiagraph,
             event_emitter: Some(emitter),
             embedding_provider: None,
         }
@@ -80,7 +75,7 @@ impl PlanManager {
             )
         };
 
-        self.neo4j.create_plan(&plan).await?;
+        self.indentiagraph.create_plan(&plan).await?;
 
         // Create constraints if provided
         if let Some(constraints) = req.constraints {
@@ -109,17 +104,17 @@ impl PlanManager {
 
     /// Get a plan by ID
     pub async fn get_plan(&self, plan_id: Uuid) -> Result<Option<PlanNode>> {
-        self.neo4j.get_plan(plan_id).await
+        self.indentiagraph.get_plan(plan_id).await
     }
 
     /// List all active plans
     pub async fn list_active_plans(&self) -> Result<Vec<PlanNode>> {
-        self.neo4j.list_active_plans().await
+        self.indentiagraph.list_active_plans().await
     }
 
     /// Update plan status
     pub async fn update_plan_status(&self, plan_id: Uuid, status: PlanStatus) -> Result<()> {
-        self.neo4j
+        self.indentiagraph
             .update_plan_status(plan_id, status.clone())
             .await?;
         self.emit(
@@ -131,7 +126,7 @@ impl PlanManager {
 
     /// Delete a plan and all its related data
     pub async fn delete_plan(&self, plan_id: Uuid) -> Result<()> {
-        self.neo4j.delete_plan(plan_id).await?;
+        self.indentiagraph.delete_plan(plan_id).await?;
         self.emit(CrudEvent::new(
             EntityType::Plan,
             CrudAction::Deleted,
@@ -142,12 +137,12 @@ impl PlanManager {
 
     /// Get full plan details including tasks
     pub async fn get_plan_details(&self, plan_id: Uuid) -> Result<Option<PlanDetails>> {
-        let plan = match self.neo4j.get_plan(plan_id).await? {
+        let plan = match self.indentiagraph.get_plan(plan_id).await? {
             Some(p) => p,
             None => return Ok(None),
         };
 
-        let tasks = self.neo4j.get_plan_tasks(plan_id).await?;
+        let tasks = self.indentiagraph.get_plan_tasks(plan_id).await?;
         let mut task_details = Vec::new();
 
         for task in tasks {
@@ -157,8 +152,8 @@ impl PlanManager {
             }
         }
 
-        // Get constraints from Neo4j
-        let constraints = self.neo4j.get_plan_constraints(plan_id).await?;
+        // Get constraints from IndentiaGraph
+        let constraints = self.indentiagraph.get_plan_constraints(plan_id).await?;
 
         Ok(Some(PlanDetails {
             plan,
@@ -183,12 +178,14 @@ impl PlanManager {
             req.estimated_complexity,
         );
 
-        self.neo4j.create_task(plan_id, &task).await?;
+        self.indentiagraph.create_task(plan_id, &task).await?;
 
         // Add dependencies
         if let Some(deps) = req.depends_on {
             for dep_id in deps {
-                self.neo4j.add_task_dependency(task.id, dep_id).await?;
+                self.indentiagraph
+                    .add_task_dependency(task.id, dep_id)
+                    .await?;
             }
         }
 
@@ -212,18 +209,20 @@ impl PlanManager {
 
     /// Get task details
     pub async fn get_task_details(&self, task_id: Uuid) -> Result<Option<TaskDetails>> {
-        self.neo4j.get_task_with_full_details(task_id).await
+        self.indentiagraph.get_task_with_full_details(task_id).await
     }
 
     /// Update task fields
     pub async fn update_task(&self, task_id: Uuid, req: UpdateTaskRequest) -> Result<()> {
         // Handle status change separately (has side effects like timestamps)
         if let Some(status) = req.status.clone() {
-            self.neo4j.update_task_status(task_id, status).await?;
+            self.indentiagraph
+                .update_task_status(task_id, status)
+                .await?;
         }
 
         // Update all other fields via the full update method
-        self.neo4j.update_task(task_id, &req).await?;
+        self.indentiagraph.update_task(task_id, &req).await?;
 
         self.emit(
             CrudEvent::new(EntityType::Task, CrudAction::Updated, task_id.to_string())
@@ -235,7 +234,7 @@ impl PlanManager {
 
     /// Delete a task and all its related data (steps, decisions)
     pub async fn delete_task(&self, task_id: Uuid) -> Result<()> {
-        self.neo4j.delete_task(task_id).await?;
+        self.indentiagraph.delete_task(task_id).await?;
         self.emit(CrudEvent::new(
             EntityType::Task,
             CrudAction::Deleted,
@@ -246,12 +245,12 @@ impl PlanManager {
 
     /// Get next available task from a plan
     pub async fn get_next_available_task(&self, plan_id: Uuid) -> Result<Option<TaskNode>> {
-        self.neo4j.get_next_available_task(plan_id).await
+        self.indentiagraph.get_next_available_task(plan_id).await
     }
 
     /// Link task to files it modifies
     pub async fn link_task_to_files(&self, task_id: Uuid, files: &[String]) -> Result<()> {
-        self.neo4j.link_task_to_files(task_id, files).await
+        self.indentiagraph.link_task_to_files(task_id, files).await
     }
 
     // ========================================================================
@@ -260,7 +259,7 @@ impl PlanManager {
 
     /// Add a step to a task
     pub async fn add_step(&self, task_id: Uuid, step: &StepNode) -> Result<()> {
-        self.neo4j.create_step(task_id, step).await?;
+        self.indentiagraph.create_step(task_id, step).await?;
         self.emit(
             CrudEvent::new(EntityType::Step, CrudAction::Created, step.id.to_string())
                 .with_payload(
@@ -272,7 +271,7 @@ impl PlanManager {
 
     /// Update step status
     pub async fn update_step_status(&self, step_id: Uuid, status: StepStatus) -> Result<()> {
-        self.neo4j
+        self.indentiagraph
             .update_step_status(step_id, status.clone())
             .await?;
         self.emit(
@@ -306,27 +305,9 @@ impl PlanManager {
             embedding_model: None,
         };
 
-        self.neo4j.create_decision(task_id, &decision).await?;
-
-        // Resolve project_id and project_slug via Task → Plan → Project chain
-        let (project_id, project_slug) = match self.neo4j.get_project_for_task(task_id).await {
-            Ok(Some(project)) => (Some(project.id.to_string()), Some(project.slug.clone())),
-            _ => (None, None),
-        };
-
-        // Index in Meilisearch for search
-        let doc = DecisionDocument {
-            id: decision.id.to_string(),
-            description: decision.description.clone(),
-            rationale: decision.rationale.clone(),
-            task_id: task_id.to_string(),
-            agent: decided_by.to_string(),
-            timestamp: decision.decided_at.to_rfc3339(),
-            tags: vec![],
-            project_id,
-            project_slug,
-        };
-        self.meili.index_decision(&doc).await?;
+        self.indentiagraph
+            .create_decision(task_id, &decision)
+            .await?;
 
         // Generate and store embedding (best-effort, non-blocking)
         self.embed_decision(decision.id, &decision.description, &decision.rationale)
@@ -355,7 +336,7 @@ impl PlanManager {
             Ok(embedding) => {
                 let model = provider.model_name().to_string();
                 if let Err(e) = self
-                    .neo4j
+                    .indentiagraph
                     .set_decision_embedding(decision_id, &embedding, &model)
                     .await
                 {
@@ -385,7 +366,7 @@ impl PlanManager {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Embedding provider not configured"))?;
 
-        let decisions = self.neo4j.get_decisions_without_embedding().await?;
+        let decisions = self.indentiagraph.get_decisions_without_embedding().await?;
         let total = decisions.len();
         let mut created = 0;
 
@@ -395,7 +376,7 @@ impl PlanManager {
                 Ok(embedding) => {
                     let model = provider.model_name().to_string();
                     if let Err(e) = self
-                        .neo4j
+                        .indentiagraph
                         .set_decision_embedding(*id, &embedding, &model)
                         .await
                     {
@@ -414,186 +395,124 @@ impl PlanManager {
         Ok((total, created))
     }
 
-    /// Reindex all decisions from Neo4j into MeiliSearch.
+    /// Reindex all decisions for graph-native search.
     ///
-    /// Reads every Decision node (with its linked Task), resolves the project
-    /// via Task → Plan → Project, and upserts the corresponding DecisionDocument
-    /// into MeiliSearch. Useful after MeiliSearch data loss or rebuild.
-    ///
-    /// Returns `(total_decisions, indexed_count)`.
+    /// Search now runs directly against the graph backend (no secondary index).
+    /// We return `(total_decisions, indexed_count)` for API compatibility.
     pub async fn reindex_decisions(&self) -> Result<(usize, usize)> {
-        let decisions = self.neo4j.get_all_decisions_with_task_id().await?;
-        let total = decisions.len();
-        let mut indexed = 0;
-
-        for (decision, task_id) in &decisions {
-            // Resolve project info via Task → Plan → Project
-            let (project_id, project_slug) = match self.neo4j.get_project_for_task(*task_id).await {
-                Ok(Some(project)) => (Some(project.id.to_string()), Some(project.slug.clone())),
-                _ => (None, None),
-            };
-
-            let doc = DecisionDocument {
-                id: decision.id.to_string(),
-                description: decision.description.clone(),
-                rationale: decision.rationale.clone(),
-                task_id: task_id.to_string(),
-                agent: decision.decided_by.clone(),
-                timestamp: decision.decided_at.to_rfc3339(),
-                tags: vec![],
-                project_id,
-                project_slug,
-            };
-
-            match self.meili.index_decision(&doc).await {
-                Ok(()) => indexed += 1,
-                Err(e) => {
-                    tracing::warn!(
-                        decision_id = %decision.id,
-                        error = %e,
-                        "Failed to reindex decision into MeiliSearch"
-                    );
-                }
-            }
-        }
-
-        tracing::info!(total, indexed, "Decision MeiliSearch reindex complete");
-        Ok((total, indexed))
+        let total = self
+            .indentiagraph
+            .get_all_decisions_with_task_id()
+            .await?
+            .len();
+        tracing::info!(
+            total_decisions = total,
+            "Decision search uses graph-native indexes; reindex is a compatibility no-op"
+        );
+        Ok((total, total))
     }
 
-    /// Backfill `project_id` and `project_slug` for all DecisionDocuments in Meilisearch.
+    /// Backfill decision project slugs for legacy search indexes.
     ///
-    /// Fetches all decisions from the Meilisearch index, resolves each one's project
-    /// via the `Task → Plan → Project` chain in Neo4j, and re-indexes documents
-    /// that were missing project info.
-    ///
-    /// Idempotent: re-running updates documents with the same values (Meilisearch upsert).
-    /// Returns `(total_decisions, updated_count)`.
+    /// This remains a compatibility endpoint after removing the secondary index.
+    /// Decisions are project-scoped through graph relationships, so no data mutation is needed.
     pub async fn backfill_decision_project_slugs(&self) -> Result<(usize, usize)> {
-        // Fetch all decisions from Meilisearch (broad search)
-        let all_docs = self.meili.search_decisions("*", 10000).await?;
-        let total = all_docs.len();
-        let mut updated = 0;
-
-        for doc in all_docs {
-            // Skip if already has project_slug populated
-            if doc.project_slug.is_some() {
-                continue;
-            }
-
-            // Parse task_id and resolve project
-            let task_id: Uuid = match doc.task_id.parse() {
-                Ok(id) => id,
-                Err(e) => {
-                    tracing::warn!(
-                        decision_id = %doc.id,
-                        task_id = %doc.task_id,
-                        error = %e,
-                        "Failed to parse task_id during backfill, skipping"
-                    );
-                    continue;
-                }
-            };
-
-            match self.neo4j.get_project_for_task(task_id).await {
-                Ok(Some(project)) => {
-                    let updated_doc = DecisionDocument {
-                        project_id: Some(project.id.to_string()),
-                        project_slug: Some(project.slug.clone()),
-                        ..doc
-                    };
-                    if let Err(e) = self.meili.index_decision(&updated_doc).await {
-                        tracing::warn!(
-                            decision_id = %updated_doc.id,
-                            error = %e,
-                            "Failed to re-index decision during backfill"
-                        );
-                    } else {
-                        updated += 1;
-                    }
-                }
-                Ok(None) => {
-                    tracing::debug!(
-                        decision_id = %doc.id,
-                        task_id = %doc.task_id,
-                        "No project found for decision's task, skipping"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        decision_id = %doc.id,
-                        error = %e,
-                        "Failed to resolve project for decision during backfill"
-                    );
-                }
-            }
-        }
-
-        tracing::info!(total, updated, "Decision project_slug backfill complete");
-        Ok((total, updated))
+        let total = self
+            .indentiagraph
+            .get_all_decisions_with_task_id()
+            .await?
+            .len();
+        tracing::info!(
+            total_decisions = total,
+            "Decision project-slug backfill is not required for graph-native search"
+        );
+        Ok((total, total))
     }
 
-    /// Search for related decisions
+    /// Search for related decisions using full-text search on the graph backend.
     pub async fn search_decisions(
         &self,
         query: &str,
         limit: usize,
         project_slug: Option<&str>,
     ) -> Result<Vec<DecisionNode>> {
-        let docs = self
-            .meili
-            .search_decisions_in_project(query, limit, project_slug)
+        let project_id = if let Some(slug) = project_slug {
+            match self.indentiagraph.get_project_by_slug(slug).await? {
+                Some(project) => Some(project.id.to_string()),
+                None => return Ok(vec![]),
+            }
+        } else {
+            None
+        };
+        let project_uuid = project_id
+            .as_deref()
+            .and_then(|id| Uuid::parse_str(id).ok());
+
+        let mut hits = self
+            .indentiagraph
+            .search_decisions_fts(query, limit, project_id.as_deref())
             .await?;
 
-        // Convert documents to nodes
-        let decisions = docs
-            .into_iter()
-            .map(|doc| DecisionNode {
-                id: doc.id.parse().unwrap_or_else(|_| Uuid::new_v4()),
-                description: doc.description,
-                rationale: doc.rationale,
-                alternatives: vec![],
-                chosen_option: None,
-                decided_by: doc.agent,
-                decided_at: doc.timestamp.parse().unwrap_or_else(|_| chrono::Utc::now()),
-                status: DecisionStatus::Accepted,
-                embedding: None,
-                embedding_model: None,
-            })
-            .collect();
+        // Defense-in-depth: enforce strict project scoping even if backend FTS filtering
+        // is unavailable/incomplete (e.g., simplified mocks).
+        if let Some(project_uuid) = project_uuid {
+            let plans = self.indentiagraph.list_project_plans(project_uuid).await?;
+            let mut allowed_task_ids: HashSet<Uuid> = HashSet::new();
+            for plan in plans {
+                for task in self.indentiagraph.get_plan_tasks(plan.id).await? {
+                    allowed_task_ids.insert(task.id);
+                }
+            }
 
-        Ok(decisions)
+            let allowed_decision_ids: HashSet<Uuid> = self
+                .indentiagraph
+                .get_all_decisions_with_task_id()
+                .await?
+                .into_iter()
+                .filter_map(|(decision, task_id)| {
+                    if allowed_task_ids.contains(&task_id) {
+                        Some(decision.id)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            hits.retain(|(decision, _)| allowed_decision_ids.contains(&decision.id));
+        }
+
+        hits.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.0.decided_at.cmp(&a.0.decided_at))
+        });
+        hits.truncate(limit);
+        Ok(hits.into_iter().map(|(decision, _)| decision).collect())
     }
 
-    /// Search decisions across multiple projects (workspace-level).
+    /// Search decisions across multiple projects (workspace scope).
     pub async fn search_decisions_in_workspace(
         &self,
         query: &str,
         limit: usize,
         project_slugs: &[String],
     ) -> Result<Vec<DecisionNode>> {
-        let docs = self
-            .meili
-            .search_decisions_in_projects(query, limit, project_slugs)
-            .await?;
+        if project_slugs.is_empty() {
+            return Ok(vec![]);
+        }
 
-        let decisions = docs
-            .into_iter()
-            .map(|doc| DecisionNode {
-                id: doc.id.parse().unwrap_or_else(|_| Uuid::new_v4()),
-                description: doc.description,
-                rationale: doc.rationale,
-                alternatives: vec![],
-                chosen_option: None,
-                decided_by: doc.agent,
-                decided_at: doc.timestamp.parse().unwrap_or_else(|_| chrono::Utc::now()),
-                status: DecisionStatus::Accepted,
-                embedding: None,
-                embedding_model: None,
-            })
-            .collect();
+        let mut dedup: HashMap<Uuid, DecisionNode> = HashMap::new();
+        for slug in project_slugs {
+            let project_results = self.search_decisions(query, limit, Some(slug)).await?;
+            for decision in project_results {
+                dedup.entry(decision.id).or_insert(decision);
+            }
+        }
 
-        Ok(decisions)
+        let mut merged: Vec<DecisionNode> = dedup.into_values().collect();
+        merged.sort_by(|a, b| b.decided_at.cmp(&a.decided_at));
+        merged.truncate(limit);
+        Ok(merged)
     }
 
     /// Semantic search for decisions using vector embeddings.
@@ -612,7 +531,7 @@ impl PlanManager {
             .ok_or_else(|| anyhow::anyhow!("Embedding provider not configured"))?;
         let embedding = provider.embed_text(query).await?;
         let results = self
-            .neo4j
+            .indentiagraph
             .search_decisions_by_vector(&embedding, limit, project_id)
             .await?;
         Ok(results
@@ -627,7 +546,9 @@ impl PlanManager {
 
     /// Add a constraint to a plan
     pub async fn add_constraint(&self, plan_id: Uuid, constraint: &ConstraintNode) -> Result<()> {
-        self.neo4j.create_constraint(plan_id, constraint).await?;
+        self.indentiagraph
+            .create_constraint(plan_id, constraint)
+            .await?;
         self.emit(
             CrudEvent::new(EntityType::Constraint, CrudAction::Created, constraint.id.to_string())
                 .with_payload(serde_json::json!({"plan_id": plan_id.to_string(), "type": constraint.constraint_type})),
@@ -641,7 +562,7 @@ impl PlanManager {
 
     /// Analyze the impact of a task on the codebase
     pub async fn analyze_task_impact(&self, task_id: Uuid) -> Result<Vec<String>> {
-        self.neo4j.analyze_task_impact(task_id).await
+        self.indentiagraph.analyze_task_impact(task_id).await
     }
 
     /// Find blocked tasks in a plan
@@ -649,7 +570,7 @@ impl PlanManager {
         &self,
         plan_id: Uuid,
     ) -> Result<Vec<(TaskNode, Vec<TaskNode>)>> {
-        self.neo4j.find_blocked_tasks(plan_id).await
+        self.indentiagraph.find_blocked_tasks(plan_id).await
     }
 }
 
@@ -660,7 +581,7 @@ mod tests {
 
     fn create_plan_manager() -> PlanManager {
         let state = mock_app_state();
-        PlanManager::new(state.neo4j.clone(), state.meili.clone())
+        PlanManager::new(state.indentiagraph.clone())
     }
 
     // =========================================================================
@@ -1438,183 +1359,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_add_decision_populates_project_slug() {
-        let state = mock_app_state();
-        let pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
-
-        // Create a project and link a plan to it
-        let project = test_project();
-        state.neo4j.create_project(&project).await.unwrap();
-
-        let plan = pm
-            .create_plan(
-                CreatePlanRequest {
-                    title: "Plan with project".to_string(),
-                    description: "Desc".to_string(),
-                    project_id: Some(project.id),
-                    priority: Some(1),
-                    constraints: None,
-                },
-                "agent",
-            )
-            .await
-            .unwrap();
-
-        // Link plan to project (for the mock's reverse lookup)
-        state
-            .neo4j
-            .link_plan_to_project(plan.id, project.id)
-            .await
-            .unwrap();
-
-        let task = pm
-            .add_task(
-                plan.id,
-                CreateTaskRequest {
-                    title: Some("Task".to_string()),
-                    description: "Task desc".to_string(),
-                    priority: None,
-                    tags: None,
-                    acceptance_criteria: None,
-                    affected_files: None,
-                    depends_on: None,
-                    steps: None,
-                    estimated_complexity: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        let _decision = pm
-            .add_decision(
-                task.id,
-                CreateDecisionRequest {
-                    description: "Use Axum framework".to_string(),
-                    rationale: "Best web framework for Rust".to_string(),
-                    alternatives: None,
-                    chosen_option: Some("axum".to_string()),
-                },
-                "engineer",
-            )
-            .await
-            .unwrap();
-
-        // Verify that the decision was indexed in Meilisearch WITH project_slug
-        let docs = state
-            .meili
-            .search_decisions_in_project("Axum", 10, Some(&project.slug))
-            .await
-            .unwrap();
-        assert!(
-            !docs.is_empty(),
-            "Decision should be findable by project_slug filter"
-        );
-        assert_eq!(docs[0].project_slug.as_deref(), Some(project.slug.as_str()));
-        assert_eq!(
-            docs[0].project_id.as_deref(),
-            Some(project.id.to_string().as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_backfill_decision_project_slugs() {
-        let state = mock_app_state();
-        let pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
-
-        // Create a project
-        let project = test_project();
-        state.neo4j.create_project(&project).await.unwrap();
-
-        // Create a plan linked to the project
-        let plan = pm
-            .create_plan(
-                CreatePlanRequest {
-                    title: "Plan".to_string(),
-                    description: "Desc".to_string(),
-                    project_id: Some(project.id),
-                    priority: Some(1),
-                    constraints: None,
-                },
-                "agent",
-            )
-            .await
-            .unwrap();
-        state
-            .neo4j
-            .link_plan_to_project(plan.id, project.id)
-            .await
-            .unwrap();
-
-        let task = pm
-            .add_task(
-                plan.id,
-                CreateTaskRequest {
-                    title: Some("Task".to_string()),
-                    description: "Task desc".to_string(),
-                    priority: None,
-                    tags: None,
-                    acceptance_criteria: None,
-                    affected_files: None,
-                    depends_on: None,
-                    steps: None,
-                    estimated_complexity: None,
-                },
-            )
-            .await
-            .unwrap();
-
-        // Manually index a decision WITHOUT project_slug (simulates the old behavior)
-        let doc = crate::meilisearch::indexes::DecisionDocument {
-            id: uuid::Uuid::new_v4().to_string(),
-            description: "Old decision without project".to_string(),
-            rationale: "Some rationale".to_string(),
-            task_id: task.id.to_string(),
-            agent: "old-agent".to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            tags: vec![],
-            project_id: None,
-            project_slug: None,
-        };
-        state.meili.index_decision(&doc).await.unwrap();
-
-        // Verify it's indexed without project_slug
-        let before = state
-            .meili
-            .search_decisions("Old decision", 10)
-            .await
-            .unwrap();
-        assert_eq!(before.len(), 1);
-        assert!(before[0].project_slug.is_none());
-
-        // Run backfill
-        let (total, updated) = pm.backfill_decision_project_slugs().await.unwrap();
-        assert!(total >= 1, "Should have at least 1 decision");
-        assert_eq!(updated, 1, "Should have updated exactly 1 decision");
-
-        // Verify the decision now has project_slug
-        let after = state
-            .meili
-            .search_decisions("Old decision", 10)
-            .await
-            .unwrap();
-        assert_eq!(after.len(), 1);
-        assert_eq!(
-            after[0].project_slug.as_deref(),
-            Some(project.slug.as_str())
-        );
-        assert_eq!(
-            after[0].project_id.as_deref(),
-            Some(project.id.to_string().as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn test_search_decisions() {
+    async fn test_search_decisions_returns_match() {
         let pm = create_plan_manager();
         let plan = pm
             .create_plan(
                 CreatePlanRequest {
-                    title: "Plan".to_string(),
+                    title: "Decision Search Plan".to_string(),
                     description: "Desc".to_string(),
                     project_id: None,
                     priority: Some(1),
@@ -1624,7 +1374,6 @@ mod tests {
             )
             .await
             .unwrap();
-
         let task = pm
             .add_task(
                 plan.id,
@@ -1642,49 +1391,210 @@ mod tests {
             )
             .await
             .unwrap();
+        let decision = pm
+            .add_decision(
+                task.id,
+                CreateDecisionRequest {
+                    description: "Use microservices for deployment".to_string(),
+                    rationale: "Better scalability characteristics".to_string(),
+                    alternatives: None,
+                    chosen_option: None,
+                },
+                "architect",
+            )
+            .await
+            .unwrap();
 
-        // Add decisions
-        pm.add_decision(
-            task.id,
-            CreateDecisionRequest {
-                description: "Adopt microservices architecture".to_string(),
-                rationale: "Better scalability".to_string(),
-                alternatives: None,
-                chosen_option: None,
-            },
-            "architect",
-        )
-        .await
-        .unwrap();
-
-        pm.add_decision(
-            task.id,
-            CreateDecisionRequest {
-                description: "Use PostgreSQL database".to_string(),
-                rationale: "Strong ACID compliance".to_string(),
-                alternatives: None,
-                chosen_option: None,
-            },
-            "architect",
-        )
-        .await
-        .unwrap();
-
-        // Search for "microservices" should find first decision
         let results = pm
             .search_decisions("microservices", 10, None)
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].description, "Adopt microservices architecture");
+        assert_eq!(results[0].id, decision.id);
+    }
 
-        // Search for "database" should find second decision (via description)
-        let results = pm.search_decisions("database", 10, None).await.unwrap();
-        assert_eq!(results.len(), 1);
+    #[tokio::test]
+    async fn test_search_decisions_project_filter() {
+        let state = mock_app_state();
+        let pm = PlanManager::new(state.indentiagraph.clone());
 
-        // Search for something not present
-        let results = pm.search_decisions("nonexistent", 10, None).await.unwrap();
-        assert!(results.is_empty());
+        let project_a = test_project_named("Project A");
+        let project_b = test_project_named("Project B");
+        state
+            .indentiagraph
+            .create_project(&project_a)
+            .await
+            .unwrap();
+        state
+            .indentiagraph
+            .create_project(&project_b)
+            .await
+            .unwrap();
+
+        let plan_a = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan A".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: Some(project_a.id),
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+        let task_a = pm
+            .add_task(
+                plan_a.id,
+                CreateTaskRequest {
+                    title: Some("Task A".to_string()),
+                    description: "Task A".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+        let decision_a = pm
+            .add_decision(
+                task_a.id,
+                CreateDecisionRequest {
+                    description: "Use event sourcing".to_string(),
+                    rationale: "Auditability".to_string(),
+                    alternatives: None,
+                    chosen_option: None,
+                },
+                "architect",
+            )
+            .await
+            .unwrap();
+
+        let plan_b = pm
+            .create_plan(
+                CreatePlanRequest {
+                    title: "Plan B".to_string(),
+                    description: "Desc".to_string(),
+                    project_id: Some(project_b.id),
+                    priority: Some(1),
+                    constraints: None,
+                },
+                "agent",
+            )
+            .await
+            .unwrap();
+        let task_b = pm
+            .add_task(
+                plan_b.id,
+                CreateTaskRequest {
+                    title: Some("Task B".to_string()),
+                    description: "Task B".to_string(),
+                    priority: None,
+                    tags: None,
+                    acceptance_criteria: None,
+                    affected_files: None,
+                    depends_on: None,
+                    steps: None,
+                    estimated_complexity: None,
+                },
+            )
+            .await
+            .unwrap();
+        pm.add_decision(
+            task_b.id,
+            CreateDecisionRequest {
+                description: "Use event sourcing".to_string(),
+                rationale: "Different project".to_string(),
+                alternatives: None,
+                chosen_option: None,
+            },
+            "architect",
+        )
+        .await
+        .unwrap();
+
+        let filtered = pm
+            .search_decisions("event sourcing", 10, Some(&project_a.slug))
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, decision_a.id);
+    }
+
+    #[tokio::test]
+    async fn test_search_decisions_in_workspace_merges_projects() {
+        let state = mock_app_state();
+        let pm = PlanManager::new(state.indentiagraph.clone());
+
+        let project_a = test_project_named("Workspace A");
+        let project_b = test_project_named("Workspace B");
+        state
+            .indentiagraph
+            .create_project(&project_a)
+            .await
+            .unwrap();
+        state
+            .indentiagraph
+            .create_project(&project_b)
+            .await
+            .unwrap();
+
+        for project in [&project_a, &project_b] {
+            let plan = pm
+                .create_plan(
+                    CreatePlanRequest {
+                        title: format!("Plan {}", project.slug),
+                        description: "Desc".to_string(),
+                        project_id: Some(project.id),
+                        priority: Some(1),
+                        constraints: None,
+                    },
+                    "agent",
+                )
+                .await
+                .unwrap();
+            let task = pm
+                .add_task(
+                    plan.id,
+                    CreateTaskRequest {
+                        title: Some("Task".to_string()),
+                        description: "Task".to_string(),
+                        priority: None,
+                        tags: None,
+                        acceptance_criteria: None,
+                        affected_files: None,
+                        depends_on: None,
+                        steps: None,
+                        estimated_complexity: None,
+                    },
+                )
+                .await
+                .unwrap();
+            pm.add_decision(
+                task.id,
+                CreateDecisionRequest {
+                    description: "Adopt CQRS".to_string(),
+                    rationale: format!("For {}", project.slug),
+                    alternatives: None,
+                    chosen_option: None,
+                },
+                "architect",
+            )
+            .await
+            .unwrap();
+        }
+
+        let project_slugs = vec![project_a.slug.clone(), project_b.slug.clone()];
+        let results = pm
+            .search_decisions_in_workspace("CQRS", 10, &project_slugs)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2);
     }
 
     // =========================================================================

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::neo4j::traits::GraphStore;
+use crate::indentiagraph::traits::GraphStore;
 use crate::skills::models::{SkillNode, SkillStatus};
 
 // ============================================================================
@@ -989,7 +989,7 @@ mod tests {
     // Async lifecycle tests (MockGraphStore)
     // ================================================================
 
-    use crate::neo4j::mock::MockGraphStore;
+    use crate::indentiagraph::mock::MockGraphStore;
     use std::sync::Arc;
 
     async fn mock_store_with_skill(skill: SkillNode) -> Arc<MockGraphStore> {

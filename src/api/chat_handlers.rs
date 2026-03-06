@@ -102,7 +102,7 @@ pub async fn list_messages(
             }
         })?;
 
-    // Events are sorted by seq ASC from Neo4j. Each event's `data` field is
+    // Events are sorted by seq ASC from IndentiaGraph. Each event's `data` field is
     // the JSON-serialized ChatEvent (includes type tag, tool_use, tool_result, etc.)
     let messages: Vec<serde_json::Value> = loaded
         .events
@@ -116,7 +116,7 @@ pub async fn list_messages(
             if let Some(map) = obj.as_object_mut() {
                 map.entry("type".to_string())
                     .or_insert_with(|| serde_json::json!(e.event_type));
-                // Only inject the Neo4j UUID as "id" if the event doesn't already have one.
+                // Only inject the IndentiaGraph UUID as "id" if the event doesn't already have one.
                 // tool_use and tool_result events carry a Claude tool_call_id in their "id" field
                 // which must be preserved for proper tool_use ↔ tool_result matching.
                 map.entry("id".to_string())
@@ -163,7 +163,7 @@ pub async fn list_sessions(
 
     let (sessions, total) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_chat_sessions(
             query.project_slug.as_deref(),
             query.workspace_slug.as_deref(),
@@ -210,7 +210,7 @@ pub async fn get_session(
 ) -> Result<Json<ChatSession>, AppError> {
     let node = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_chat_session(session_id)
         .await
         .map_err(AppError::Internal)?
@@ -245,10 +245,10 @@ pub async fn delete_session(
         let _ = chat_manager.close_session(&session_id.to_string()).await;
     }
 
-    // Delete from Neo4j
+    // Delete from IndentiaGraph
     let deleted = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .delete_chat_session(session_id)
         .await
         .map_err(AppError::Internal)?;
@@ -322,30 +322,18 @@ pub async fn search_messages(
 pub async fn backfill_previews(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    // Phase 1: backfill from Neo4j events (fast, for sessions with stored events)
-    let neo4j_count = state
+    // Backfill from IndentiaGraph events
+    let indentiagraph_count = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .backfill_chat_session_previews()
         .await
         .map_err(AppError::Internal)?;
 
-    // Phase 2: backfill from Meilisearch (for older sessions without Neo4j events)
-    let meili_count = if let Some(chat_manager) = &state.chat_manager {
-        chat_manager
-            .backfill_previews_from_meilisearch()
-            .await
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
-    let total = neo4j_count + meili_count;
     Ok(Json(serde_json::json!({
-        "updated": total,
-        "from_neo4j": neo4j_count,
-        "from_meilisearch": meili_count,
-        "message": format!("Backfilled title/preview for {} sessions", total)
+        "updated": indentiagraph_count,
+        "from_indentiagraph": indentiagraph_count,
+        "message": format!("Backfilled title/preview for {} sessions", indentiagraph_count)
     })))
 }
 
@@ -629,7 +617,7 @@ pub async fn add_discussed(
 
     let created = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .add_discussed(session_id, &entities)
         .await
         .map_err(AppError::Internal)?;
@@ -642,7 +630,7 @@ pub async fn get_session_entities(
     State(state): State<OrchestratorState>,
     Path(session_id): Path<Uuid>,
     Query(params): Query<SessionEntitiesQuery>,
-) -> Result<Json<Vec<crate::neo4j::models::DiscussedEntity>>, AppError> {
+) -> Result<Json<Vec<crate::indentiagraph::models::DiscussedEntity>>, AppError> {
     let project_id = params
         .project_id
         .as_ref()
@@ -650,7 +638,7 @@ pub async fn get_session_entities(
 
     let entities = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_session_entities(session_id, project_id)
         .await
         .map_err(AppError::Internal)?;
@@ -740,11 +728,15 @@ mod tests {
 
     /// Build a test router with pre-seeded sessions
     async fn test_app_with_sessions(
-        sessions: &[crate::neo4j::models::ChatSessionNode],
+        sessions: &[crate::indentiagraph::models::ChatSessionNode],
     ) -> axum::Router {
         let app_state = mock_app_state();
         for s in sessions {
-            app_state.neo4j.create_chat_session(s).await.unwrap();
+            app_state
+                .indentiagraph
+                .create_chat_session(s)
+                .await
+                .unwrap();
         }
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(
@@ -1162,8 +1154,7 @@ mod tests {
         let app_state = mock_app_state();
         let chat_config = crate::chat::config::ChatConfig::default();
         let chat_manager = Arc::new(crate::chat::ChatManager::new_without_memory(
-            app_state.neo4j.clone(),
-            app_state.meili.clone(),
+            app_state.indentiagraph.clone(),
             chat_config,
         ));
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());

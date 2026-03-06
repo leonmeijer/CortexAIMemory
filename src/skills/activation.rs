@@ -15,7 +15,7 @@
 //! - **No embeddings in hot path**: Regex/FileGlob matching costs <1ms vs 20-50ms for embedding.
 //!   Semantic matching is reserved for the MCP `skill(action: "activate")` tool.
 //! - **Local trigger evaluation**: Skills are loaded from DB then matched in Rust,
-//!   avoiding per-trigger Neo4j round-trips.
+//!   avoiding per-trigger IndentiaGraph round-trips.
 //! - **Context budget**: 3200 chars max (~800 tokens) to prevent additionalContext flooding.
 
 use regex::RegexBuilder;
@@ -23,8 +23,8 @@ use uuid::Uuid;
 
 use std::sync::Arc;
 
-use crate::neo4j::models::DecisionNode;
-use crate::neo4j::traits::GraphStore;
+use crate::indentiagraph::models::DecisionNode;
+use crate::indentiagraph::traits::GraphStore;
 use crate::neurons::AutoReinforcementConfig;
 use crate::notes::models::Note;
 use crate::skills::cache::{evaluate_cached_skill, SkillCache};
@@ -289,7 +289,7 @@ pub async fn activate_for_hook(
 /// Cached version of `activate_for_hook`.
 ///
 /// Uses the `SkillCache` to avoid:
-/// 1. Neo4j round-trip for `get_skills_for_project()` on cache hit
+/// 1. IndentiaGraph round-trip for `get_skills_for_project()` on cache hit
 /// 2. `Regex::new()` / `glob::Pattern::new()` recompilation (pre-compiled triggers)
 ///
 /// Falls back to DB on cache miss, then populates the cache for next request.
@@ -918,7 +918,7 @@ fn truncate_content(content: &str, max_chars: usize) -> String {
 ///
 /// # Examples
 /// ```
-/// extract_path_segments("src/neo4j/client.rs")  // → ["neo4j", "client"]
+/// extract_path_segments("src/indentiagraph/client.rs")  // → ["indentiagraph", "client"]
 /// extract_path_segments("src/lib.rs")            // → []
 /// extract_path_segments("/Users/x/project/src/skills/activation.rs")
 ///     // → ["skills", "activation"]
@@ -1076,7 +1076,7 @@ pub fn same_directory(path_a: &str, path_b: &str) -> bool {
     match (dir_a, dir_b) {
         (Some(a), Some(b)) => {
             // Handle case where one is absolute and the other relative
-            // e.g., "/Users/x/src/neo4j/client.rs" vs "src/neo4j/analytics.rs"
+            // e.g., "/Users/x/src/indentiagraph/client.rs" vs "src/indentiagraph/analytics.rs"
             a == b || a.ends_with(b) || b.ends_with(a)
         }
         _ => false,
@@ -1097,9 +1097,9 @@ const SOURCE_EXTENSIONS: &[&str] = &[
 /// Extract file paths mentioned in a note's content.
 ///
 /// Detects:
-/// - Relative paths: `src/neo4j/client.rs`, `tests/unit/test_foo.py`
+/// - Relative paths: `src/indentiagraph/client.rs`, `tests/unit/test_foo.py`
 /// - Absolute paths: `/Users/foo/project/src/bar.rs` → normalized to relative after `src/`
-/// - Backtick-wrapped: \`src/neo4j/client.rs\`
+/// - Backtick-wrapped: \`src/indentiagraph/client.rs\`
 /// - Paths with known source extensions
 ///
 /// Filters out:
@@ -1245,8 +1245,8 @@ fn validate_and_normalize_path(token: &str) -> Option<String> {
 /// performs MERGE (idempotent — safe to call multiple times).
 ///
 /// **Important**: `root_path` must be provided so that relative paths extracted
-/// from note content (e.g. `src/neo4j/client.rs`) are resolved to the absolute
-/// paths used by File nodes in Neo4j (e.g. `/home/user/project/src/neo4j/client.rs`).
+/// from note content (e.g. `src/indentiagraph/client.rs`) are resolved to the absolute
+/// paths used by File nodes in IndentiaGraph (e.g. `/home/user/project/src/indentiagraph/client.rs`).
 /// Without `root_path`, the MATCH query silently returns 0 rows (ghost anchors).
 ///
 /// Returns the number of new anchors created.
@@ -1261,8 +1261,8 @@ pub async fn auto_anchor_note(
     let mut anchored = 0;
 
     for path in &paths {
-        // File nodes in Neo4j use absolute paths. extract_file_paths_from_content
-        // returns relative paths (e.g. "src/neo4j/client.rs"). Resolve them to
+        // File nodes in IndentiaGraph use absolute paths. extract_file_paths_from_content
+        // returns relative paths (e.g. "src/indentiagraph/client.rs"). Resolve them to
         // absolute using the project's root_path so the MATCH query finds the node.
         let resolved_path = if let Some(root) = root_path {
             let root = root.trim_end_matches('/');
@@ -1306,7 +1306,7 @@ pub async fn auto_anchor_notes_for_project(
     use crate::notes::models::NoteFilters;
 
     // Resolve project root_path for absolute file path matching.
-    // File nodes in Neo4j use absolute paths, but extract_file_paths_from_content
+    // File nodes in IndentiaGraph use absolute paths, but extract_file_paths_from_content
     // returns relative paths — we need root_path to bridge the gap.
     let root_path = match graph_store.get_project(project_id).await? {
         Some(proj) => Some(proj.root_path),
@@ -1391,6 +1391,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            valid_at: None,
+            invalid_at: None,
         }
     }
 
@@ -1403,7 +1405,7 @@ mod tests {
             chosen_option: Some(chosen.to_string()),
             decided_by: "test".to_string(),
             decided_at: Utc::now(),
-            status: crate::neo4j::models::DecisionStatus::Accepted,
+            status: crate::indentiagraph::models::DecisionStatus::Accepted,
             embedding: None,
             embedding_model: None,
         }
@@ -1413,13 +1415,16 @@ mod tests {
 
     #[test]
     fn test_match_regex_trigger_matches() {
-        assert!(match_regex_trigger("neo4j|cypher", "neo4j_client"));
-        assert!(match_regex_trigger("neo4j|cypher", "cypher_query"));
+        assert!(match_regex_trigger(
+            "indentiagraph|cypher",
+            "indentiagraph_client"
+        ));
+        assert!(match_regex_trigger("indentiagraph|cypher", "cypher_query"));
     }
 
     #[test]
     fn test_match_regex_trigger_no_match() {
-        assert!(!match_regex_trigger("neo4j|cypher", "api_handler"));
+        assert!(!match_regex_trigger("indentiagraph|cypher", "api_handler"));
     }
 
     #[test]
@@ -1430,19 +1435,19 @@ mod tests {
     #[test]
     fn test_match_file_glob_trigger_matches() {
         assert!(match_file_glob_trigger(
-            "src/neo4j/**",
-            "src/neo4j/client.rs"
+            "src/indentiagraph/**",
+            "src/indentiagraph/client.rs"
         ));
         assert!(match_file_glob_trigger(
-            "src/neo4j/*",
-            "src/neo4j/client.rs"
+            "src/indentiagraph/*",
+            "src/indentiagraph/client.rs"
         ));
     }
 
     #[test]
     fn test_match_file_glob_trigger_no_match() {
         assert!(!match_file_glob_trigger(
-            "src/neo4j/**",
+            "src/indentiagraph/**",
             "src/api/handlers.rs"
         ));
     }
@@ -1456,17 +1461,17 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_regex_hit() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
-        skill.trigger_patterns = vec![SkillTrigger::regex("neo4j|cypher|UNWIND", 0.6)];
+        let mut skill = SkillNode::new(Uuid::new_v4(), "IndentiaGraph");
+        skill.trigger_patterns = vec![SkillTrigger::regex("indentiagraph|cypher|UNWIND", 0.6)];
 
-        let confidence = evaluate_skill_match(&skill, Some("neo4j_client"), None);
+        let confidence = evaluate_skill_match(&skill, Some("indentiagraph_client"), None);
         assert!((confidence - 0.6).abs() < f64::EPSILON); // returns trigger's confidence_threshold
     }
 
     #[test]
     fn test_evaluate_skill_match_regex_miss() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
-        skill.trigger_patterns = vec![SkillTrigger::regex("neo4j|cypher", 0.6)];
+        let mut skill = SkillNode::new(Uuid::new_v4(), "IndentiaGraph");
+        skill.trigger_patterns = vec![SkillTrigger::regex("indentiagraph|cypher", 0.6)];
 
         let confidence = evaluate_skill_match(&skill, Some("api_handler"), None);
         assert!((confidence - 0.0).abs() < f64::EPSILON);
@@ -1474,12 +1479,12 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_file_glob_hit() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
-        skill.trigger_patterns = vec![SkillTrigger::file_glob("src/neo4j/**", 0.8)];
+        let mut skill = SkillNode::new(Uuid::new_v4(), "IndentiaGraph");
+        skill.trigger_patterns = vec![SkillTrigger::file_glob("src/indentiagraph/**", 0.8)];
 
-        let confidence = evaluate_skill_match(&skill, None, Some("src/neo4j/client.rs"));
-        // "src/neo4j/**" depth=2 → boost=0.85 → effective = 0.8 * 0.85 = 0.68
-        let expected = 0.8 * glob_depth_boost("src/neo4j/**");
+        let confidence = evaluate_skill_match(&skill, None, Some("src/indentiagraph/client.rs"));
+        // "src/indentiagraph/**" depth=2 → boost=0.85 → effective = 0.8 * 0.85 = 0.68
+        let expected = 0.8 * glob_depth_boost("src/indentiagraph/**");
         assert!(
             (confidence - expected).abs() < f64::EPSILON,
             "Expected {}, got {}",
@@ -1490,12 +1495,12 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_file_glob_with_pattern_fallback() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
-        skill.trigger_patterns = vec![SkillTrigger::file_glob("src/neo4j/**", 0.8)];
+        let mut skill = SkillNode::new(Uuid::new_v4(), "IndentiaGraph");
+        skill.trigger_patterns = vec![SkillTrigger::file_glob("src/indentiagraph/**", 0.8)];
 
         // file_context is None, but pattern is a file path (from Read tool)
-        let confidence = evaluate_skill_match(&skill, Some("src/neo4j/client.rs"), None);
-        let expected = 0.8 * glob_depth_boost("src/neo4j/**");
+        let confidence = evaluate_skill_match(&skill, Some("src/indentiagraph/client.rs"), None);
+        let expected = 0.8 * glob_depth_boost("src/indentiagraph/**");
         assert!(
             (confidence - expected).abs() < f64::EPSILON,
             "Expected {}, got {}",
@@ -1506,21 +1511,24 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_multiple_triggers_best_wins() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Uuid::new_v4(), "IndentiaGraph");
         skill.trigger_patterns = vec![
-            SkillTrigger::regex("neo4j|cypher", 0.6),
+            SkillTrigger::regex("indentiagraph|cypher", 0.6),
             SkillTrigger::file_glob("src/api/**", 0.8), // won't match
         ];
 
-        let confidence =
-            evaluate_skill_match(&skill, Some("neo4j_client"), Some("src/skills/test.rs"));
+        let confidence = evaluate_skill_match(
+            &skill,
+            Some("indentiagraph_client"),
+            Some("src/skills/test.rs"),
+        );
         assert!((confidence - 0.6).abs() < f64::EPSILON); // regex matched with its threshold
     }
 
     #[test]
     fn test_evaluate_skill_match_no_pattern_no_file() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
-        skill.trigger_patterns = vec![SkillTrigger::regex("neo4j", 0.6)];
+        let mut skill = SkillNode::new(Uuid::new_v4(), "IndentiaGraph");
+        skill.trigger_patterns = vec![SkillTrigger::regex("indentiagraph", 0.6)];
 
         let confidence = evaluate_skill_match(&skill, None, None);
         assert!((confidence - 0.0).abs() < f64::EPSILON);
@@ -1528,7 +1536,7 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_unreliable_trigger_skipped() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Uuid::new_v4(), "IndentiaGraph");
         let mut trigger = SkillTrigger::regex(".*", 0.5); // matches everything
         trigger.quality_score = Some(0.1); // but unreliable
         skill.trigger_patterns = vec![trigger];
@@ -1539,22 +1547,22 @@ mod tests {
 
     #[test]
     fn test_evaluate_skill_match_semantic_skipped() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Uuid::new_v4(), "IndentiaGraph");
         skill.trigger_patterns = vec![SkillTrigger::semantic("[0.1, 0.2]", 0.7)];
 
-        let confidence = evaluate_skill_match(&skill, Some("neo4j"), None);
+        let confidence = evaluate_skill_match(&skill, Some("indentiagraph"), None);
         assert!((confidence - 0.0).abs() < f64::EPSILON); // semantic skipped in hot path
     }
 
     #[test]
     fn test_evaluate_skill_match_dormant_not_matchable() {
-        let mut skill = SkillNode::new(Uuid::new_v4(), "Neo4j");
+        let mut skill = SkillNode::new(Uuid::new_v4(), "IndentiaGraph");
         skill.status = crate::skills::models::SkillStatus::Dormant;
-        skill.trigger_patterns = vec![SkillTrigger::regex("neo4j", 0.5)];
+        skill.trigger_patterns = vec![SkillTrigger::regex("indentiagraph", 0.5)];
 
         // The function itself doesn't filter by status — that's done by the caller
         // using `is_matchable()`. But let's confirm the trigger still evaluates.
-        let confidence = evaluate_skill_match(&skill, Some("neo4j"), None);
+        let confidence = evaluate_skill_match(&skill, Some("indentiagraph"), None);
         assert!((confidence - 0.5).abs() < f64::EPSILON); // returns trigger's confidence_threshold
     }
 
@@ -1650,16 +1658,16 @@ mod tests {
 
         let decisions = vec![make_test_decision(
             Uuid::new_v4(),
-            "Use Neo4j 5.x driver",
-            "neo4j-rust-driver 0.8",
+            "Use IndentiaGraph 5.x driver",
+            "indentiagraph-rust-driver 0.8",
         )];
 
-        let context = assemble_context("Neo4j Performance", &notes, &decisions, 3200);
+        let context = assemble_context("IndentiaGraph Performance", &notes, &decisions, 3200);
 
-        assert!(context.starts_with("## \u{1f4a1} Neo4j Performance"));
+        assert!(context.starts_with("## \u{1f4a1} IndentiaGraph Performance"));
         assert!(context.contains("UNWIND"));
         assert!(context.contains("Connection pool"));
-        assert!(context.contains("Neo4j 5.x driver"));
+        assert!(context.contains("IndentiaGraph 5.x driver"));
         assert!(context.chars().count() <= 3200);
     }
 
@@ -1790,13 +1798,13 @@ mod tests {
 
         let decisions = vec![make_test_decision(
             Uuid::new_v4(),
-            "Use Neo4j 5.x driver",
-            "neo4j-rust-driver 0.8",
+            "Use IndentiaGraph 5.x driver",
+            "indentiagraph-rust-driver 0.8",
         )];
 
         // With confidence → 🧠 header with percentage
         let (context, _) = assemble_context_with_confidence(
-            "Neo4j Perf",
+            "IndentiaGraph Perf",
             &notes,
             &decisions,
             3200,
@@ -1804,12 +1812,12 @@ mod tests {
             false,
         );
         assert!(
-            context.starts_with("## \u{1f9e0} Skill \"Neo4j Perf\" (confidence 85%)"),
+            context.starts_with("## \u{1f9e0} Skill \"IndentiaGraph Perf\" (confidence 85%)"),
             "Expected confidence header, got: {}",
             context.lines().next().unwrap_or("")
         );
         assert!(context.contains("UNWIND"));
-        assert!(context.contains("Neo4j 5.x driver"));
+        assert!(context.contains("IndentiaGraph 5.x driver"));
     }
 
     #[test]
@@ -2062,8 +2070,8 @@ mod tests {
         let decisions = vec![
             make_test_decision(
                 Uuid::new_v4(),
-                "Use async Neo4j driver for all database operations",
-                "neo4j-rust-driver 0.8 with async support",
+                "Use async IndentiaGraph driver for all database operations",
+                "indentiagraph-rust-driver 0.8 with async support",
             ),
             make_test_decision(
                 Uuid::new_v4(),
@@ -2077,7 +2085,7 @@ mod tests {
             ),
         ];
 
-        let context = assemble_context("Neo4j Expertise", &notes, &decisions, 3200);
+        let context = assemble_context("IndentiaGraph Expertise", &notes, &decisions, 3200);
 
         // Strict budget enforcement (use chars count, not byte length)
         let char_count = context.chars().count();
@@ -2088,7 +2096,7 @@ mod tests {
         );
 
         // Header present
-        assert!(context.starts_with("## \u{1f4a1} Neo4j Expertise\n"));
+        assert!(context.starts_with("## \u{1f4a1} IndentiaGraph Expertise\n"));
 
         // Critical notes should appear first (they have highest importance weight)
         let critical_pos = context.find("Note 0 with substantial");
@@ -2116,7 +2124,7 @@ mod tests {
 
         // At least some decisions are present
         assert!(
-            context.contains("Neo4j driver") || context.contains("caching"),
+            context.contains("IndentiaGraph driver") || context.contains("caching"),
             "At least one decision should be included"
         );
     }
@@ -2333,11 +2341,11 @@ mod tests {
         skill_name: &str,
         triggers: Vec<SkillTrigger>,
         notes: Vec<Note>,
-    ) -> crate::neo4j::mock::MockGraphStore {
-        let store = crate::neo4j::mock::MockGraphStore::new();
+    ) -> crate::indentiagraph::mock::MockGraphStore {
+        let store = crate::indentiagraph::mock::MockGraphStore::new();
 
         // Create a project first (mock requires it for create_skill)
-        let project = crate::neo4j::models::ProjectNode {
+        let project = crate::indentiagraph::models::ProjectNode {
             id: project_id,
             name: "test-project".to_string(),
             slug: "test-project".to_string(),
@@ -2434,7 +2442,7 @@ mod tests {
         let config = HookActivationConfig::default();
         let tool_input = serde_json::json!({
             "action": "search_semantic",
-            "query": "neo4j batch processing"
+            "query": "indentiagraph batch processing"
         });
 
         let result = activate_for_hook(
@@ -2699,7 +2707,7 @@ mod tests {
         let triggers = vec![
             SkillTrigger::mcp_action("task", 0.7),
             SkillTrigger::mcp_action("note", 0.65),
-            SkillTrigger::regex("neo4j|cypher", 0.6),
+            SkillTrigger::regex("indentiagraph|cypher", 0.6),
             SkillTrigger::file_glob("src/skills/**", 0.55),
         ];
 
@@ -2737,7 +2745,7 @@ mod tests {
     #[tokio::test]
     async fn test_e2e_mcp_no_project_skills_returns_none() {
         // Empty store — no skills registered
-        let store = crate::neo4j::mock::MockGraphStore::new();
+        let store = crate::indentiagraph::mock::MockGraphStore::new();
         let project_id = Uuid::new_v4();
 
         let config = HookActivationConfig::default();
@@ -2780,8 +2788,8 @@ mod tests {
 
     #[test]
     fn test_extract_path_segments_basic() {
-        let segments = extract_path_segments("src/neo4j/client.rs");
-        assert_eq!(segments, vec!["neo4j", "client"]);
+        let segments = extract_path_segments("src/indentiagraph/client.rs");
+        assert_eq!(segments, vec!["indentiagraph", "client"]);
     }
 
     #[test]
@@ -2798,15 +2806,15 @@ mod tests {
 
     #[test]
     fn test_extract_path_segments_no_extension() {
-        let segments = extract_path_segments("src/neo4j/Dockerfile");
-        assert_eq!(segments, vec!["neo4j", "dockerfile"]);
+        let segments = extract_path_segments("src/indentiagraph/Dockerfile");
+        assert_eq!(segments, vec!["indentiagraph", "dockerfile"]);
     }
 
     #[test]
     fn test_score_tag_path_affinity() {
-        let neo4j_note = make_scored_note(
-            "Neo4j performance tip",
-            vec!["neo4j", "cypher"],
+        let indentiagraph_note = make_scored_note(
+            "IndentiaGraph performance tip",
+            vec!["indentiagraph", "cypher"],
             NoteType::Tip,
             NoteImportance::Medium,
             0.8,
@@ -2821,15 +2829,23 @@ mod tests {
             0.0,
         );
 
-        let neo4j_score =
-            score_note_relevance(&neo4j_note, Some("src/neo4j/client.rs"), None, "Read");
-        let tauri_score =
-            score_note_relevance(&tauri_note, Some("src/neo4j/client.rs"), None, "Read");
+        let indentiagraph_score = score_note_relevance(
+            &indentiagraph_note,
+            Some("src/indentiagraph/client.rs"),
+            None,
+            "Read",
+        );
+        let tauri_score = score_note_relevance(
+            &tauri_note,
+            Some("src/indentiagraph/client.rs"),
+            None,
+            "Read",
+        );
 
         assert!(
-            neo4j_score > tauri_score,
-            "neo4j note ({}) should score higher than tauri note ({}) for neo4j file",
-            neo4j_score,
+            indentiagraph_score > tauri_score,
+            "indentiagraph note ({}) should score higher than tauri note ({}) for indentiagraph file",
+            indentiagraph_score,
             tauri_score
         );
     }
@@ -2837,7 +2853,7 @@ mod tests {
     #[test]
     fn test_score_content_keyword_match() {
         let matching_note = make_scored_note(
-            "Modify src/neo4j/client.rs to fix the query pattern",
+            "Modify src/indentiagraph/client.rs to fix the query pattern",
             vec![],
             NoteType::Observation,
             NoteImportance::Medium,
@@ -2853,11 +2869,15 @@ mod tests {
             0.0,
         );
 
-        let matching_score =
-            score_note_relevance(&matching_note, Some("src/neo4j/client.rs"), None, "Read");
+        let matching_score = score_note_relevance(
+            &matching_note,
+            Some("src/indentiagraph/client.rs"),
+            None,
+            "Read",
+        );
         let non_matching_score = score_note_relevance(
             &non_matching_note,
-            Some("src/neo4j/client.rs"),
+            Some("src/indentiagraph/client.rs"),
             None,
             "Read",
         );
@@ -2874,7 +2894,7 @@ mod tests {
     fn test_score_importance_weighting() {
         let critical_note = make_scored_note(
             "Same content",
-            vec!["neo4j"],
+            vec!["indentiagraph"],
             NoteType::Tip,
             NoteImportance::Critical,
             0.8,
@@ -2882,16 +2902,21 @@ mod tests {
         );
         let low_note = make_scored_note(
             "Same content",
-            vec!["neo4j"],
+            vec!["indentiagraph"],
             NoteType::Tip,
             NoteImportance::Low,
             0.8,
             0.0,
         );
 
-        let critical_score =
-            score_note_relevance(&critical_note, Some("src/neo4j/client.rs"), None, "Read");
-        let low_score = score_note_relevance(&low_note, Some("src/neo4j/client.rs"), None, "Read");
+        let critical_score = score_note_relevance(
+            &critical_note,
+            Some("src/indentiagraph/client.rs"),
+            None,
+            "Read",
+        );
+        let low_score =
+            score_note_relevance(&low_note, Some("src/indentiagraph/client.rs"), None, "Read");
 
         // critical = 1.5x, low = 0.8x → critical should be ~1.875x the low
         assert!(
@@ -2912,7 +2937,7 @@ mod tests {
     fn test_score_freshness_decay() {
         let fresh_note = make_scored_note(
             "Fresh note",
-            vec!["neo4j"],
+            vec!["indentiagraph"],
             NoteType::Tip,
             NoteImportance::Medium,
             0.8,
@@ -2920,17 +2945,25 @@ mod tests {
         );
         let stale_note = make_scored_note(
             "Stale note",
-            vec!["neo4j"],
+            vec!["indentiagraph"],
             NoteType::Tip,
             NoteImportance::Medium,
             0.8,
             0.5, // stale
         );
 
-        let fresh_score =
-            score_note_relevance(&fresh_note, Some("src/neo4j/client.rs"), None, "Read");
-        let stale_score =
-            score_note_relevance(&stale_note, Some("src/neo4j/client.rs"), None, "Read");
+        let fresh_score = score_note_relevance(
+            &fresh_note,
+            Some("src/indentiagraph/client.rs"),
+            None,
+            "Read",
+        );
+        let stale_score = score_note_relevance(
+            &stale_note,
+            Some("src/indentiagraph/client.rs"),
+            None,
+            "Read",
+        );
 
         assert!(
             fresh_score > stale_score,
@@ -2959,9 +2992,14 @@ mod tests {
             0.0,
         );
 
-        let gotcha_score =
-            score_note_relevance(&gotcha_note, Some("src/neo4j/client.rs"), None, "Edit");
-        let tip_score = score_note_relevance(&tip_note, Some("src/neo4j/client.rs"), None, "Edit");
+        let gotcha_score = score_note_relevance(
+            &gotcha_note,
+            Some("src/indentiagraph/client.rs"),
+            None,
+            "Edit",
+        );
+        let tip_score =
+            score_note_relevance(&tip_note, Some("src/indentiagraph/client.rs"), None, "Edit");
 
         assert!(
             gotcha_score > tip_score,
@@ -2992,13 +3030,13 @@ mod tests {
 
         let guideline_score = score_note_relevance(
             &guideline_note,
-            Some("src/neo4j/client.rs"),
+            Some("src/indentiagraph/client.rs"),
             None,
             "mcp__project-orchestrator__task",
         );
         let tip_score = score_note_relevance(
             &tip_note,
-            Some("src/neo4j/client.rs"),
+            Some("src/indentiagraph/client.rs"),
             None,
             "mcp__project-orchestrator__task",
         );
@@ -3015,7 +3053,7 @@ mod tests {
     fn test_score_is_pure_no_side_effects() {
         let note = make_scored_note(
             "Test note",
-            vec!["neo4j"],
+            vec!["indentiagraph"],
             NoteType::Gotcha,
             NoteImportance::High,
             0.8,
@@ -3023,8 +3061,8 @@ mod tests {
         );
 
         // Call twice with same inputs → same output
-        let score1 = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Edit");
-        let score2 = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Edit");
+        let score1 = score_note_relevance(&note, Some("src/indentiagraph/client.rs"), None, "Edit");
+        let score2 = score_note_relevance(&note, Some("src/indentiagraph/client.rs"), None, "Edit");
 
         assert!(
             (score1 - score2).abs() < f64::EPSILON,
@@ -3038,7 +3076,7 @@ mod tests {
     fn test_score_without_file_context() {
         let note = make_scored_note(
             "Generic note",
-            vec!["neo4j"],
+            vec!["indentiagraph"],
             NoteType::Tip,
             NoteImportance::Medium,
             0.8,
@@ -3058,11 +3096,11 @@ mod tests {
 
     #[test]
     fn test_score_combo_ordering() {
-        // Simulate a real scenario: skill with mixed notes, file is neo4j
+        // Simulate a real scenario: skill with mixed notes, file is indentiagraph
         let notes = [
             make_scored_note(
-                "Neo4j RETURN count() gotcha after DELETE",
-                vec!["neo4j", "cypher", "gotcha"],
+                "IndentiaGraph RETURN count() gotcha after DELETE",
+                vec!["indentiagraph", "cypher", "gotcha"],
                 NoteType::Gotcha,
                 NoteImportance::Critical,
                 0.9,
@@ -3092,14 +3130,14 @@ mod tests {
             .map(|(i, n)| {
                 (
                     i,
-                    score_note_relevance(n, Some("src/neo4j/client.rs"), None, "Edit"),
+                    score_note_relevance(n, Some("src/indentiagraph/client.rs"), None, "Edit"),
                 )
             })
             .collect();
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
 
-        // Neo4j note should be first (tag affinity + content match + critical)
-        assert_eq!(scored[0].0, 0, "Neo4j note should rank first");
+        // IndentiaGraph note should be first (tag affinity + content match + critical)
+        assert_eq!(scored[0].0, 0, "IndentiaGraph note should rank first");
         // Code review tip should be last (no affinity + low importance + stale)
         assert_eq!(scored[2].0, 2, "Code review tip should rank last");
     }
@@ -3107,14 +3145,17 @@ mod tests {
     #[test]
     fn test_same_directory() {
         assert!(same_directory(
-            "src/neo4j/client.rs",
-            "src/neo4j/analytics.rs"
+            "src/indentiagraph/client.rs",
+            "src/indentiagraph/analytics.rs"
         ));
         assert!(!same_directory(
-            "src/neo4j/client.rs",
+            "src/indentiagraph/client.rs",
             "src/api/handlers.rs"
         ));
-        assert!(same_directory("/Users/x/src/neo4j/a.rs", "src/neo4j/b.rs"));
+        assert!(same_directory(
+            "/Users/x/src/indentiagraph/a.rs",
+            "src/indentiagraph/b.rs"
+        ));
         assert!(!same_directory("a.rs", "b.rs")); // no parent dir
     }
 
@@ -3122,26 +3163,27 @@ mod tests {
 
     #[test]
     fn test_extract_file_paths_relative() {
-        let content = "Modifier `src/neo4j/client.rs` pour ajouter la méthode.";
+        let content = "Modifier `src/indentiagraph/client.rs` pour ajouter la méthode.";
         let paths = extract_file_paths_from_content(content);
-        assert_eq!(paths, vec!["src/neo4j/client.rs"]);
+        assert_eq!(paths, vec!["src/indentiagraph/client.rs"]);
     }
 
     #[test]
     fn test_extract_file_paths_multiple() {
-        let content = "Les fichiers src/api/handlers.rs et src/neo4j/note.rs doivent être modifiés. Voir aussi src/skills/activation.rs.";
+        let content = "Les fichiers src/api/handlers.rs et src/indentiagraph/note.rs doivent être modifiés. Voir aussi src/skills/activation.rs.";
         let paths = extract_file_paths_from_content(content);
         assert_eq!(paths.len(), 3);
         assert!(paths.contains(&"src/api/handlers.rs".to_string()));
-        assert!(paths.contains(&"src/neo4j/note.rs".to_string()));
+        assert!(paths.contains(&"src/indentiagraph/note.rs".to_string()));
         assert!(paths.contains(&"src/skills/activation.rs".to_string()));
     }
 
     #[test]
     fn test_extract_file_paths_absolute_normalized() {
-        let content = "Le fichier /Users/foo/project/src/neo4j/client.rs doit être modifié.";
+        let content =
+            "Le fichier /Users/foo/project/src/indentiagraph/client.rs doit être modifié.";
         let paths = extract_file_paths_from_content(content);
-        assert_eq!(paths, vec!["src/neo4j/client.rs"]);
+        assert_eq!(paths, vec!["src/indentiagraph/client.rs"]);
     }
 
     #[test]
@@ -3155,14 +3197,14 @@ mod tests {
 
     #[test]
     fn test_extract_file_paths_ignores_urls() {
-        let content = "See https://example.com/src/neo4j/client.rs for docs";
+        let content = "See https://example.com/src/indentiagraph/client.rs for docs";
         let paths = extract_file_paths_from_content(content);
         assert!(paths.is_empty(), "URLs should be ignored, got: {:?}", paths);
     }
 
     #[test]
     fn test_extract_file_paths_ignores_rust_modules() {
-        let content = "Use crate::neo4j::client for the implementation";
+        let content = "Use crate::indentiagraph::client for the implementation";
         let paths = extract_file_paths_from_content(content);
         assert!(
             paths.is_empty(),
@@ -3180,9 +3222,9 @@ mod tests {
 
     #[test]
     fn test_extract_file_paths_deduplicates() {
-        let content = "Modifier src/neo4j/client.rs. Le fichier src/neo4j/client.rs est critique.";
+        let content = "Modifier src/indentiagraph/client.rs. Le fichier src/indentiagraph/client.rs est critique.";
         let paths = extract_file_paths_from_content(content);
-        assert_eq!(paths, vec!["src/neo4j/client.rs"]);
+        assert_eq!(paths, vec!["src/indentiagraph/client.rs"]);
     }
 
     #[test]
@@ -3204,7 +3246,7 @@ mod tests {
         use crate::notes::models::{EntityType as NoteEntityType, NoteAnchor};
 
         let mut note = make_scored_note(
-            "Neo4j tip",
+            "IndentiaGraph tip",
             vec![],
             NoteType::Tip,
             NoteImportance::Medium,
@@ -3213,11 +3255,11 @@ mod tests {
         );
         note.anchors = vec![NoteAnchor::new(
             NoteEntityType::File,
-            "src/neo4j/client.rs".to_string(),
+            "src/indentiagraph/client.rs".to_string(),
         )];
 
         let note_without_anchors = make_scored_note(
-            "Neo4j tip",
+            "IndentiaGraph tip",
             vec![],
             NoteType::Tip,
             NoteImportance::Medium,
@@ -3225,10 +3267,11 @@ mod tests {
             0.0,
         );
 
-        let with_anchor = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+        let with_anchor =
+            score_note_relevance(&note, Some("src/indentiagraph/client.rs"), None, "Read");
         let without_anchor = score_note_relevance(
             &note_without_anchors,
-            Some("src/neo4j/client.rs"),
+            Some("src/indentiagraph/client.rs"),
             None,
             "Read",
         );
@@ -3253,7 +3296,7 @@ mod tests {
         use crate::notes::models::{EntityType as NoteEntityType, NoteAnchor};
 
         let mut note = make_scored_note(
-            "Neo4j tip",
+            "IndentiaGraph tip",
             vec![],
             NoteType::Tip,
             NoteImportance::Medium,
@@ -3262,11 +3305,11 @@ mod tests {
         );
         note.anchors = vec![NoteAnchor::new(
             NoteEntityType::File,
-            "src/neo4j/analytics.rs".to_string(),
+            "src/indentiagraph/analytics.rs".to_string(),
         )];
 
         let note_without_anchors = make_scored_note(
-            "Neo4j tip",
+            "IndentiaGraph tip",
             vec![],
             NoteType::Tip,
             NoteImportance::Medium,
@@ -3275,10 +3318,10 @@ mod tests {
         );
 
         let with_dir_anchor =
-            score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+            score_note_relevance(&note, Some("src/indentiagraph/client.rs"), None, "Read");
         let without_anchor = score_note_relevance(
             &note_without_anchors,
-            Some("src/neo4j/client.rs"),
+            Some("src/indentiagraph/client.rs"),
             None,
             "Read",
         );
@@ -3303,7 +3346,7 @@ mod tests {
             0.0,
         );
 
-        let score = score_note_relevance(&note, Some("src/neo4j/client.rs"), None, "Read");
+        let score = score_note_relevance(&note, Some("src/indentiagraph/client.rs"), None, "Read");
         // base(0.1) × importance(1.0) = 0.1
         assert!(
             (score - 0.1).abs() < f64::EPSILON,
@@ -3315,19 +3358,19 @@ mod tests {
     // --- E2E contextual scoring simulation ---
 
     /// Simulates a realistic skill activation scenario: a skill with 15+ notes
-    /// of mixed topics (neo4j, tauri, chat, api), triggered by a Read on
-    /// `src/neo4j/client.rs`. Verifies that notes relevant to neo4j are
+    /// of mixed topics (indentiagraph, tauri, chat, api), triggered by a Read on
+    /// `src/indentiagraph/client.rs`. Verifies that notes relevant to indentiagraph are
     /// sorted first in the assembled context string.
     #[test]
     fn test_e2e_contextual_scoring_sorts_relevant_notes_first() {
         use crate::notes::models::{EntityType as NoteEntityType, NoteAnchor};
 
         // --- Build 18 notes with realistic diversity ---
-        let neo4j_notes = vec![
+        let indentiagraph_notes = vec![
             {
                 let mut n = make_scored_note(
                     "Always use parameters in Cypher queries to prevent injection.",
-                    vec!["neo4j", "cypher", "security"],
+                    vec!["indentiagraph", "cypher", "security"],
                     NoteType::Gotcha,
                     NoteImportance::Critical,
                     0.9,
@@ -3335,21 +3378,21 @@ mod tests {
                 );
                 n.anchors = vec![NoteAnchor::new(
                     NoteEntityType::File,
-                    "src/neo4j/client.rs".to_string(),
+                    "src/indentiagraph/client.rs".to_string(),
                 )];
                 n
             },
             make_scored_note(
-                "Neo4j MERGE is not atomic, use unique constraints. See src/neo4j/client.rs.",
-                vec!["neo4j", "cypher", "gotcha"],
+                "IndentiaGraph MERGE is not atomic, use unique constraints. See src/indentiagraph/client.rs.",
+                vec!["indentiagraph", "cypher", "gotcha"],
                 NoteType::Gotcha,
                 NoteImportance::High,
                 0.8,
                 0.05,
             ),
             make_scored_note(
-                "The Neo4j driver pool size should match tokio thread count.",
-                vec!["neo4j", "performance"],
+                "The IndentiaGraph driver pool size should match tokio thread count.",
+                vec!["indentiagraph", "performance"],
                 NoteType::Tip,
                 NoteImportance::Medium,
                 0.7,
@@ -3358,7 +3401,7 @@ mod tests {
             {
                 let mut n = make_scored_note(
                     "All LINKED_TO relations must use this exact name, not ATTACHED_TO.",
-                    vec!["neo4j", "knowledge-fabric"],
+                    vec!["indentiagraph", "knowledge-fabric"],
                     NoteType::Guideline,
                     NoteImportance::High,
                     0.85,
@@ -3366,7 +3409,7 @@ mod tests {
                 );
                 n.anchors = vec![NoteAnchor::new(
                     NoteEntityType::File,
-                    "src/neo4j/note.rs".to_string(),
+                    "src/indentiagraph/note.rs".to_string(),
                 )];
                 n
             },
@@ -3478,29 +3521,29 @@ mod tests {
         all_notes.extend(chat_notes);
         all_notes.extend(misc_notes);
         all_notes.extend(api_notes);
-        all_notes.extend(neo4j_notes); // neo4j notes added LAST
+        all_notes.extend(indentiagraph_notes); // indentiagraph notes added LAST
 
         assert_eq!(all_notes.len(), 15, "Should have 15 notes total");
 
         // Score and sort (simulate what activate_for_hook does)
-        let file_context = Some("src/neo4j/client.rs");
+        let file_context = Some("src/indentiagraph/client.rs");
         let mut scored: Vec<(f64, &Note)> = all_notes
             .iter()
             .map(|n| (score_note_relevance(n, file_context, None, "Read"), n))
             .collect();
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
 
-        // The top 4 notes should ALL be neo4j-related
+        // The top 4 notes should ALL be indentiagraph-related
         let top_4_contents: Vec<&str> = scored[0..4]
             .iter()
             .map(|(_, n)| n.content.as_str())
             .collect();
         for content in &top_4_contents {
             assert!(
-                content.to_lowercase().contains("neo4j")
+                content.to_lowercase().contains("indentiagraph")
                     || content.to_lowercase().contains("linked_to")
                     || content.to_lowercase().contains("cypher"),
-                "Top-4 note should be neo4j-related, got: '{}'",
+                "Top-4 note should be indentiagraph-related, got: '{}'",
                 content
             );
         }
@@ -3533,12 +3576,12 @@ mod tests {
         for pos in &tauri_positions {
             assert!(
                 *pos >= 4,
-                "Tauri notes should be below neo4j notes, found at position {}",
+                "Tauri notes should be below indentiagraph notes, found at position {}",
                 pos
             );
         }
 
-        // Assemble context and verify neo4j notes appear first in the string
+        // Assemble context and verify indentiagraph notes appear first in the string
         let sorted_notes: Vec<Note> = scored.iter().map(|(_, n)| (*n).clone()).collect();
         let decisions = vec![];
         let (context_str, notes_included) = assemble_context_with_confidence(
@@ -3552,9 +3595,9 @@ mod tests {
 
         assert!(notes_included > 0, "Should include at least 1 note");
         // With short notes, all 15 may fit in 3200 chars. The important thing
-        // is that the ORDER is correct (neo4j first), not that truncation happens.
+        // is that the ORDER is correct (indentiagraph first), not that truncation happens.
 
-        // First note line in context should be neo4j-related
+        // First note line in context should be indentiagraph-related
         // Format is "- {emoji}{badge}{content}\n"
         let first_note_line = context_str
             .lines()
@@ -3563,7 +3606,7 @@ mod tests {
         assert!(
             first_note_line.to_lowercase().contains("cypher")
                 || first_note_line.to_lowercase().contains("parameter"),
-            "First note in context should be neo4j-related, got: '{}'",
+            "First note in context should be indentiagraph-related, got: '{}'",
             first_note_line
         );
     }

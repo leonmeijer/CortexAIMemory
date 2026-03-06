@@ -1,362 +1,346 @@
-<p align="center">
-  <img src="dist/logo-512.png" alt="Project Orchestrator" width="128" />
-</p>
 
-<h1 align="center">Project Orchestrator</h1>
+## Wat is CortexAIMemory?
 
-<p align="center">
-  <strong>Coordinate AI coding agents with a shared knowledge graph.</strong>
-</p>
+CortexAIMemory is de AI-orchestratielaag van het Indentia-platform. Het geeft Claude Code en andere AI-agents een gedeeld, persistent geheugen: codestructuur, plannen, beslissingen, kennisnotities en episodisch geheugen worden centraal opgeslagen en doorzoekbaar gemaakt.
 
-<p align="center">
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.6_aarch64.dmg"><img src="https://img.shields.io/badge/Download_for_macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="Download for macOS" height="40"></a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.6_x64-setup.exe"><img src="https://img.shields.io/badge/Download_for_Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Download for Windows" height="40"></a>
-  &nbsp;&nbsp;
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.6_amd64.AppImage"><img src="https://img.shields.io/badge/Download_for_Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Download for Linux" height="40"></a>
-</p>
+In plaats van elke sessie opnieuw te beginnen, bouwt CortexAIMemory een kennisgraaf op die groeit naarmate je codebase evolueert. Agents kunnen elkaars context lezen, taken oppakken, beslissingen terugvinden en patronen herkennen die eerder zijn vastgelegd.
 
-<p align="center">
-  <a href="#desktop-app">All download options (Intel Mac, .msi, .deb, .rpm...)</a>
-</p>
+Het systeem is opgezet rond twee kernprincipes: **structureel geheugen** (wat staat er in de code, wie hangt van wie af, welke beslissingen zijn genomen) en **episodisch geheugen** (wat is er wanneer gebeurd, wat wisten we op een bepaald moment in de tijd).
 
-<p align="center">
-  <a href="https://github.com/this-rs/project-orchestrator/actions/workflows/ci.yml"><img src="https://github.com/this-rs/project-orchestrator/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://codecov.io/gh/this-rs/project-orchestrator"><img src="https://codecov.io/gh/this-rs/project-orchestrator/branch/main/graph/badge.svg" alt="codecov"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.75+-orange.svg" alt="Rust"></a>
-  <a href="https://github.com/this-rs/project-orchestrator/releases/latest"><img src="https://img.shields.io/github/v/release/this-rs/project-orchestrator?label=release" alt="Latest Release"></a>
-</p>
+### Kernfunctionaliteit
 
-Project Orchestrator gives your AI agents a shared brain. Instead of each agent starting from scratch, they share code understanding, plans, decisions, and progress through a central knowledge base.
+- **Kennisgraaf (IndentiaGraph)** — code-structuur, plannen, taken, beslissingen en notes als graaf
+- **Native BM25 + vector search** — full-text en semantisch zoeken direct op de graph-backend
+- **Episodisch geheugen (Graphiti-inspired)** — tijdgestempelde episoden, bi-temporele notes, historische queries
+- **MCP-server** — 20 mega-tools voor Claude Code, OpenAI Agents en Cursor
+- **cortex-mem** — memory worker daemon die Claude Code sessies automatisch vastlegt (poort 37777)
+- **Tree-sitter parser** — 17 programmeertalen, inclusief HCL/Terraform
+- **File watcher** — automatische code-synchronisatie bij elke opgeslagen wijziging
+- **Authenticatie** — Google OAuth2, generieke OIDC, wachtwoord + JWT, deny-by-default middleware
+- **Chat WebSocket** — real-time conversationele AI via Claude Code CLI (Nexus SDK)
+- **Event systeem** — live CRUD-notificaties via WebSocket
 
 ---
 
-## Features
+## Architectuur
 
-- **Shared Knowledge Base** — Code structure stored in Neo4j graph database, accessible to all agents
-- **Semantic Code Search** — Find code by meaning, not just keywords, powered by Meilisearch
-- **Plan & Task Management** — Structured workflows with dependencies, steps, and progress tracking
-- **Multi-Language Parsing** — Tree-sitter support for Rust, TypeScript, Python, Go, and 12 more languages
-- **Multi-Project Workspaces** — Group related projects with shared context, contracts, and milestones
-- **MCP Integration** — 19 mega-tools available for Claude Code, OpenAI Agents, and Cursor
-- **Auto-Sync** — File watcher keeps the knowledge base updated as you code
-- **Authentication** — Google OAuth2, OIDC, and Password login with deny-by-default security
-- **Chat WebSocket** — Real-time conversational AI via Claude integration
-- **Event System** — Live CRUD notifications via WebSocket
-- **NATS Integration** — Inter-process event sync for multi-instance deployments
-
----
-
-## Installation
-
-### Desktop App
-
-Download the desktop app for your platform:
-
-| Platform | Download | Type |
-|----------|----------|------|
-| **macOS** (Apple Silicon) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.6_aarch64.dmg) | M1/M2/M3/M4 |
-| **macOS** (Intel) | [Download .dmg](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.6_x64.dmg) | Intel Mac |
-| **Windows** (64-bit) | [Download .exe](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.6_x64-setup.exe) | Installer |
-| **Windows** (64-bit MSI) | [Download .msi](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.6_x64_en-US.msi) | MSI |
-| **Linux** (64-bit) | [Download .AppImage](https://github.com/this-rs/project-orchestrator/releases/latest/download/Project.Orchestrator_0.0.6_amd64.AppImage) | Universal |
-| **Linux** (Debian/Ubuntu) | [Download .deb](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.6-1_amd64.deb) | apt/dpkg |
-| **Linux** (Fedora/RHEL) | [Download .rpm](https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.6-1.x86_64.rpm) | dnf/rpm |
-
-> All releases are available on the [Releases page](https://github.com/this-rs/project-orchestrator/releases/latest).
-
----
-
-### Homebrew (macOS / Linux)
-
-```bash
-brew install this-rs/tap/project-orchestrator
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    AI-AGENTS                                │
+│           (Claude Code / OpenAI / Cursor)                   │
+└──────────┬──────────────────┬───────────────────┬───────────┘
+           │ MCP Protocol     │ WebSocket         │ REST API
+           ▼                  ▼                   ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   CORTEX (HTTP server)                      │
+│              (20 MCP Mega-Tools, Axum 0.8)                  │
+│                                                             │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
+│  │   Auth   │  │   Chat   │  │  Events  │  │  Episodes  │  │
+│  │OIDC+Pass │  │  Claude  │  │ Live WS  │  │ Bi-temporal│  │
+│  │  + JWT   │  │  Streams │  │ + NATS   │  │   Memory   │  │
+│  └──────────┘  └──────────┘  └──────────┘  └────────────┘  │
+└─────────────────────────────┬───────────────────────────────┘
+                              │
+   ┌──────────────────────────┼──────────────────────────┐
+   ▼                          ▼                          ▼
+┌────────────────────┐  ┌──────────────────────┐  ┌──────────────┐
+│ INDENTIAGRAPH API  │  │   SURREALDB ENGINE   │  │ TREE-SITTER  │
+│                    │  │  (via IndentiaGraph) │  │              │
+│ • Code graph       │  │ • BM25 zoeken        │  │ • 17 talen   │
+│ • Plannen/taken    │  │ • Episoden           │  │ • AST parse  │
+│ • Beslissingen     │  │ • Temporele queries  │  │ • Symbolen   │
+└────────────────────┘  └──────────────────────┘  └──────────────┘
 ```
 
-This installs `orchestrator`, `orch` (CLI shorthand), and `mcp_server`.
+### Binaries
+
+| Binary | Beschrijving |
+|--------|-------------|
+| `cortex` | Hoofdserver (was: `orchestrator`) |
+| `cortex-cli` | CLI-tool (was: `orch`) |
+| `cortex-mcp` | MCP-server voor AI-tools (was: `mcp_server`) |
+| `cortex-mem` | Memory worker daemon (poort 37777) |
+| `cortex-mem-hook` | Claude Code hook binary |
+
+### Feature Flags
+
+| Flag | Standaard | Beschrijving |
+|------|-----------|-------------|
+| `embedded-frontend` | nee | Embed React SPA in de binary |
+| `vendored-openssl` | nee | Statische OpenSSL voor cross-compilatie |
+| `nexus-memory` | nee | Activeert Nexus memory integratie voor chat |
 
 ---
 
-### Shell Script (macOS / Linux)
+## Installatie
+
+### Vereisten
+
+- Rust 1.75+
+- Geen Docker nodig voor standaardgebruik (embedded SurrealKV)
+- Optioneel: externe SurrealDB 2.x/3.x via `ws://...`
+
+### Snel starten
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/this-rs/project-orchestrator/main/install.sh | sh
-```
+# Clone de repository
+git clone <repository-url>
+cd CortexAIMemory
 
-Options:
-
-```bash
-# Install a specific version
-curl -fsSL https://…/install.sh | sh -s -- --version 0.0.6
-
-# Install without the embedded frontend (lighter)
-curl -fsSL https://…/install.sh | sh -s -- --no-frontend
-
-# Custom install directory
-curl -fsSL https://…/install.sh | sh -s -- --install-dir /usr/local/bin
-```
-
----
-
-### PowerShell (Windows)
-
-```powershell
-irm https://raw.githubusercontent.com/this-rs/project-orchestrator/main/install.ps1 | iex
-```
-
----
-
-### Docker
-
-```bash
-# Full (with embedded frontend)
-docker pull ghcr.io/this-rs/project-orchestrator:latest
-
-# API-only (lighter, no frontend)
-docker pull ghcr.io/this-rs/project-orchestrator:latest-api
-```
-
-Or use Docker Compose with all services (Neo4j, Meilisearch, NATS):
-
-```bash
-git clone https://github.com/this-rs/project-orchestrator.git
-cd project-orchestrator
-docker compose up -d
-```
-
----
-
-### Debian / Ubuntu (apt)
-
-```bash
-# Download and install the .deb package
-curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator_0.0.6-1_amd64.deb
-sudo dpkg -i project-orchestrator_0.0.6-1_amd64.deb
-
-# Start the service
-sudo systemctl enable --now project-orchestrator
-```
-
----
-
-### Fedora / RHEL (rpm)
-
-```bash
-# Download and install the .rpm package
-curl -LO https://github.com/this-rs/project-orchestrator/releases/latest/download/project-orchestrator-0.0.6-1.x86_64.rpm
-sudo rpm -i project-orchestrator-0.0.6-1.x86_64.rpm
-```
-
----
-
-### Build from Source
-
-```bash
-git clone https://github.com/this-rs/project-orchestrator.git
-cd project-orchestrator
+# Bouw en start de server
 cargo build --release
-
-# Binaries in target/release/:
-#   orchestrator  — main server
-#   orch          — CLI shorthand
-#   mcp_server    — MCP server for AI tools
+./target/release/cortex serve --port 8080
 ```
+
+### Configuratie (config.yaml)
+
+Kopieer en pas `config.yaml` aan:
+
+```yaml
+server:
+  port: 8080                        # SERVER_PORT
+
+indentiagraph:
+  # Persistent lokale opslag (non-ephemeral, zonder Docker)
+  uri: "surrealkv://./.cortex/indentiagraph"  # SURREALDB_URL (of legacy INDENTIAGRAPH_URI)
+  user: "root"                      # SURREALDB_USERNAME (alleen nodig voor remote ws/http)
+  password: "root"                  # SURREALDB_PASSWORD (alleen nodig voor remote ws/http)
+  namespace: "cortex"               # SURREALDB_NAMESPACE
+  database: "memory"                # SURREALDB_DATABASE
+
+chat:
+  default_model: "claude-opus-4-6"  # CHAT_DEFAULT_MODEL
+```
+
+| Omgevingsvariabele | Beschrijving | Standaard |
+|--------------------|-------------|-----------|
+| `SURREALDB_URL` | SurrealDB verbindings-URI | `surrealkv://./.cortex/indentiagraph` |
+| `SURREALDB_USERNAME` | SurrealDB gebruiker | `root` |
+| `SURREALDB_PASSWORD` | SurrealDB wachtwoord | `root` |
+| `SURREALDB_NAMESPACE` | SurrealDB namespace | `cortex` |
+| `SURREALDB_DATABASE` | SurrealDB database | `memory` |
+| `INDENTIAGRAPH_URI/USER/PASSWORD` | Legacy aliases (achterwaarts compatibel) | - |
+| `CHAT_DEFAULT_MODEL` | Standaard Claude model | `claude-opus-4-6` |
+| `RUST_LOG` | Log niveau | `info` |
 
 ---
 
-## Quick Start
+## MCP-integratie (Claude Code)
 
-### 1. Start the backend services
-
-The server requires **Neo4j** and **Meilisearch**. The easiest way is Docker Compose:
+### Bouwen
 
 ```bash
-docker compose up -d
+cargo build --release --bin cortex-mcp
 ```
 
-Then start the orchestrator:
-
-```bash
-orchestrator serve
-```
-
-### 2. Configure your AI tool
-
-Add to your MCP configuration (e.g., `~/.claude/mcp.json`):
+### Configuratie in `~/.claude/mcp.json`
 
 ```json
 {
   "mcpServers": {
-    "project-orchestrator": {
-      "command": "mcp_server",
+    "cortex": {
+      "command": "/pad/naar/cortex-mcp",
       "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "orchestrator123",
-        "MEILISEARCH_URL": "http://localhost:7700",
-        "MEILISEARCH_KEY": "orchestrator-meili-key-change-me",
-        "NATS_URL": "nats://localhost:4222"
+        "PO_SERVER_URL": "http://127.0.0.1:8080"
       }
     }
   }
 }
 ```
 
-> **Note:** `NATS_URL` enables real-time event sync between the MCP server and other instances (desktop app, other agents). Without it, CRUD events from MCP tools won't propagate to the rest of the system. If some env vars are not forwarded by your AI tool, the MCP server also reads `config.yaml` as a fallback (see [Configuration](#configuration)).
+### Overzicht van de 20 Mega-Tools
 
-### 3. Create and sync your first project
+| Mega-Tool | Acties | Beschrijving |
+|-----------|--------|-------------|
+| `project` | 8 | Project CRUD, sync, roadmap |
+| `plan` | 10 | Plan lifecycle, dependency graph, critical path |
+| `task` | 13 | Taken, afhankelijkheden, blockers, context |
+| `step` | 6 | Subtaken, voortgang bijhouden |
+| `decision` | 12 | Beslissingen, tijdlijn, impact tracking |
+| `constraint` | 5 | Plan constraints (performance, security, stijl) |
+| `release` | 8 | Releasemanagement met taken en commits |
+| `milestone` | 9 | Mijlpalen met voortgang en plan-koppeling |
+| `commit` | 7 | Git commit tracking, bestandshistorie |
+| `note` | 24 | Kennisnotities, semantisch zoeken, episodisch geheugen |
+| `workspace` | 10 | Multi-project workspaces, topologie |
+| `workspace_milestone` | 10 | Cross-project mijlpalen |
+| `resource` | 6 | Gedeelde API-contracten, schema's |
+| `component` | 8 | Servicetopologie en afhankelijkheden |
+| `chat` | 7 | Chat sessies, berichten, delegatie |
+| `feature_graph` | 6 | Feature grafen, automatisch bouwen vanuit code |
+| `code` | 36 | Code zoeken, call grafen, impact analyse, communities, bridge |
+| `admin` | 25 | Sync, watch, Knowledge Fabric, neural onderhoud, skills |
+| `skill` | 12 | Neurale skills detectie, activatie, export/import |
+| `analysis_profile` | 4 | Edge/fusion gewichten presets voor analyse |
+
+---
+
+## Episodisch Geheugen
+
+CortexAIMemory ondersteunt Graphiti-geïnspireerd temporeel episodisch geheugen: ruwe tekst als tijdgestempelde episoden opslaan, bi-temporele notes en historische queries.
+
+### Hoe het werkt
+
+**Episoden** zijn ruwe teksteenheden met een tijdstempel (gesprekken, code-events, documenten, systeem-events). Ze worden opgeslagen met BM25-indexering voor snelle full-text zoekacties.
+
+**Bi-temporele notes** hebben twee tijdstempels:
+- `valid_at` — wanneer het feit waar werd
+- `invalid_at` — wanneer het feit ophield waar te zijn (NULL = nu nog geldig)
+
+Dit maakt het mogelijk te vragen: "Wat wisten we op 15 januari 2024?" zonder huidige kennis te verliezen.
+
+### API-voorbeelden
 
 ```bash
-# Your AI agent can now use MCP tools to:
-# - create_project: Register your codebase
-# - sync_project: Parse and index your code
-# - create_plan: Start a development plan
-# - create_workspace: Group related projects
-# - And 15 more mega-tools...
+# Episode opslaan (gesprek, code-event, document, systeem-event)
+curl -X POST http://localhost:8080/api/episodes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Sprint planning 2024-01-15",
+    "content": "Team besloot auth te migreren van JWT naar PASETO...",
+    "source": "conversation",
+    "reference_time": "2024-01-15T09:00:00Z",
+    "project_id": "uuid-van-project"
+  }'
+
+# Recente episoden ophalen
+curl "http://localhost:8080/api/episodes?project_id=uuid&limit=20"
+
+# Episoden doorzoeken (BM25)
+curl "http://localhost:8080/api/episodes/search?query=auth+migratie&project_id=uuid"
+
+# Wat wisten we op een bepaald moment? (temporele zoekopdracht)
+curl "http://localhost:8080/api/notes/at-time?query=auth&at_time=2024-01-15T09:00:00Z&project_id=uuid"
+
+# Note niet-destructief ongeldig markeren op een tijdstip
+curl -X POST http://localhost:8080/api/notes/{id}/invalidate-temporal \
+  -H "Content-Type: application/json" \
+  -d '{"at_time": "2024-01-16T00:00:00Z"}'
 ```
 
-That's it! Your AI agents now have shared context.
+### MCP-tools voor episodisch geheugen
 
----
+De `note` mega-tool heeft 5 extra acties:
 
-## Integrations
-
-| Platform | Status | Documentation |
-|----------|--------|---------------|
-| **Claude Code** | Full Support | [Setup Guide](docs/integrations/claude-code.md) |
-| **OpenAI Agents** | Full Support | [Setup Guide](docs/integrations/openai.md) |
-| **Cursor** | Full Support | [Setup Guide](docs/integrations/cursor.md) |
-
----
-
-## What Can Your Agents Do?
-
-### Explore Code
-```
-"Find all functions that handle authentication"
-"Show me what imports this file"
-"What's the impact of changing UserService?"
-```
-
-### Manage Work
-```
-"Create a plan to add OAuth support"
-"What's the next task I should work on?"
-"Record that we chose JWT over sessions"
-```
-
-### Stay in Sync
-```
-"What decisions were made about caching?"
-"Show me the project roadmap"
-"What tasks are blocking the release?"
-```
-
-### Coordinate Multiple Projects
-```
-"Create a workspace for our microservices"
-"Add the API contract shared by all services"
-"What's the cross-project milestone progress?"
-```
-
----
-
-## Documentation
-
-| Guide | Description |
+| Actie | Beschrijving |
 |-------|-------------|
-| [Installation](docs/setup/installation.md) | Full setup instructions and configuration |
-| [Getting Started](docs/guides/getting-started.md) | Step-by-step tutorial for new users |
-| [API Reference](docs/api/reference.md) | Complete REST API documentation |
-| [MCP Tools](docs/api/mcp-tools.md) | All 19 MCP mega-tools with examples |
-| [Workspaces](docs/guides/workspaces.md) | Multi-project coordination |
-| [Multi-Agent Workflows](docs/guides/multi-agent-workflow.md) | Coordinating multiple agents |
-| [Authentication](docs/guides/authentication.md) | JWT + OAuth/OIDC + Password auth setup |
-| [Chat & WebSocket](docs/guides/chat-websocket.md) | Real-time chat and events |
-| [Knowledge Notes](docs/guides/knowledge-notes.md) | Contextual knowledge capture |
+| `add_episode` | Ruwe tekst opslaan als tijdgestempelde episode |
+| `get_episodes` | Recente episoden ophalen (filter op project_id, group_id) |
+| `search_episodes` | BM25 zoeken over episode-inhoud |
+| `search_at_time` | "Wat wisten we op datum X?" temporele notitiezoekopdracht |
+| `invalidate_temporal` | Note ongeldig markeren op een specifiek tijdstip |
 
 ---
 
-## Configuration
+## cortex-mem (Claude Code Hook)
 
-The server uses a layered configuration system: **env vars > config.yaml > defaults**.
+`cortex-mem` is een memory worker daemon die automatisch Claude Code sessies vastlegt als episoden in het geheugen.
 
-Copy and edit `config.yaml` at the project root:
+### Hoe het werkt
 
-```yaml
-server:
-  port: 8080                    # SERVER_PORT
+1. `cortex-mem` draait als achtergrondproces op poort 37777
+2. `cortex-mem-hook` is een lichtgewicht binary die als `PostToolUse` hook in Claude Code wordt geconfigureerd
+3. Na elke tool-aanroep stuurt de hook de context naar de memory worker
+4. De worker slaat dit op als episode in IndentiaGraph DB
 
-neo4j:
-  uri: "bolt://localhost:7687"  # NEO4J_URI
-  user: "neo4j"                 # NEO4J_USER
-  password: "orchestrator123"   # NEO4J_PASSWORD
+### Installatie als Claude Code hook
 
-meilisearch:
-  url: "http://localhost:7700"              # MEILISEARCH_URL
-  key: "orchestrator-meili-key-change-me"   # MEILISEARCH_KEY
+```bash
+# Bouw de hook binary
+cargo build --release -p cortex-mem --bin cortex-mem-hook
 
-nats:
-  url: "nats://localhost:4222"  # NATS_URL — inter-process event sync
+# Bouw ook de worker binary
+cargo build --release -p cortex-mem --bin cortex-mem
 
-chat:
-  default_model: "claude-opus-4-6"  # CHAT_DEFAULT_MODEL
+# Start de memory worker
+./target/release/cortex-mem &
+
+# Configureer in ~/.claude/settings.json
 ```
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `NEO4J_URI` | Neo4j Bolt connection URI | `bolt://localhost:7687` |
-| `NEO4J_USER` | Neo4j username | `neo4j` |
-| `NEO4J_PASSWORD` | Neo4j password | `orchestrator123` |
-| `MEILISEARCH_URL` | Meilisearch HTTP URL | `http://localhost:7700` |
-| `MEILISEARCH_KEY` | Meilisearch API key | `orchestrator-meili-key-change-me` |
-| `NATS_URL` | NATS server URL for event sync | *(optional)* |
-| `CHAT_DEFAULT_MODEL` | Default Claude model for chat | `claude-opus-4-6` |
-| `RUST_LOG` | Log level filter | `info` |
+Voeg toe aan `~/.claude/settings.json`:
 
-> **Why NATS?** The MCP server runs as a separate process (spawned by Claude Code). NATS is the pub/sub bridge that propagates CRUD events and chat messages between the MCP server, the HTTP backend, and the desktop app. Without NATS, each instance works in isolation.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     YOUR AI AGENTS                          │
-│           (Claude Code / OpenAI / Cursor)                   │
-└──────────┬──────────────────┬───────────────────┬───────────┘
-           │ MCP Protocol     │ WebSocket         │ REST API
-           ▼                  ▼                   ▼
-┌─────────────────────────────────────────────────────────────┐
-│                  PROJECT ORCHESTRATOR                        │
-│                   (19 MCP Mega-Tools)                        │
-│                                                             │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
-│  │   Auth   │  │   Chat   │  │  Events  │  │   Config   │  │
-│  │OIDC+Pass │  │  Claude  │  │ Live WS  │  │   YAML +   │  │
-│  │  + JWT   │  │  Streams │  │ + NATS   │  │  env vars  │  │
-│  └──────────┘  └──────────┘  └──────────┘  └────────────┘  │
-└─────────────────────────────┬───────────────────────────────┘
-                              │
-   ┌──────────────────────────┼──────────────────────────┐
-   ▼                ▼                  ▼                  ▼
-┌──────────┐  ┌──────────┐     ┌──────────┐     ┌──────────────┐
-│  NEO4J   │  │MEILISEARCH│    │  NATS    │     │ TREE-SITTER  │
-│          │  │          │     │          │     │              │
-│• Code    │  │• Code    │     │• Event   │     │• 16 languages│
-│  graph   │  │  search  │     │  sync    │     │• AST parsing │
-│• Plans   │  │• Decisions│    │• Chat    │     │• Symbols     │
-│• Decisions│ │          │     │  relay   │     │              │
-└──────────┘  └──────────┘     └──────────┘     └──────────────┘
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/pad/naar/cortex-mem-hook"
+          }
+        ]
+      }
+    ]
+  }
+}
 ```
 
 ---
 
-## Supported Languages
+## API-overzicht
 
-| Language | Extensions |
-|----------|------------|
+### Plannen en Taken
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/api/plans` | GET/POST | Plannen ophalen / aanmaken |
+| `/api/plans/{id}/tasks` | POST | Taak toevoegen aan plan |
+| `/api/tasks/{id}` | GET/PATCH | Taakdetails / bijwerken |
+| `/api/tasks/{id}/dependencies` | POST | Afhankelijkheden toevoegen |
+| `/api/tasks/{id}/blockers` | GET | Geblokkeerde taken ophalen |
+
+### Code Exploratie
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/api/code/search` | GET | Semantisch zoeken in code |
+| `/api/code/symbols/{path}` | GET | Symbolen in een bestand |
+| `/api/code/callgraph` | GET | Functie-aanroepgraaf |
+| `/api/code/impact` | GET | Impact-analyse bij wijzigingen |
+| `/api/code/architecture` | GET | Codebase-overzicht |
+
+### Kennisnotities
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/api/notes` | GET/POST | Notities ophalen / aanmaken |
+| `/api/notes/search` | GET | Semantisch zoeken in notities |
+| `/api/notes/at-time` | GET | Temporele notitiezoekopdracht |
+| `/api/notes/{id}/invalidate-temporal` | POST | Notitie ongeldig markeren op tijdstip |
+
+### Episodisch Geheugen
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/api/episodes` | GET/POST | Episoden ophalen / opslaan |
+| `/api/episodes/search` | GET | BM25 zoeken in episoden |
+
+### Workspaces
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/api/workspaces` | GET/POST | Workspaces beheren |
+| `/api/workspaces/{slug}/projects` | GET/POST | Projecten in workspace |
+| `/api/workspaces/{slug}/topology` | GET | Topologiegraaf |
+
+### Authenticatie
+
+| Endpoint | Methode | Beschrijving |
+|----------|---------|-------------|
+| `/auth/login` | POST | Inloggen (wachtwoord) |
+| `/auth/google` | GET | Google OAuth URL ophalen |
+| `/auth/me` | GET | Huidig gebruikersprofiel |
+
+---
+
+## Ondersteunde Programmeertalen
+
+| Taal | Extensies |
+|------|-----------|
 | Rust | `.rs` |
 | TypeScript | `.ts`, `.tsx` |
 | JavaScript | `.js`, `.jsx` |
@@ -376,16 +360,35 @@ chat:
 
 ---
 
-## Contributing
+## Ontwikkeling
 
-Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+```bash
+# Alle tests uitvoeren (mock backends, geen Docker vereist voor unit tests)
+cargo test
 
-## License
+# Linter
+cargo clippy
 
-MIT License - see [LICENSE](LICENSE) for details.
+# Formatter
+cargo fmt
 
----
+# Release build
+cargo build --release
+```
 
-<p align="center">
-  <i>Give your AI agents a shared brain.</i>
-</p>
+### Teststructuur
+
+| Testbestand | Beschrijving |
+|-------------|-------------|
+| `tests/api_tests.rs` | HTTP API tests |
+| `tests/integration_tests.rs` | Database integratietests |
+| `tests/parser_tests.rs` | Parser tests |
+| `tests/workspace_tests.rs` | Workspace tests |
+| `crates/cortex-indentiagraph/` | SurrealDB implementatietests (221) |
+
+### Nieuwe API-endpoint toevoegen
+
+1. Handler toevoegen in `src/api/handlers.rs` of een nieuwe `*_handlers.rs`
+2. Route registreren in `src/api/routes.rs`
+3. Test schrijven in `tests/api_tests.rs`
+

@@ -8,7 +8,7 @@ use crate::graph::{
     AnalyticsConfig, AnalyticsDebouncer, AnalyticsEngine, CoChangeDebouncer, GraphAnalyticsEngine,
     NeuralReinforcementDebouncer,
 };
-use crate::neo4j::models::*;
+use crate::indentiagraph::models::*;
 use crate::neurons::{AutoReinforcementConfig, SpreadingActivationEngine};
 use crate::notes::{EntityType, NoteLifecycleManager, NoteManager};
 use crate::parser::{CodeParser, ParsedFile};
@@ -272,13 +272,13 @@ impl Orchestrator {
     pub async fn new(state: AppState) -> Result<Self> {
         let embedding_provider = init_embedding_provider(&state.config);
 
-        let mut pm = PlanManager::new(state.neo4j.clone(), state.meili.clone());
+        let mut pm = PlanManager::new(state.indentiagraph.clone());
         if let Some(ref provider) = embedding_provider {
             pm = pm.with_embedding_provider(provider.clone());
         }
         let plan_manager = Arc::new(pm);
 
-        let mut note_manager = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let mut note_manager = NoteManager::new(state.indentiagraph.clone());
         if let Some(ref provider) = embedding_provider {
             note_manager = note_manager.with_embedding_provider(provider.clone());
         }
@@ -286,14 +286,13 @@ impl Orchestrator {
 
         let activation_engine = embedding_provider.clone().map(|provider| {
             Arc::new(SpreadingActivationEngine::new(
-                state.neo4j.clone() as Arc<dyn crate::neo4j::GraphStore>,
+                state.indentiagraph.clone() as Arc<dyn crate::indentiagraph::GraphStore>,
                 provider,
             ))
         });
 
         let context_builder = Arc::new(ContextBuilder::new(
-            state.neo4j.clone(),
-            state.meili.clone(),
+            state.indentiagraph.clone(),
             plan_manager.clone(),
             note_manager.clone(),
         ));
@@ -301,8 +300,7 @@ impl Orchestrator {
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
         let mut planner = super::ImplementationPlanner::new(
-            state.neo4j.clone(),
-            state.meili.clone(),
+            state.indentiagraph.clone(),
             plan_manager.clone(),
             note_manager.clone(),
         );
@@ -311,18 +309,21 @@ impl Orchestrator {
         }
         let planner = Arc::new(planner);
         let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
-            state.neo4j.clone(),
+            state.indentiagraph.clone(),
             AnalyticsConfig::default(),
         ));
         let analytics_debouncer = AnalyticsDebouncer::with_graph_store(
             analytics.clone(),
             2000,
-            Some(state.neo4j.clone()),
+            Some(state.indentiagraph.clone()),
         );
-        let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
+        let co_change_debouncer = CoChangeDebouncer::new(state.indentiagraph.clone(), 30_000);
         let ar_config = AutoReinforcementConfig::default();
-        let neural_reinforcement_debouncer =
-            NeuralReinforcementDebouncer::new(state.neo4j.clone(), ar_config.clone(), 5_000);
+        let neural_reinforcement_debouncer = NeuralReinforcementDebouncer::new(
+            state.indentiagraph.clone(),
+            ar_config.clone(),
+            5_000,
+        );
 
         Ok(Self {
             state,
@@ -353,21 +354,14 @@ impl Orchestrator {
         let emitter: Arc<dyn EventEmitter> = event_bus.clone();
         let embedding_provider = init_embedding_provider(&state.config);
 
-        let mut pm = PlanManager::with_event_emitter(
-            state.neo4j.clone(),
-            state.meili.clone(),
-            emitter.clone(),
-        );
+        let mut pm = PlanManager::with_event_emitter(state.indentiagraph.clone(), emitter.clone());
         if let Some(ref provider) = embedding_provider {
             pm = pm.with_embedding_provider(provider.clone());
         }
         let plan_manager = Arc::new(pm);
 
-        let mut note_manager = NoteManager::with_event_emitter(
-            state.neo4j.clone(),
-            state.meili.clone(),
-            emitter.clone(),
-        );
+        let mut note_manager =
+            NoteManager::with_event_emitter(state.indentiagraph.clone(), emitter.clone());
         if let Some(ref provider) = embedding_provider {
             note_manager = note_manager.with_embedding_provider(provider.clone());
         }
@@ -375,14 +369,13 @@ impl Orchestrator {
 
         let activation_engine = embedding_provider.clone().map(|provider| {
             Arc::new(SpreadingActivationEngine::new(
-                state.neo4j.clone() as Arc<dyn crate::neo4j::GraphStore>,
+                state.indentiagraph.clone() as Arc<dyn crate::indentiagraph::GraphStore>,
                 provider,
             ))
         });
 
         let context_builder = Arc::new(ContextBuilder::new(
-            state.neo4j.clone(),
-            state.meili.clone(),
+            state.indentiagraph.clone(),
             plan_manager.clone(),
             note_manager.clone(),
         ));
@@ -390,8 +383,7 @@ impl Orchestrator {
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
         let mut planner = super::ImplementationPlanner::new(
-            state.neo4j.clone(),
-            state.meili.clone(),
+            state.indentiagraph.clone(),
             plan_manager.clone(),
             note_manager.clone(),
         );
@@ -400,18 +392,21 @@ impl Orchestrator {
         }
         let planner = Arc::new(planner);
         let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
-            state.neo4j.clone(),
+            state.indentiagraph.clone(),
             AnalyticsConfig::default(),
         ));
         let analytics_debouncer = AnalyticsDebouncer::with_graph_store(
             analytics.clone(),
             2000,
-            Some(state.neo4j.clone()),
+            Some(state.indentiagraph.clone()),
         );
-        let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
+        let co_change_debouncer = CoChangeDebouncer::new(state.indentiagraph.clone(), 30_000);
         let ar_config = AutoReinforcementConfig::default();
-        let neural_reinforcement_debouncer =
-            NeuralReinforcementDebouncer::new(state.neo4j.clone(), ar_config.clone(), 5_000);
+        let neural_reinforcement_debouncer = NeuralReinforcementDebouncer::new(
+            state.indentiagraph.clone(),
+            ar_config.clone(),
+            5_000,
+        );
 
         Ok(Self {
             state,
@@ -444,21 +439,14 @@ impl Orchestrator {
     ) -> Result<Self> {
         let embedding_provider = init_embedding_provider(&state.config);
 
-        let mut pm = PlanManager::with_event_emitter(
-            state.neo4j.clone(),
-            state.meili.clone(),
-            emitter.clone(),
-        );
+        let mut pm = PlanManager::with_event_emitter(state.indentiagraph.clone(), emitter.clone());
         if let Some(ref provider) = embedding_provider {
             pm = pm.with_embedding_provider(provider.clone());
         }
         let plan_manager = Arc::new(pm);
 
-        let mut note_manager = NoteManager::with_event_emitter(
-            state.neo4j.clone(),
-            state.meili.clone(),
-            emitter.clone(),
-        );
+        let mut note_manager =
+            NoteManager::with_event_emitter(state.indentiagraph.clone(), emitter.clone());
         if let Some(ref provider) = embedding_provider {
             note_manager = note_manager.with_embedding_provider(provider.clone());
         }
@@ -466,14 +454,13 @@ impl Orchestrator {
 
         let activation_engine = embedding_provider.clone().map(|provider| {
             Arc::new(SpreadingActivationEngine::new(
-                state.neo4j.clone() as Arc<dyn crate::neo4j::GraphStore>,
+                state.indentiagraph.clone() as Arc<dyn crate::indentiagraph::GraphStore>,
                 provider,
             ))
         });
 
         let context_builder = Arc::new(ContextBuilder::new(
-            state.neo4j.clone(),
-            state.meili.clone(),
+            state.indentiagraph.clone(),
             plan_manager.clone(),
             note_manager.clone(),
         ));
@@ -481,8 +468,7 @@ impl Orchestrator {
         let parser = Arc::new(RwLock::new(CodeParser::new()?));
         let note_lifecycle = Arc::new(NoteLifecycleManager::new());
         let mut planner = super::ImplementationPlanner::new(
-            state.neo4j.clone(),
-            state.meili.clone(),
+            state.indentiagraph.clone(),
             plan_manager.clone(),
             note_manager.clone(),
         );
@@ -491,18 +477,21 @@ impl Orchestrator {
         }
         let planner = Arc::new(planner);
         let analytics: Arc<dyn AnalyticsEngine> = Arc::new(GraphAnalyticsEngine::new(
-            state.neo4j.clone(),
+            state.indentiagraph.clone(),
             AnalyticsConfig::default(),
         ));
         let analytics_debouncer = AnalyticsDebouncer::with_graph_store(
             analytics.clone(),
             2000,
-            Some(state.neo4j.clone()),
+            Some(state.indentiagraph.clone()),
         );
-        let co_change_debouncer = CoChangeDebouncer::new(state.neo4j.clone(), 30_000);
+        let co_change_debouncer = CoChangeDebouncer::new(state.indentiagraph.clone(), 30_000);
         let ar_config = AutoReinforcementConfig::default();
-        let neural_reinforcement_debouncer =
-            NeuralReinforcementDebouncer::new(state.neo4j.clone(), ar_config.clone(), 5_000);
+        let neural_reinforcement_debouncer = NeuralReinforcementDebouncer::new(
+            state.indentiagraph.clone(),
+            ar_config.clone(),
+            5_000,
+        );
 
         Ok(Self {
             state,
@@ -558,13 +547,13 @@ impl Orchestrator {
     }
 
     /// Get the graph store
-    pub fn neo4j(&self) -> &dyn crate::neo4j::GraphStore {
-        self.state.neo4j.as_ref()
+    pub fn indentiagraph(&self) -> &dyn crate::indentiagraph::GraphStore {
+        self.state.indentiagraph.as_ref()
     }
 
     /// Get the graph store as Arc (for sharing with ChatManager etc.)
-    pub fn neo4j_arc(&self) -> Arc<dyn crate::neo4j::GraphStore> {
-        self.state.neo4j.clone()
+    pub fn indentiagraph_arc(&self) -> Arc<dyn crate::indentiagraph::GraphStore> {
+        self.state.indentiagraph.clone()
     }
 
     /// Spawn analytics computation in background (non-blocking).
@@ -574,7 +563,7 @@ impl Orchestrator {
     /// response while analytics are computed.
     pub fn spawn_analyze_project(&self, project_id: Uuid) {
         let analytics = self.analytics.clone();
-        let neo4j = self.neo4j_arc();
+        let indentiagraph = self.indentiagraph_arc();
         let emitter: Option<Arc<dyn EventEmitter>> = self.event_emitter.clone();
         tokio::spawn(async move {
             let start = std::time::Instant::now();
@@ -608,7 +597,10 @@ impl Orchestrator {
                             })),
                         );
                     }
-                    if let Err(e) = neo4j.update_project_analytics_timestamp(project_id).await {
+                    if let Err(e) = indentiagraph
+                        .update_project_analytics_timestamp(project_id)
+                        .await
+                    {
                         tracing::warn!(
                             "Failed to update analytics_computed_at for project {}: {}",
                             project_id,
@@ -630,7 +622,7 @@ impl Orchestrator {
     /// Compute graph analytics for a project (synchronous, best-effort).
     ///
     /// Runs the full analytics pipeline (PageRank, Betweenness, Louvain, etc.)
-    /// and persists scores back to Neo4j. Logs timing on success, warns on failure.
+    /// and persists scores back to IndentiaGraph. Logs timing on success, warns on failure.
     /// Errors are caught and logged — analytics failures never break the sync pipeline.
     pub async fn analyze_project_safe(&self, project_id: Uuid) {
         let start = std::time::Instant::now();
@@ -665,7 +657,7 @@ impl Orchestrator {
                 );
                 // Update the project's analytics_computed_at timestamp
                 if let Err(e) = self
-                    .neo4j()
+                    .indentiagraph()
                     .update_project_analytics_timestamp(project_id)
                     .await
                 {
@@ -695,7 +687,7 @@ impl Orchestrator {
     /// Returns a `StalenessReport` with details about the staleness.
     pub async fn check_analytics_staleness(&self, project_id: Uuid) -> Result<StalenessReport> {
         let project = self
-            .neo4j()
+            .indentiagraph()
             .get_project(project_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Project {} not found", project_id))?;
@@ -718,7 +710,7 @@ impl Orchestrator {
         // set but no cc_version on any file.
         if !is_stale {
             match self
-                .neo4j()
+                .indentiagraph()
                 .has_context_cards(&project_id.to_string())
                 .await
             {
@@ -756,7 +748,7 @@ impl Orchestrator {
 
     /// Check staleness for all projects and return a list of stale project IDs.
     pub async fn get_stale_projects(&self) -> Result<Vec<StalenessReport>> {
-        let projects = self.neo4j().list_projects().await?;
+        let projects = self.indentiagraph().list_projects().await?;
         let mut stale = Vec::new();
         for project in &projects {
             let report = self.check_analytics_staleness(project.id).await?;
@@ -772,9 +764,9 @@ impl Orchestrator {
     /// Best-effort: logs info on success, warn on failure.
     /// Does not block the caller.
     pub fn spawn_refresh_feature_graphs(&self, project_id: uuid::Uuid) {
-        let neo4j = self.neo4j_arc();
+        let indentiagraph = self.indentiagraph_arc();
         tokio::spawn(async move {
-            let graphs = match neo4j.list_feature_graphs(Some(project_id)).await {
+            let graphs = match indentiagraph.list_feature_graphs(Some(project_id)).await {
                 Ok(g) => g,
                 Err(e) => {
                     tracing::warn!(
@@ -799,8 +791,11 @@ impl Orchestrator {
                 );
 
                 // Try LLM-based proposal first
-                let proposals =
-                    Orchestrator::propose_feature_graphs_with_llm(neo4j.as_ref(), project_id).await;
+                let proposals = Orchestrator::propose_feature_graphs_with_llm(
+                    indentiagraph.as_ref(),
+                    project_id,
+                )
+                .await;
 
                 if !proposals.is_empty() {
                     tracing::info!(
@@ -811,7 +806,7 @@ impl Orchestrator {
 
                     for proposal in &proposals {
                         let include_rels = proposal.include_relations.as_deref();
-                        match neo4j
+                        match indentiagraph
                             .auto_build_feature_graph(
                                 &proposal.name,
                                 proposal.description.as_deref(),
@@ -850,17 +845,18 @@ impl Orchestrator {
                     project_id
                 );
 
-                let top_functions = match neo4j.get_top_entry_functions(project_id, 10).await {
-                    Ok(fns) => fns,
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to get top entry functions for project {}: {}",
-                            project_id,
-                            e
-                        );
-                        return;
-                    }
-                };
+                let top_functions =
+                    match indentiagraph.get_top_entry_functions(project_id, 10).await {
+                        Ok(fns) => fns,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to get top entry functions for project {}: {}",
+                                project_id,
+                                e
+                            );
+                            return;
+                        }
+                    };
 
                 if top_functions.is_empty() {
                     tracing::info!(
@@ -877,7 +873,7 @@ impl Orchestrator {
                 );
 
                 for func_name in &top_functions {
-                    match neo4j
+                    match indentiagraph
                         .auto_build_feature_graph(
                             func_name, None, project_id, func_name, 2, None, None,
                         )
@@ -915,7 +911,7 @@ impl Orchestrator {
             );
 
             for fg in &auto_built {
-                match neo4j.refresh_feature_graph(fg.id).await {
+                match indentiagraph.refresh_feature_graph(fg.id).await {
                     Ok(Some(_)) => {
                         tracing::info!("Refreshed feature graph '{}' ({})", fg.name, fg.id);
                     }
@@ -945,26 +941,28 @@ impl Orchestrator {
     /// Collects top functions, module structure, and existing feature graphs
     /// to build a JSON context that the LLM can analyze.
     async fn gather_codebase_context(
-        neo4j: &dyn crate::neo4j::GraphStore,
+        indentiagraph: &dyn crate::indentiagraph::GraphStore,
         project_id: Uuid,
     ) -> Result<String> {
         // Top 30 functions by connectivity
-        let top_functions = neo4j.get_top_entry_functions(project_id, 30).await?;
+        let top_functions = indentiagraph
+            .get_top_entry_functions(project_id, 30)
+            .await?;
 
         // Module structure: most connected files
-        let connected_files = neo4j
+        let connected_files = indentiagraph
             .get_most_connected_files_for_project(project_id, 20)
             .await
             .unwrap_or_default();
 
         // Language stats
-        let lang_stats = neo4j
+        let lang_stats = indentiagraph
             .get_language_stats_for_project(project_id)
             .await
             .unwrap_or_default();
 
         // Existing feature graphs (to avoid duplicates)
-        let existing_fgs = neo4j
+        let existing_fgs = indentiagraph
             .list_feature_graphs(Some(project_id))
             .await
             .unwrap_or_default();
@@ -1062,11 +1060,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     ///
     /// Returns an empty Vec on any failure (best-effort).
     async fn propose_feature_graphs_with_llm(
-        neo4j: &dyn crate::neo4j::GraphStore,
+        indentiagraph: &dyn crate::indentiagraph::GraphStore,
         project_id: Uuid,
     ) -> Vec<FeatureGraphProposal> {
         // 1. Gather context
-        let context = match Self::gather_codebase_context(neo4j, project_id).await {
+        let context = match Self::gather_codebase_context(indentiagraph, project_id).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::warn!(
@@ -1182,16 +1180,6 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
     }
 
-    /// Get the search store
-    pub fn meili(&self) -> &dyn crate::meilisearch::SearchStore {
-        self.state.meili.as_ref()
-    }
-
-    /// Get the search store as Arc (for sharing with ChatManager etc.)
-    pub fn meili_arc(&self) -> Arc<dyn crate::meilisearch::SearchStore> {
-        self.state.meili.clone()
-    }
-
     /// Get the note manager
     pub fn note_manager(&self) -> &Arc<NoteManager> {
         &self.note_manager
@@ -1255,13 +1243,13 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // Get project to read last_co_change_computed_at
         let since = self
-            .neo4j()
+            .indentiagraph()
             .get_project(project_id)
             .await?
             .and_then(|p| p.last_co_change_computed_at);
 
         let count = self
-            .neo4j()
+            .indentiagraph()
             .compute_co_changed(project_id, since, 3, 500)
             .await?;
 
@@ -1304,7 +1292,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // Step 2: Create Commit nodes + TOUCHES relations in batches
         let mut commits_backfilled = 0u64;
         let mut touches_created = 0u64;
-        let neo4j = self.neo4j();
+        let indentiagraph = self.indentiagraph();
 
         for chunk in git_commits.chunks(100) {
             for gc in chunk {
@@ -1315,25 +1303,27 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                     author: gc.author.clone(),
                     timestamp: gc.timestamp,
                 };
-                neo4j.create_commit(&commit).await?;
+                indentiagraph.create_commit(&commit).await?;
 
                 // Create TOUCHES (MERGE = idempotent)
                 // git log returns relative paths (e.g. "src/lib.rs") but File nodes
-                // in Neo4j use absolute paths — prefix with root_path to match.
+                // in IndentiaGraph use absolute paths — prefix with root_path to match.
                 if !gc.files.is_empty() {
-                    let file_infos: Vec<crate::neo4j::models::FileChangedInfo> = gc
+                    let file_infos: Vec<crate::indentiagraph::models::FileChangedInfo> = gc
                         .files
                         .iter()
                         .map(|f| {
                             let abs_path = root_path.join(&f.path);
-                            crate::neo4j::models::FileChangedInfo {
+                            crate::indentiagraph::models::FileChangedInfo {
                                 path: abs_path.to_string_lossy().to_string(),
                                 additions: f.additions,
                                 deletions: f.deletions,
                             }
                         })
                         .collect();
-                    neo4j.create_commit_touches(&gc.hash, &file_infos).await?;
+                    indentiagraph
+                        .create_commit_touches(&gc.hash, &file_infos)
+                        .await?;
                     touches_created += gc.files.len() as u64;
                 }
                 commits_backfilled += 1;
@@ -1341,7 +1331,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         }
 
         // Step 3: Trigger full CO_CHANGED computation (since=None for full recompute)
-        if let Err(e) = neo4j.compute_co_changed(project_id, None, 3, 500).await {
+        if let Err(e) = indentiagraph
+            .compute_co_changed(project_id, None, 3, 500)
+            .await
+        {
             tracing::warn!(
                 project_id = %project_id,
                 error = %e,
@@ -1470,10 +1463,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         &self,
         dir_path: &Path,
         project_id: Option<Uuid>,
-        project_slug: Option<&str>,
+        _project_slug: Option<&str>,
         force: bool,
     ) -> Result<SyncResult> {
-        let project_slug = project_slug.map(|s| s.to_string());
         let mut result = SyncResult::default();
 
         // ── Phase 1: Scan ──────────────────────────────────────────
@@ -1489,7 +1481,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let mut to_parse = Vec::with_capacity(file_contents.len());
         for fc in file_contents {
             if !force {
-                if let Ok(Some(existing)) = self.state.neo4j.get_file(&fc.path).await {
+                if let Ok(Some(existing)) = self.state.indentiagraph.get_file(&fc.path).await {
                     if existing.hash == fc.hash {
                         result.files_skipped += 1;
                         continue;
@@ -1502,7 +1494,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // ── Phase 3: Parse (with AST cache) ─────────────────────────
         let mut cache_guard = self.ast_cache.lock().await;
         let parsed_files = parse_files_with_cache(to_parse, Some(&mut *cache_guard)).await;
-        drop(cache_guard); // Release lock before Neo4j calls
+        drop(cache_guard); // Release lock before IndentiaGraph calls
         let parse_count = parsed_files.len();
 
         // ── Build ImportResolutionContext once for all files ────────
@@ -1521,7 +1513,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         import_ctx.log_stats();
 
-        // ── Store: Batch Neo4j (~10 queries total) ─────────────────
+        // ── Store: Batch IndentiaGraph (~10 queries total) ─────────────────
         match self
             .store_parsed_files_batch(&parsed_files, project_id, &mut import_ctx)
             .await
@@ -1532,16 +1524,6 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             Err(e) => {
                 tracing::error!("Batch store failed: {}", e);
                 result.errors = parse_count;
-            }
-        }
-
-        // ── Index in MeiliSearch ───────────────────────────────────
-        if let (Some(pid), Some(slug)) = (project_id, project_slug.as_deref()) {
-            for parsed in &parsed_files {
-                let doc = CodeParser::to_code_document(parsed, &pid.to_string(), slug);
-                if let Err(e) = self.state.meili.index_code(&doc).await {
-                    tracing::warn!("Failed to index {} in Meilisearch: {}", parsed.path, e);
-                }
             }
         }
 
@@ -1568,28 +1550,14 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // ── Cleanup: remove stale files ────────────────────────────
         if let Some(pid) = project_id {
             let valid_paths: Vec<String> = synced_paths.into_iter().collect();
-            match self.neo4j().delete_stale_files(pid, &valid_paths).await {
-                Ok((files_deleted, symbols_deleted, stale_paths)) => {
+            match self
+                .indentiagraph()
+                .delete_stale_files(pid, &valid_paths)
+                .await
+            {
+                Ok((files_deleted, symbols_deleted, _stale_paths)) => {
                     result.files_deleted = files_deleted;
                     result.symbols_deleted = symbols_deleted;
-
-                    // Also clean up stale files from Meilisearch search index
-                    if !stale_paths.is_empty() {
-                        tracing::info!(
-                            "Cleaning {} stale file(s) from Meilisearch for project {}",
-                            stale_paths.len(),
-                            pid
-                        );
-                        for path in &stale_paths {
-                            if let Err(e) = self.meili().delete_code(path).await {
-                                tracing::warn!(
-                                    "Failed to delete stale file {} from Meilisearch: {}",
-                                    path,
-                                    e
-                                );
-                            }
-                        }
-                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed to clean up stale files: {}", e);
@@ -1621,17 +1589,17 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         &self,
         path: &Path,
         project_id: Option<Uuid>,
-        project_slug: Option<&str>,
+        _project_slug: Option<&str>,
         force: bool,
     ) -> Result<bool> {
         let content = tokio::fs::read_to_string(path)
             .await
             .context("Failed to read file")?;
 
-        // Normalize path to absolute form for consistent Neo4j storage
+        // Normalize path to absolute form for consistent IndentiaGraph storage
         let path_str = normalize_path(&path.to_string_lossy());
         if !force {
-            if let Some(existing) = self.state.neo4j.get_file(&path_str).await? {
+            if let Some(existing) = self.state.indentiagraph.get_file(&path_str).await? {
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(content.as_bytes());
@@ -1650,15 +1618,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             parser.parse_file(norm_path, &content)?
         };
 
-        // Store in Neo4j with project association
+        // Store in IndentiaGraph with project association
         self.store_parsed_file_for_project(&parsed, project_id)
             .await?;
-
-        // Index in Meilisearch only if project context is available
-        if let (Some(pid), Some(slug)) = (project_id, project_slug) {
-            let doc = CodeParser::to_code_document(&parsed, &pid.to_string(), slug);
-            self.state.meili.index_code(&doc).await?;
-        }
 
         // Verify notes attached to this file
         self.verify_notes_for_file(&path_str, &parsed, &content)
@@ -1680,7 +1642,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // Get all notes attached to this file
         let notes = self
             .state
-            .neo4j
+            .indentiagraph
             .get_notes_for_entity(&EntityType::File, file_path)
             .await?;
 
@@ -1704,7 +1666,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 if let Some(update) = result.suggested_update {
                     // Update note status
                     self.state
-                        .neo4j
+                        .indentiagraph
                         .update_note(
                             result.note_id,
                             None,
@@ -1712,15 +1674,6 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                             Some(update.new_status),
                             None,
                             None,
-                        )
-                        .await?;
-
-                    // Update Meilisearch index
-                    self.state
-                        .meili
-                        .update_note_status(
-                            &result.note_id.to_string(),
-                            &update.new_status.to_string(),
                         )
                         .await?;
 
@@ -1794,7 +1747,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                             ViolationAction::FlagNote | ViolationAction::Block => {
                                 // Update note status to needs_review
                                 self.state
-                                    .neo4j
+                                    .indentiagraph
                                     .update_note(
                                         result.note_id,
                                         None,
@@ -1803,11 +1756,6 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                                         None,
                                         None,
                                     )
-                                    .await?;
-
-                                self.state
-                                    .meili
-                                    .update_note_status(&result.note_id.to_string(), "needs_review")
                                     .await?;
 
                                 tracing::warn!(
@@ -1842,7 +1790,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             let func_id = format!("{}:{}:{}", file_path, func.name, func.line_start);
             let notes = self
                 .state
-                .neo4j
+                .indentiagraph
                 .get_notes_for_entity(&EntityType::Function, &func_id)
                 .await?;
 
@@ -1856,7 +1804,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 if !result.all_valid {
                     if let Some(update) = result.suggested_update {
                         self.state
-                            .neo4j
+                            .indentiagraph
                             .update_note(
                                 result.note_id,
                                 None,
@@ -1864,14 +1812,6 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                                 Some(update.new_status),
                                 None,
                                 None,
-                            )
-                            .await?;
-
-                        self.state
-                            .meili
-                            .update_note_status(
-                                &result.note_id.to_string(),
-                                &update.new_status.to_string(),
                             )
                             .await?;
 
@@ -1892,7 +1832,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             let struct_id = format!("{}:{}", file_path, s.name);
             let notes = self
                 .state
-                .neo4j
+                .indentiagraph
                 .get_notes_for_entity(&EntityType::Struct, &struct_id)
                 .await?;
 
@@ -1906,7 +1846,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 if !result.all_valid {
                     if let Some(update) = result.suggested_update {
                         self.state
-                            .neo4j
+                            .indentiagraph
                             .update_note(
                                 result.note_id,
                                 None,
@@ -1914,14 +1854,6 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                                 Some(update.new_status),
                                 None,
                                 None,
-                            )
-                            .await?;
-
-                        self.state
-                            .meili
-                            .update_note_status(
-                                &result.note_id.to_string(),
-                                &update.new_status.to_string(),
                             )
                             .await?;
 
@@ -1940,7 +1872,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         Ok(())
     }
 
-    /// Store a parsed file in Neo4j with project association
+    /// Store a parsed file in IndentiaGraph with project association
     async fn store_parsed_file_for_project(
         &self,
         parsed: &ParsedFile,
@@ -1950,7 +1882,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .await
     }
 
-    /// Store a parsed file in Neo4j with optional ImportResolutionContext.
+    /// Store a parsed file in IndentiaGraph with optional ImportResolutionContext.
     ///
     /// When ctx is provided, uses SuffixIndex for O(1) import resolution
     /// instead of filesystem lookups.
@@ -1968,22 +1900,28 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             last_parsed: chrono::Utc::now(),
             project_id,
         };
-        self.state.neo4j.upsert_file(&file_node).await?;
+        self.state.indentiagraph.upsert_file(&file_node).await?;
 
-        // Batch upsert all entity types (UNWIND — one Neo4j query each)
+        // Batch upsert all entity types (UNWIND — one IndentiaGraph query each)
         self.state
-            .neo4j
+            .indentiagraph
             .batch_upsert_functions(&parsed.functions)
             .await?;
         self.state
-            .neo4j
+            .indentiagraph
             .batch_upsert_structs(&parsed.structs)
             .await?;
-        self.state.neo4j.batch_upsert_traits(&parsed.traits).await?;
-        self.state.neo4j.batch_upsert_enums(&parsed.enums).await?;
+        self.state
+            .indentiagraph
+            .batch_upsert_traits(&parsed.traits)
+            .await?;
+        self.state
+            .indentiagraph
+            .batch_upsert_enums(&parsed.enums)
+            .await?;
         // Impls AFTER structs/traits/enums (IMPLEMENTS_FOR/IMPLEMENTS_TRAIT need targets)
         self.state
-            .neo4j
+            .indentiagraph
             .batch_upsert_impls(&parsed.impl_blocks)
             .await?;
 
@@ -1997,7 +1935,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         //    (same for IMPLEMENTS, STEP_IN_PROCESS)
         //
         // 2. UPSERT new relations via batch helper:
-        //    use crate::neo4j::batch::{run_unwind_in_chunks, BoltMap};
+        //    use crate::indentiagraph::batch::{run_unwind_in_chunks, BoltMap};
         //    let items: Vec<BoltMap> = build_extends_items(&parsed.heritage);
         //    run_unwind_in_chunks(&graph, items, "UNWIND $items AS ...").await?;
         //
@@ -2013,7 +1951,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // Batch upsert imports, then resolve relationships (logic stays in runner)
         self.state
-            .neo4j
+            .indentiagraph
             .batch_upsert_imports(&parsed.imports)
             .await?;
 
@@ -2047,11 +1985,11 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             }
         }
         self.state
-            .neo4j
+            .indentiagraph
             .batch_create_import_relationships(&import_rels)
             .await?;
         self.state
-            .neo4j
+            .indentiagraph
             .batch_create_imports_symbol_relationships(&symbol_rels)
             .await?;
 
@@ -2065,7 +2003,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // Batch create CALLS relationships (scoped to project to prevent cross-project pollution)
         self.state
-            .neo4j
+            .indentiagraph
             .batch_create_call_relationships(&scored_calls, project_id)
             .await?;
 
@@ -2097,13 +2035,13 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         if !extends_rels.is_empty() {
             self.state
-                .neo4j
+                .indentiagraph
                 .batch_create_extends_relationships(&extends_rels)
                 .await?;
         }
         if !implements_rels.is_empty() {
             self.state
-                .neo4j
+                .indentiagraph
                 .batch_create_implements_relationships(&implements_rels)
                 .await?;
         }
@@ -2111,12 +2049,13 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         // Embed file and functions (best-effort, non-blocking)
         if self.embedding_provider.is_some() {
             let provider = self.embedding_provider.clone().unwrap();
-            let neo4j = self.state.neo4j.clone();
+            let indentiagraph = self.state.indentiagraph.clone();
             let parsed_clone = parsed.clone();
             let file_path = normalize_path(&parsed.path);
             tokio::spawn(async move {
                 if let Err(e) =
-                    Self::embed_parsed_file(&provider, &neo4j, &parsed_clone, &file_path).await
+                    Self::embed_parsed_file(&provider, &indentiagraph, &parsed_clone, &file_path)
+                        .await
                 {
                     tracing::warn!(file = %file_path, error = %e, "Failed to embed file (best-effort)");
                 }
@@ -2126,10 +2065,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         Ok(())
     }
 
-    /// Store multiple parsed files in Neo4j using batch operations.
+    /// Store multiple parsed files in IndentiaGraph using batch operations.
     ///
     /// Instead of calling `store_parsed_file_for_project_with_ctx` per file
-    /// (which issues ~10 Neo4j queries each), this method accumulates all
+    /// (which issues ~10 IndentiaGraph queries each), this method accumulates all
     /// entities across files and issues ~10 batch queries total:
     ///
     /// 1. batch_upsert_files
@@ -2143,7 +2082,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     /// 9. batch_create_imports_symbol_relationships
     /// 10. batch_create_call_relationships (per-file scoring, batched write)
     ///
-    /// This reduces Neo4j round-trips from O(files × 10) to O(10).
+    /// This reduces IndentiaGraph round-trips from O(files × 10) to O(10).
     async fn store_parsed_files_batch(
         &self,
         parsed_files: &[ParsedFile],
@@ -2167,7 +2106,10 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                 project_id,
             })
             .collect();
-        self.state.neo4j.batch_upsert_files(&file_nodes).await?;
+        self.state
+            .indentiagraph
+            .batch_upsert_files(&file_nodes)
+            .await?;
 
         // ── 2. Accumulate all symbols ─────────────────────────────────
         let all_functions: Vec<_> = parsed_files
@@ -2196,14 +2138,29 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
             .collect();
 
         self.state
-            .neo4j
+            .indentiagraph
             .batch_upsert_functions(&all_functions)
             .await?;
-        self.state.neo4j.batch_upsert_structs(&all_structs).await?;
-        self.state.neo4j.batch_upsert_traits(&all_traits).await?;
-        self.state.neo4j.batch_upsert_enums(&all_enums).await?;
-        self.state.neo4j.batch_upsert_impls(&all_impls).await?;
-        self.state.neo4j.batch_upsert_imports(&all_imports).await?;
+        self.state
+            .indentiagraph
+            .batch_upsert_structs(&all_structs)
+            .await?;
+        self.state
+            .indentiagraph
+            .batch_upsert_traits(&all_traits)
+            .await?;
+        self.state
+            .indentiagraph
+            .batch_upsert_enums(&all_enums)
+            .await?;
+        self.state
+            .indentiagraph
+            .batch_upsert_impls(&all_impls)
+            .await?;
+        self.state
+            .indentiagraph
+            .batch_upsert_imports(&all_imports)
+            .await?;
 
         // ── 3. Resolve imports per-file, accumulate relationships ─────
         let mut all_import_rels: Vec<(String, String, String)> = Vec::new();
@@ -2273,28 +2230,28 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
         // ── 4. Batch write all relationships ──────────────────────────
         self.state
-            .neo4j
+            .indentiagraph
             .batch_create_import_relationships(&all_import_rels)
             .await?;
         self.state
-            .neo4j
+            .indentiagraph
             .batch_create_imports_symbol_relationships(&all_symbol_rels)
             .await?;
         self.state
-            .neo4j
+            .indentiagraph
             .batch_create_call_relationships(&all_scored_calls, project_id)
             .await?;
 
         // Heritage relationships (EXTENDS / IMPLEMENTS)
         if !all_extends_rels.is_empty() {
             self.state
-                .neo4j
+                .indentiagraph
                 .batch_create_extends_relationships(&all_extends_rels)
                 .await?;
         }
         if !all_implements_rels.is_empty() {
             self.state
-                .neo4j
+                .indentiagraph
                 .batch_create_implements_relationships(&all_implements_rels)
                 .await?;
         }
@@ -2303,12 +2260,17 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         if self.embedding_provider.is_some() {
             for parsed in parsed_files {
                 let provider = self.embedding_provider.clone().unwrap();
-                let neo4j = self.state.neo4j.clone();
+                let indentiagraph = self.state.indentiagraph.clone();
                 let parsed_clone = parsed.clone();
                 let file_path = normalize_path(&parsed.path);
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        Self::embed_parsed_file(&provider, &neo4j, &parsed_clone, &file_path).await
+                    if let Err(e) = Self::embed_parsed_file(
+                        &provider,
+                        &indentiagraph,
+                        &parsed_clone,
+                        &file_path,
+                    )
+                    .await
                     {
                         tracing::warn!(
                             file = %file_path,
@@ -2323,7 +2285,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let elapsed = store_start.elapsed();
         tracing::info!(
             "store_parsed_files_batch: stored {} files ({} functions, {} imports, {} calls) \
-             in ~10 Neo4j queries, {:?}",
+             in ~10 IndentiaGraph queries, {:?}",
             parsed_files.len(),
             all_functions.len(),
             all_imports.len(),
@@ -2366,7 +2328,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     /// Build a summary text for embedding a function.
     ///
     /// Format: "name(param1: Type, param2: Type) -> ReturnType — docstring"
-    fn build_function_embedding_text(func: &crate::neo4j::models::FunctionNode) -> String {
+    fn build_function_embedding_text(func: &crate::indentiagraph::models::FunctionNode) -> String {
         let params = func
             .params
             .iter()
@@ -2395,13 +2357,13 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         format!("{}({}){}{}", func.name, params, ret, doc)
     }
 
-    /// Embed a parsed file and its public functions into Neo4j.
+    /// Embed a parsed file and its public functions into IndentiaGraph.
     ///
     /// Best-effort: logs warnings on failure but never returns errors that block sync.
     /// Uses embed_batch for efficiency (one API call for file + all functions).
     async fn embed_parsed_file(
         provider: &Arc<dyn EmbeddingProvider>,
-        neo4j: &Arc<dyn crate::neo4j::GraphStore>,
+        indentiagraph: &Arc<dyn crate::indentiagraph::GraphStore>,
         parsed: &ParsedFile,
         file_path: &str,
     ) -> Result<()> {
@@ -2409,12 +2371,15 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let file_text = Self::build_file_embedding_text(parsed);
 
         // Collect functions that are worth embedding (public or have docstrings)
-        let embeddable_functions: Vec<&crate::neo4j::models::FunctionNode> = parsed
+        let embeddable_functions: Vec<&crate::indentiagraph::models::FunctionNode> = parsed
             .functions
             .iter()
             .filter(|f| {
                 f.docstring.is_some()
-                    || matches!(f.visibility, crate::neo4j::models::Visibility::Public)
+                    || matches!(
+                        f.visibility,
+                        crate::indentiagraph::models::Visibility::Public
+                    )
             })
             .collect();
 
@@ -2437,14 +2402,14 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         let model = provider.model_name().to_string();
 
         // Store file embedding (first result)
-        neo4j
+        indentiagraph
             .set_file_embedding(file_path, &embeddings[0], &model)
             .await?;
 
         // Store function embeddings (remaining results)
         for (i, func) in embeddable_functions.iter().enumerate() {
             if let Some(emb) = embeddings.get(i + 1) {
-                if let Err(e) = neo4j
+                if let Err(e) = indentiagraph
                     .set_function_embedding(&func.name, file_path, emb, &model)
                     .await
                 {
@@ -2538,7 +2503,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     ///
     /// Examples:
     /// - `crate::{errors::{Result}, transport::Transport}` → `["crate::errors", "crate::transport"]`
-    /// - `crate::neo4j::client` → `["crate::neo4j::client"]` (unchanged)
+    /// - `crate::indentiagraph::client` → `["crate::indentiagraph::client"]` (unchanged)
     fn flatten_grouped_import(import_path: &str) -> Vec<String> {
         let trimmed = import_path.trim();
 
@@ -2607,7 +2572,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     /// Returns multiple paths for grouped imports like `crate::{errors, transport}`.
     ///
     /// Examples:
-    /// - `crate::neo4j::client` → `["src/neo4j/client.rs"]`
+    /// - `crate::indentiagraph::client` → `["src/indentiagraph/client.rs"]`
     /// - `crate::{errors::{Result}, transport::Transport}` → `["src/errors.rs", "src/transport.rs"]`
     /// - External crates (std::, serde::) → `[]`
     fn resolve_rust_imports(&self, import_path: &str, source_file: &str) -> Vec<String> {
@@ -3057,7 +3022,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                     return None;
                 }
                 // Try full path first (import might target a file directly)
-                // e.g., crate::neo4j::client → neo4j/client.rs
+                // e.g., crate::indentiagraph::client → indentiagraph/client.rs
                 let full_path = path[1..].join("/");
                 let rs_suffix = format!("{}.rs", full_path);
                 if let Some(resolved) = index.get(&rs_suffix) {
@@ -3068,7 +3033,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
                     return Some(resolved.to_string());
                 }
                 // Fallback: strip last segment (it's likely a type/function name)
-                // e.g., crate::neo4j::client::Client → neo4j/client.rs
+                // e.g., crate::indentiagraph::client::Client → indentiagraph/client.rs
                 let module_path = &path[1..path.len().saturating_sub(1)];
                 if !module_path.is_empty() {
                     let suffix = module_path.join("/");
@@ -4209,7 +4174,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Create a project and emit event
     pub async fn create_project(&self, project: &ProjectNode) -> Result<()> {
-        self.neo4j().create_project(project).await?;
+        self.indentiagraph().create_project(project).await?;
         self.emit(
             CrudEvent::new(
                 EventEntityType::Project,
@@ -4229,7 +4194,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         description: Option<Option<String>>,
         root_path: Option<String>,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .update_project(id, name.clone(), description, root_path.clone())
             .await?;
         let mut payload = serde_json::Map::new();
@@ -4254,28 +4219,21 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
     ///
     /// Cleanup order:
     /// 1. Lookup project (get name + slug before deletion)
-    /// 2. MeiliSearch: delete code documents (best-effort)
-    /// 3. Neo4j: archive notes/decisions, cascade delete structural entities
+    /// 2. Search index cleanup (best-effort)
+    /// 3. IndentiaGraph: archive notes/decisions, cascade delete structural entities
     /// 4. Emit CrudEvent with slug in payload
     pub async fn delete_project(&self, id: Uuid) -> Result<()> {
         // Lookup project before deleting — we need the name and slug
         let project = self
-            .neo4j()
+            .indentiagraph()
             .get_project(id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Project {} not found", id))?;
 
-        // MeiliSearch cleanup — best-effort, don't block deletion on failure
-        if let Err(e) = self.meili().delete_code_for_project(&project.slug).await {
-            tracing::warn!(
-                "Failed to delete MeiliSearch code documents for project '{}': {}",
-                project.slug,
-                e
-            );
-        }
-
-        // Neo4j cascade delete (archives notes/decisions, deletes everything else)
-        self.neo4j().delete_project(id, &project.name).await?;
+        // IndentiaGraph cascade delete (archives notes/decisions, deletes everything else)
+        self.indentiagraph()
+            .delete_project(id, &project.name)
+            .await?;
 
         // Emit event with slug in payload for subscribers (watcher bridge, etc.)
         let mut payload = serde_json::Map::new();
@@ -4295,7 +4253,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Link a plan to a project and emit event
     pub async fn link_plan_to_project(&self, plan_id: Uuid, project_id: Uuid) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .link_plan_to_project(plan_id, project_id)
             .await?;
         self.emit(
@@ -4311,7 +4269,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Unlink a plan from its project and emit event
     pub async fn unlink_plan_from_project(&self, plan_id: Uuid) -> Result<()> {
-        self.neo4j().unlink_plan_from_project(plan_id).await?;
+        self.indentiagraph()
+            .unlink_plan_from_project(plan_id)
+            .await?;
         self.emit(CrudEvent::new(
             EventEntityType::Plan,
             CrudAction::Unlinked,
@@ -4324,7 +4284,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Add a task dependency and emit event
     pub async fn add_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .add_task_dependency(task_id, depends_on_id)
             .await?;
         self.emit(
@@ -4340,7 +4300,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Remove a task dependency and emit event
     pub async fn remove_task_dependency(&self, task_id: Uuid, depends_on_id: Uuid) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .remove_task_dependency(task_id, depends_on_id)
             .await?;
         self.emit(
@@ -4358,7 +4318,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Delete a step and emit event
     pub async fn delete_step(&self, step_id: Uuid) -> Result<()> {
-        self.neo4j().delete_step(step_id).await?;
+        self.indentiagraph().delete_step(step_id).await?;
         self.emit(CrudEvent::new(
             EventEntityType::Step,
             CrudAction::Deleted,
@@ -4376,7 +4336,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         chosen_option: Option<String>,
         status: Option<DecisionStatus>,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .update_decision(decision_id, description, rationale, chosen_option, status)
             .await?;
         self.emit(CrudEvent::new(
@@ -4389,7 +4349,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Delete a decision and emit event
     pub async fn delete_decision(&self, decision_id: Uuid) -> Result<()> {
-        self.neo4j().delete_decision(decision_id).await?;
+        self.indentiagraph().delete_decision(decision_id).await?;
         self.emit(CrudEvent::new(
             EventEntityType::Decision,
             CrudAction::Deleted,
@@ -4406,7 +4366,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         constraint_type: Option<ConstraintType>,
         enforced_by: Option<String>,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .update_constraint(constraint_id, description, constraint_type, enforced_by)
             .await?;
         self.emit(CrudEvent::new(
@@ -4419,7 +4379,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Delete a constraint and emit event
     pub async fn delete_constraint(&self, constraint_id: Uuid) -> Result<()> {
-        self.neo4j().delete_constraint(constraint_id).await?;
+        self.indentiagraph()
+            .delete_constraint(constraint_id)
+            .await?;
         self.emit(CrudEvent::new(
             EventEntityType::Constraint,
             CrudAction::Deleted,
@@ -4432,7 +4394,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Create a commit and emit event
     pub async fn create_commit(&self, commit: &CommitNode) -> Result<()> {
-        self.neo4j().create_commit(commit).await?;
+        self.indentiagraph().create_commit(commit).await?;
         self.emit(
             CrudEvent::new(EventEntityType::Commit, CrudAction::Created, &commit.hash)
                 .with_payload(serde_json::json!({"message": &commit.message})),
@@ -4442,7 +4404,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Link a commit to a task and emit event
     pub async fn link_commit_to_task(&self, commit_hash: &str, task_id: Uuid) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .link_commit_to_task(commit_hash, task_id)
             .await?;
         self.emit(
@@ -4454,7 +4416,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Link a commit to a plan and emit event
     pub async fn link_commit_to_plan(&self, commit_hash: &str, plan_id: Uuid) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .link_commit_to_plan(commit_hash, plan_id)
             .await?;
         self.emit(
@@ -4468,7 +4430,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Create a release and emit event
     pub async fn create_release(&self, release: &ReleaseNode) -> Result<()> {
-        self.neo4j().create_release(release).await?;
+        self.indentiagraph().create_release(release).await?;
         self.emit(
             CrudEvent::new(
                 EventEntityType::Release,
@@ -4491,7 +4453,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         title: Option<String>,
         description: Option<String>,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .update_release(id, status, target_date, released_at, title, description)
             .await?;
         self.emit(CrudEvent::new(
@@ -4504,7 +4466,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Delete a release and emit event
     pub async fn delete_release(&self, release_id: Uuid) -> Result<()> {
-        self.neo4j().delete_release(release_id).await?;
+        self.indentiagraph().delete_release(release_id).await?;
         self.emit(CrudEvent::new(
             EventEntityType::Release,
             CrudAction::Deleted,
@@ -4515,7 +4477,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Add a task to a release and emit event
     pub async fn add_task_to_release(&self, release_id: Uuid, task_id: Uuid) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .add_task_to_release(release_id, task_id)
             .await?;
         self.emit(
@@ -4531,7 +4493,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Add a commit to a release and emit event
     pub async fn add_commit_to_release(&self, release_id: Uuid, commit_hash: &str) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .add_commit_to_release(release_id, commit_hash)
             .await?;
         self.emit(
@@ -4551,7 +4513,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         release_id: Uuid,
         commit_hash: &str,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .remove_commit_from_release(release_id, commit_hash)
             .await?;
         self.emit(
@@ -4569,7 +4531,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Create a milestone and emit event
     pub async fn create_milestone(&self, milestone: &MilestoneNode) -> Result<()> {
-        self.neo4j().create_milestone(milestone).await?;
+        self.indentiagraph().create_milestone(milestone).await?;
         self.emit(
             CrudEvent::new(
                 EventEntityType::Milestone,
@@ -4592,7 +4554,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         title: Option<String>,
         description: Option<String>,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .update_milestone(id, status, target_date, closed_at, title, description)
             .await?;
         self.emit(CrudEvent::new(
@@ -4605,7 +4567,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Delete a milestone and emit event
     pub async fn delete_milestone(&self, milestone_id: Uuid) -> Result<()> {
-        self.neo4j().delete_milestone(milestone_id).await?;
+        self.indentiagraph().delete_milestone(milestone_id).await?;
         self.emit(CrudEvent::new(
             EventEntityType::Milestone,
             CrudAction::Deleted,
@@ -4616,7 +4578,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Add a task to a milestone and emit event
     pub async fn add_task_to_milestone(&self, milestone_id: Uuid, task_id: Uuid) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .add_task_to_milestone(milestone_id, task_id)
             .await?;
         self.emit(
@@ -4632,7 +4594,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Link a plan to a project milestone and emit event
     pub async fn link_plan_to_milestone(&self, plan_id: Uuid, milestone_id: Uuid) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .link_plan_to_milestone(plan_id, milestone_id)
             .await?;
         self.emit(
@@ -4652,7 +4614,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         plan_id: Uuid,
         milestone_id: Uuid,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .unlink_plan_from_milestone(plan_id, milestone_id)
             .await?;
         self.emit(
@@ -4670,7 +4632,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Create a workspace and emit event
     pub async fn create_workspace(&self, workspace: &WorkspaceNode) -> Result<()> {
-        self.neo4j().create_workspace(workspace).await?;
+        self.indentiagraph().create_workspace(workspace).await?;
         self.emit(
             CrudEvent::new(
                 EventEntityType::Workspace,
@@ -4690,7 +4652,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         description: Option<String>,
         metadata: Option<serde_json::Value>,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .update_workspace(id, name, description, metadata)
             .await?;
         self.emit(CrudEvent::new(
@@ -4703,7 +4665,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Delete a workspace and emit event
     pub async fn delete_workspace(&self, id: Uuid) -> Result<()> {
-        self.neo4j().delete_workspace(id).await?;
+        self.indentiagraph().delete_workspace(id).await?;
         self.emit(CrudEvent::new(
             EventEntityType::Workspace,
             CrudAction::Deleted,
@@ -4718,7 +4680,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         workspace_id: Uuid,
         project_id: Uuid,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .add_project_to_workspace(workspace_id, project_id)
             .await?;
         self.emit(
@@ -4738,7 +4700,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         workspace_id: Uuid,
         project_id: Uuid,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .remove_project_from_workspace(workspace_id, project_id)
             .await?;
         self.emit(
@@ -4759,7 +4721,9 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         &self,
         milestone: &WorkspaceMilestoneNode,
     ) -> Result<()> {
-        self.neo4j().create_workspace_milestone(milestone).await?;
+        self.indentiagraph()
+            .create_workspace_milestone(milestone)
+            .await?;
         self.emit(
             CrudEvent::new(
                 EventEntityType::WorkspaceMilestone,
@@ -4780,7 +4744,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         status: Option<MilestoneStatus>,
         target_date: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .update_workspace_milestone(id, title, description, status, target_date)
             .await?;
         self.emit(CrudEvent::new(
@@ -4793,7 +4757,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Delete a workspace milestone and emit event
     pub async fn delete_workspace_milestone(&self, id: Uuid) -> Result<()> {
-        self.neo4j().delete_workspace_milestone(id).await?;
+        self.indentiagraph().delete_workspace_milestone(id).await?;
         self.emit(CrudEvent::new(
             EventEntityType::WorkspaceMilestone,
             CrudAction::Deleted,
@@ -4808,7 +4772,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         milestone_id: Uuid,
         task_id: Uuid,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .add_task_to_workspace_milestone(milestone_id, task_id)
             .await?;
         self.emit(
@@ -4828,7 +4792,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         plan_id: Uuid,
         milestone_id: Uuid,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .link_plan_to_workspace_milestone(plan_id, milestone_id)
             .await?;
         self.emit(
@@ -4848,7 +4812,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         plan_id: Uuid,
         milestone_id: Uuid,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .unlink_plan_from_workspace_milestone(plan_id, milestone_id)
             .await?;
         self.emit(
@@ -4866,7 +4830,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Create a resource and emit event
     pub async fn create_resource(&self, resource: &ResourceNode) -> Result<()> {
-        self.neo4j().create_resource(resource).await?;
+        self.indentiagraph().create_resource(resource).await?;
         self.emit(
             CrudEvent::new(
                 EventEntityType::Resource,
@@ -4888,7 +4852,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         version: Option<String>,
         description: Option<String>,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .update_resource(id, name, file_path, url, version, description)
             .await?;
         self.emit(CrudEvent::new(
@@ -4901,7 +4865,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Delete a resource and emit event
     pub async fn delete_resource(&self, id: Uuid) -> Result<()> {
-        self.neo4j().delete_resource(id).await?;
+        self.indentiagraph().delete_resource(id).await?;
         self.emit(CrudEvent::new(
             EventEntityType::Resource,
             CrudAction::Deleted,
@@ -4916,7 +4880,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         project_id: Uuid,
         resource_id: Uuid,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .link_project_implements_resource(project_id, resource_id)
             .await?;
         self.emit(
@@ -4932,7 +4896,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         project_id: Uuid,
         resource_id: Uuid,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .link_project_uses_resource(project_id, resource_id)
             .await?;
         self.emit(
@@ -4952,7 +4916,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Create a component and emit event
     pub async fn create_component(&self, component: &ComponentNode) -> Result<()> {
-        self.neo4j().create_component(component).await?;
+        self.indentiagraph().create_component(component).await?;
         self.emit(
             CrudEvent::new(
                 EventEntityType::Component,
@@ -4974,7 +4938,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         config: Option<serde_json::Value>,
         tags: Option<Vec<String>>,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .update_component(id, name, description, runtime, config, tags)
             .await?;
         self.emit(CrudEvent::new(
@@ -4987,7 +4951,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
 
     /// Delete a component and emit event
     pub async fn delete_component(&self, id: Uuid) -> Result<()> {
-        self.neo4j().delete_component(id).await?;
+        self.indentiagraph().delete_component(id).await?;
         self.emit(CrudEvent::new(
             EventEntityType::Component,
             CrudAction::Deleted,
@@ -5004,7 +4968,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         protocol: Option<String>,
         required: bool,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .add_component_dependency(component_id, depends_on_id, protocol, required)
             .await?;
         self.emit(
@@ -5024,7 +4988,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         component_id: Uuid,
         depends_on_id: Uuid,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .remove_component_dependency(component_id, depends_on_id)
             .await?;
         self.emit(
@@ -5044,7 +5008,7 @@ Respond with ONLY a JSON array, no markdown fences, no explanation:
         component_id: Uuid,
         project_id: Uuid,
     ) -> Result<()> {
-        self.neo4j()
+        self.indentiagraph()
             .map_component_to_project(component_id, project_id)
             .await?;
         self.emit(
@@ -5522,7 +5486,7 @@ mod tests {
         let (orch, _rx) = orch_with_bus().await;
         let _ = orch.plan_manager();
         let _ = orch.context_builder();
-        let _ = orch.neo4j();
+        let _ = orch.indentiagraph();
         let _ = orch.note_manager();
         let _ = orch.note_lifecycle();
     }
@@ -5544,7 +5508,7 @@ mod tests {
     async fn test_update_project_emits_event() {
         let (orch, mut rx) = orch_with_bus().await;
         let project = test_project();
-        orch.neo4j().create_project(&project).await.unwrap();
+        orch.indentiagraph().create_project(&project).await.unwrap();
         orch.update_project(project.id, Some("new-name".into()), None, None)
             .await
             .unwrap();
@@ -5556,7 +5520,7 @@ mod tests {
     async fn test_delete_project_emits_event() {
         let (orch, mut rx) = orch_with_bus().await;
         let project = test_project();
-        orch.neo4j().create_project(&project).await.unwrap();
+        orch.indentiagraph().create_project(&project).await.unwrap();
         orch.delete_project(project.id).await.unwrap();
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.action, CrudAction::Deleted);
@@ -5566,7 +5530,7 @@ mod tests {
     async fn test_delete_project_emits_slug_in_payload() {
         let (orch, mut rx) = orch_with_bus().await;
         let project = test_project();
-        orch.neo4j().create_project(&project).await.unwrap();
+        orch.indentiagraph().create_project(&project).await.unwrap();
         orch.delete_project(project.id).await.unwrap();
         let ev = rx.try_recv().unwrap();
         assert_eq!(ev.action, CrudAction::Deleted);
@@ -5580,60 +5544,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_delete_project_cleans_meilisearch() {
-        use crate::meilisearch::indexes::CodeDocument;
-
+    async fn test_delete_project_cleans_up() {
         let orch = Orchestrator::new(mock_app_state()).await.unwrap();
 
-        // Seed a project + code documents
+        // Seed a project
         let project = test_project();
-        orch.neo4j().create_project(&project).await.unwrap();
-
-        // Add some code documents to MeiliSearch for this project
-        orch.meili()
-            .index_code(&CodeDocument {
-                id: "file1".to_string(),
-                path: "/tmp/test/main.rs".to_string(),
-                language: "rust".to_string(),
-                symbols: vec!["main".to_string()],
-                docstrings: String::new(),
-                signatures: vec!["fn main()".to_string()],
-                imports: vec![],
-                project_id: project.id.to_string(),
-                project_slug: project.slug.clone(),
-            })
-            .await
-            .unwrap();
-
-        let stats = orch.meili().get_code_stats().await.unwrap();
-        assert_eq!(stats.total_documents, 1);
+        orch.indentiagraph().create_project(&project).await.unwrap();
 
         // Delete project
         orch.delete_project(project.id).await.unwrap();
 
-        // Verify MeiliSearch was cleaned up
-        let stats = orch.meili().get_code_stats().await.unwrap();
-        assert_eq!(
-            stats.total_documents, 0,
-            "MeiliSearch code documents should be deleted on project removal"
+        // Verify project was removed from IndentiaGraph
+        let found = orch.indentiagraph().get_project(project.id).await.unwrap();
+        assert!(
+            found.is_none(),
+            "Project should be deleted from IndentiaGraph"
         );
     }
 
     #[tokio::test]
-    async fn test_delete_project_removes_project_from_neo4j() {
+    async fn test_delete_project_removes_project_from_indentiagraph() {
         let (orch, _rx) = orch_with_bus().await;
         let project = test_project();
-        orch.neo4j().create_project(&project).await.unwrap();
+        orch.indentiagraph().create_project(&project).await.unwrap();
 
         // Verify project exists
-        let found = orch.neo4j().get_project(project.id).await.unwrap();
+        let found = orch.indentiagraph().get_project(project.id).await.unwrap();
         assert!(found.is_some());
 
         orch.delete_project(project.id).await.unwrap();
 
         // Verify project is gone
-        let found = orch.neo4j().get_project(project.id).await.unwrap();
-        assert!(found.is_none(), "Project should be deleted from Neo4j");
+        let found = orch.indentiagraph().get_project(project.id).await.unwrap();
+        assert!(
+            found.is_none(),
+            "Project should be deleted from IndentiaGraph"
+        );
     }
 
     #[tokio::test]
@@ -5650,31 +5596,37 @@ mod tests {
     async fn test_delete_project_cascades_plans_tasks_steps() {
         let (orch, _rx) = orch_with_bus().await;
         let project = test_project();
-        orch.neo4j().create_project(&project).await.unwrap();
+        orch.indentiagraph().create_project(&project).await.unwrap();
 
         // Create plan → task → step
         let plan = test_plan_for_project(project.id);
-        orch.neo4j().create_plan(&plan).await.unwrap();
-        orch.neo4j()
+        orch.indentiagraph().create_plan(&plan).await.unwrap();
+        orch.indentiagraph()
             .link_plan_to_project(plan.id, project.id)
             .await
             .unwrap();
 
         let task = test_task();
-        orch.neo4j().create_task(plan.id, &task).await.unwrap();
+        orch.indentiagraph()
+            .create_task(plan.id, &task)
+            .await
+            .unwrap();
 
         let step = test_step(0, "Do something");
-        orch.neo4j().create_step(task.id, &step).await.unwrap();
+        orch.indentiagraph()
+            .create_step(task.id, &step)
+            .await
+            .unwrap();
 
         // Verify they exist
-        let steps = orch.neo4j().get_task_steps(task.id).await.unwrap();
+        let steps = orch.indentiagraph().get_task_steps(task.id).await.unwrap();
         assert_eq!(steps.len(), 1);
 
         // Delete project
         orch.delete_project(project.id).await.unwrap();
 
         // Verify cascade — steps should be gone
-        let steps = orch.neo4j().get_task_steps(task.id).await.unwrap();
+        let steps = orch.indentiagraph().get_task_steps(task.id).await.unwrap();
         assert_eq!(steps.len(), 0, "Steps should be cascade-deleted");
     }
 
@@ -5682,23 +5634,26 @@ mod tests {
     async fn test_delete_project_cascades_milestones_releases() {
         let (orch, _rx) = orch_with_bus().await;
         let project = test_project();
-        orch.neo4j().create_project(&project).await.unwrap();
+        orch.indentiagraph().create_project(&project).await.unwrap();
 
         let milestone = test_milestone(project.id, "v1.0 Milestone");
-        orch.neo4j().create_milestone(&milestone).await.unwrap();
+        orch.indentiagraph()
+            .create_milestone(&milestone)
+            .await
+            .unwrap();
 
         let release = test_release(project.id, "1.0.0");
-        orch.neo4j().create_release(&release).await.unwrap();
+        orch.indentiagraph().create_release(&release).await.unwrap();
 
         // Verify they exist
         let milestones = orch
-            .neo4j()
+            .indentiagraph()
             .list_project_milestones(project.id)
             .await
             .unwrap();
         assert_eq!(milestones.len(), 1);
         let releases = orch
-            .neo4j()
+            .indentiagraph()
             .list_project_releases(project.id)
             .await
             .unwrap();
@@ -5709,13 +5664,13 @@ mod tests {
 
         // Verify cascade
         let milestones = orch
-            .neo4j()
+            .indentiagraph()
             .list_project_milestones(project.id)
             .await
             .unwrap();
         assert_eq!(milestones.len(), 0, "Milestones should be cascade-deleted");
         let releases = orch
-            .neo4j()
+            .indentiagraph()
             .list_project_releases(project.id)
             .await
             .unwrap();
@@ -5981,7 +5936,7 @@ mod tests {
     async fn test_update_workspace_emits_event() {
         let (orch, mut rx) = orch_with_bus().await;
         let ws = test_workspace();
-        orch.neo4j().create_workspace(&ws).await.unwrap();
+        orch.indentiagraph().create_workspace(&ws).await.unwrap();
         orch.update_workspace(ws.id, Some("new".into()), None, None)
             .await
             .unwrap();
@@ -6413,7 +6368,7 @@ mod tests {
     // gather_codebase_context Tests
     // ========================================================================
 
-    use crate::neo4j::models::{FileNode, FunctionNode, Visibility};
+    use crate::indentiagraph::models::{FileNode, FunctionNode, Visibility};
     use chrono::Utc;
 
     fn test_file(path: &str, project_id: Uuid) -> FileNode {
@@ -6446,20 +6401,20 @@ mod tests {
     #[tokio::test]
     async fn test_gather_codebase_context_returns_valid_json() {
         let state = mock_app_state();
-        let neo4j = state.neo4j.as_ref();
+        let indentiagraph = state.indentiagraph.as_ref();
         let project = test_project();
-        neo4j.create_project(&project).await.unwrap();
+        indentiagraph.create_project(&project).await.unwrap();
 
-        neo4j
+        indentiagraph
             .upsert_file(&test_file("src/main.rs", project.id))
             .await
             .unwrap();
-        neo4j
+        indentiagraph
             .upsert_function(&test_function("main", "src/main.rs"))
             .await
             .unwrap();
 
-        let context = Orchestrator::gather_codebase_context(neo4j, project.id)
+        let context = Orchestrator::gather_codebase_context(indentiagraph, project.id)
             .await
             .unwrap();
 
@@ -6474,11 +6429,11 @@ mod tests {
     #[tokio::test]
     async fn test_gather_codebase_context_empty_project() {
         let state = mock_app_state();
-        let neo4j = state.neo4j.as_ref();
+        let indentiagraph = state.indentiagraph.as_ref();
         let project = test_project();
-        neo4j.create_project(&project).await.unwrap();
+        indentiagraph.create_project(&project).await.unwrap();
 
-        let context = Orchestrator::gather_codebase_context(neo4j, project.id)
+        let context = Orchestrator::gather_codebase_context(indentiagraph, project.id)
             .await
             .unwrap();
 
@@ -6494,21 +6449,21 @@ mod tests {
     #[tokio::test]
     async fn test_gather_codebase_context_includes_existing_feature_graphs() {
         let state = mock_app_state();
-        let neo4j = state.neo4j.as_ref();
+        let indentiagraph = state.indentiagraph.as_ref();
         let project = test_project();
-        neo4j.create_project(&project).await.unwrap();
+        indentiagraph.create_project(&project).await.unwrap();
 
-        neo4j
+        indentiagraph
             .upsert_file(&test_file("src/lib.rs", project.id))
             .await
             .unwrap();
-        neo4j
+        indentiagraph
             .upsert_function(&test_function("entry_fn", "src/lib.rs"))
             .await
             .unwrap();
 
         // Create a feature graph
-        neo4j
+        indentiagraph
             .auto_build_feature_graph(
                 "Test FG",
                 Some("desc"),
@@ -6521,7 +6476,7 @@ mod tests {
             .await
             .unwrap();
 
-        let context = Orchestrator::gather_codebase_context(neo4j, project.id)
+        let context = Orchestrator::gather_codebase_context(indentiagraph, project.id)
             .await
             .unwrap();
 
@@ -6534,20 +6489,20 @@ mod tests {
     #[tokio::test]
     async fn test_gather_codebase_context_includes_language_stats() {
         let state = mock_app_state();
-        let neo4j = state.neo4j.as_ref();
+        let indentiagraph = state.indentiagraph.as_ref();
         let project = test_project();
-        neo4j.create_project(&project).await.unwrap();
+        indentiagraph.create_project(&project).await.unwrap();
 
-        neo4j
+        indentiagraph
             .upsert_file(&test_file("src/main.rs", project.id))
             .await
             .unwrap();
-        neo4j
+        indentiagraph
             .upsert_file(&test_file("src/lib.rs", project.id))
             .await
             .unwrap();
 
-        let context = Orchestrator::gather_codebase_context(neo4j, project.id)
+        let context = Orchestrator::gather_codebase_context(indentiagraph, project.id)
             .await
             .unwrap();
 
@@ -6645,8 +6600,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_analyze_project_safe_computes_and_emits() {
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::GraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::GraphStore;
 
         // Build custom state with a shared MockGraphStore reference
         let mock_store = Arc::new(MockGraphStore::new());
@@ -6663,7 +6618,7 @@ mod tests {
         // Seed files via the shared MockGraphStore
         let files = ["src/main.rs", "src/lib.rs", "src/api.rs"];
         for path in &files {
-            let file = crate::neo4j::models::FileNode {
+            let file = crate::indentiagraph::models::FileNode {
                 path: path.to_string(),
                 language: "rust".to_string(),
                 hash: "abc".to_string(),
@@ -6746,7 +6701,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_staleness_computed_after_sync_is_fresh() {
-        use crate::neo4j::mock::MockGraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
         let mock_store = Arc::new(MockGraphStore::new());
         // Simulate that GraIL context cards have been computed
         mock_store
@@ -6759,7 +6714,7 @@ mod tests {
         orch.create_project(&project).await.unwrap();
 
         // Simulate analytics computed AFTER the sync
-        orch.neo4j()
+        orch.indentiagraph()
             .update_project_analytics_timestamp(project.id)
             .await
             .unwrap();
@@ -6833,7 +6788,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_stale_projects_returns_only_stale() {
-        use crate::neo4j::mock::MockGraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
         let mock_store = Arc::new(MockGraphStore::new());
         // The "fresh" project needs context cards to pass the GraIL check
         mock_store
@@ -6861,10 +6816,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_store_parsed_file_for_project_uses_batch_methods() {
-        use crate::neo4j::models::*;
+        use crate::indentiagraph::models::*;
         use crate::parser::{FunctionCall, ParsedFile};
 
-        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mock_store = std::sync::Arc::new(crate::indentiagraph::mock::MockGraphStore::new());
         let state = mock_app_state_with_graph(mock_store.clone());
         let orch = Orchestrator::new(state).await.unwrap();
 
@@ -6992,7 +6947,7 @@ mod tests {
     async fn test_store_parsed_file_for_project_empty_parsed_file() {
         use crate::parser::ParsedFile;
 
-        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mock_store = std::sync::Arc::new(crate::indentiagraph::mock::MockGraphStore::new());
         let state = mock_app_state_with_graph(mock_store.clone());
         let orch = Orchestrator::new(state).await.unwrap();
 
@@ -7024,7 +6979,7 @@ mod tests {
 
     #[test]
     fn test_build_file_embedding_text() {
-        use crate::neo4j::models::{FunctionNode, StructNode, Visibility};
+        use crate::indentiagraph::models::{FunctionNode, StructNode, Visibility};
 
         let parsed = ParsedFile {
             path: "src/api/handlers.rs".to_string(),
@@ -7072,7 +7027,7 @@ mod tests {
 
     #[test]
     fn test_build_function_embedding_text() {
-        use crate::neo4j::models::{FunctionNode, Parameter, Visibility};
+        use crate::indentiagraph::models::{FunctionNode, Parameter, Visibility};
 
         let func = FunctionNode {
             name: "plan_implementation".to_string(),
@@ -7101,7 +7056,7 @@ mod tests {
 
     #[test]
     fn test_build_function_embedding_text_minimal() {
-        use crate::neo4j::models::{FunctionNode, Visibility};
+        use crate::indentiagraph::models::{FunctionNode, Visibility};
 
         let func = FunctionNode {
             name: "main".to_string(),
@@ -7272,21 +7227,21 @@ mod tests {
     #[test]
     fn test_resolve_rust_import_indexed_crate() {
         let paths = vec![
-            "src/neo4j/client.rs".to_string(),
-            "src/neo4j/mod.rs".to_string(),
+            "src/indentiagraph/client.rs".to_string(),
+            "src/indentiagraph/mod.rs".to_string(),
             "src/parser/mod.rs".to_string(),
             "src/parser/helpers.rs".to_string(),
             "src/lib.rs".to_string(),
         ];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        // crate::neo4j::client → src/neo4j/client.rs
+        // crate::indentiagraph::client → src/indentiagraph/client.rs
         let result = Orchestrator::resolve_single_rust_import_indexed(
-            "crate::neo4j::client",
+            "crate::indentiagraph::client",
             "src/main.rs",
             &index,
         );
-        assert_eq!(result, Some("src/neo4j/client.rs".to_string()));
+        assert_eq!(result, Some("src/indentiagraph/client.rs".to_string()));
 
         // crate::parser::helpers → src/parser/helpers.rs
         let result = Orchestrator::resolve_single_rust_import_indexed(
@@ -7308,18 +7263,18 @@ mod tests {
     #[test]
     fn test_resolve_rust_import_indexed_crate_with_type() {
         let paths = vec![
-            "src/neo4j/client.rs".to_string(),
-            "src/neo4j/models.rs".to_string(),
+            "src/indentiagraph/client.rs".to_string(),
+            "src/indentiagraph/models.rs".to_string(),
         ];
         let index = crate::resolver::SuffixIndex::build(&paths);
 
-        // crate::neo4j::models::FunctionNode → src/neo4j/models.rs (strip type name)
+        // crate::indentiagraph::models::FunctionNode → src/indentiagraph/models.rs (strip type name)
         let result = Orchestrator::resolve_single_rust_import_indexed(
-            "crate::neo4j::models::FunctionNode",
+            "crate::indentiagraph::models::FunctionNode",
             "src/main.rs",
             &index,
         );
-        assert_eq!(result, Some("src/neo4j/models.rs".to_string()));
+        assert_eq!(result, Some("src/indentiagraph/models.rs".to_string()));
     }
 
     #[test]
@@ -8213,7 +8168,7 @@ mod tests {
     fn test_import_resolution_context() {
         let paths = vec![
             "src/api/handlers.rs".to_string(),
-            "src/neo4j/client.rs".to_string(),
+            "src/indentiagraph/client.rs".to_string(),
         ];
         let mut ctx = crate::resolver::ImportResolutionContext::new(&paths);
 
@@ -8459,10 +8414,10 @@ mod tests {
         // NOTE: This test documents current behavior. When Plans 5/6 add
         // EXTENDS/IMPLEMENTS, a separate DELETE-then-CREATE step must be added
         // (see comment block in store_parsed_file_for_project_with_ctx).
-        use crate::neo4j::models::*;
+        use crate::indentiagraph::models::*;
         use crate::parser::ParsedFile;
 
-        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mock_store = std::sync::Arc::new(crate::indentiagraph::mock::MockGraphStore::new());
         let state = mock_app_state_with_graph(mock_store.clone());
         let orch = Orchestrator::new(state).await.unwrap();
 
@@ -8531,7 +8486,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_utility_chunking_constants() {
         // Validate that our batch utility constants match the cleanup_sync_data pattern
-        use crate::neo4j::batch::BATCH_SIZE;
+        use crate::indentiagraph::batch::BATCH_SIZE;
 
         assert_eq!(BATCH_SIZE, 10_000, "BATCH_SIZE must be 10K per constraint");
 
@@ -9018,7 +8973,7 @@ mod tests {
         let all_paths = vec![
             "src/main.rs".to_string(),
             "src/api/handlers.rs".to_string(),
-            "src/neo4j/client.rs".to_string(),
+            "src/indentiagraph/client.rs".to_string(),
         ];
 
         let mut ctx = crate::resolver::ImportResolutionContext::new(&all_paths);
@@ -9030,7 +8985,7 @@ mod tests {
         );
         assert_eq!(
             ctx.suffix_index.get("client.rs"),
-            Some("src/neo4j/client.rs")
+            Some("src/indentiagraph/client.rs")
         );
 
         // SymbolTable starts empty, populated incrementally
@@ -9047,8 +9002,8 @@ mod tests {
         );
         ctx.symbol_table.add(
             "query",
-            "src/neo4j/client.rs::query",
-            "src/neo4j/client.rs",
+            "src/indentiagraph/client.rs::query",
+            "src/indentiagraph/client.rs",
             SymbolType::Function,
             1,
         );
@@ -9063,7 +9018,7 @@ mod tests {
     async fn test_store_parsed_files_batch_accumulates() {
         // Verify that batch store accumulates all entities across files
         let (orch, _rx) = orch_with_bus().await;
-        let mock = orch.neo4j();
+        let mock = orch.indentiagraph();
 
         let parsed_files = vec![
             ParsedFile {
@@ -9271,7 +9226,7 @@ mod tests {
             fs::write(&file_path, format!("pub fn func_{}() {{}}", i)).unwrap();
         }
 
-        let (state, _neo4j, _meili) = mock_app_state_with_stores();
+        let (state, _indentiagraph) = mock_app_state_with_stores();
         let orch = Orchestrator::new(state).await.unwrap();
 
         // ── First sync: all 10 files are cache misses ──────────────
@@ -9487,15 +9442,15 @@ mod tests {
 
     // ── T8.6: Sync consistency integration tests ──────────────────
 
-    /// Scenario 1: Add a file → verify File + symbols + IMPORTS created in Neo4j AND MeiliSearch
+    /// Scenario 1: Add a file → verify File + symbols + IMPORTS created in IndentiaGraph
     #[tokio::test]
     async fn test_sync_add_file_creates_all_entities() {
-        use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::models::*;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
-        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let (state, indentiagraph) = mock_app_state_with_stores();
         let orch = Orchestrator::new(state).await.unwrap();
 
         let file_path = "/tmp/sync-test/src/lib.rs".to_string();
@@ -9542,44 +9497,40 @@ mod tests {
             symbols: vec!["handler".to_string(), "Config".to_string()],
         };
 
-        // Store with project context so MeiliSearch gets indexed
         let project_id = uuid::Uuid::new_v4();
         orch.store_parsed_file_for_project(&parsed, Some(project_id))
             .await
             .unwrap();
 
-        // Also manually index in MeiliSearch (normally done by sync_file_for_project)
-        let doc = crate::parser::CodeParser::to_code_document(
-            &parsed,
-            &project_id.to_string(),
-            "test-project",
+        // ── Verify IndentiaGraph ──
+        assert_eq!(
+            indentiagraph.functions.read().await.len(),
+            1,
+            "1 function expected"
         );
-        orch.meili().index_code(&doc).await.unwrap();
-
-        // ── Verify Neo4j ──
-        assert_eq!(neo4j.functions.read().await.len(), 1, "1 function expected");
-        assert_eq!(neo4j.structs_map.read().await.len(), 1, "1 struct expected");
-        assert_eq!(neo4j.imports.read().await.len(), 1, "1 import expected");
-        let file = neo4j.get_file(&file_path).await.unwrap();
-        assert!(file.is_some(), "File node should exist in Neo4j");
-
-        // ── Verify MeiliSearch ──
-        let code_docs = meili.code_documents.read().await;
-        assert_eq!(code_docs.len(), 1, "1 code document in MeiliSearch");
-        assert_eq!(code_docs[0].path, file_path);
-        assert!(code_docs[0].symbols.contains(&"handler".to_string()));
-        assert!(code_docs[0].symbols.contains(&"Config".to_string()));
+        assert_eq!(
+            indentiagraph.structs_map.read().await.len(),
+            1,
+            "1 struct expected"
+        );
+        assert_eq!(
+            indentiagraph.imports.read().await.len(),
+            1,
+            "1 import expected"
+        );
+        let file = indentiagraph.get_file(&file_path).await.unwrap();
+        assert!(file.is_some(), "File node should exist in IndentiaGraph");
     }
 
-    /// Scenario 2: Delete a file (< 50 threshold) → verify everything cleaned in Neo4j AND MeiliSearch
+    /// Scenario 2: Delete a file (< 50 threshold) → verify everything cleaned in IndentiaGraph
     #[tokio::test]
     async fn test_sync_delete_file_cleans_all() {
-        use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::models::*;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
-        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let (state, indentiagraph) = mock_app_state_with_stores();
         let orch = Orchestrator::new(state).await.unwrap();
         let project_id = uuid::Uuid::new_v4();
         let file_path = "/tmp/sync-test/src/delete_me.rs".to_string();
@@ -9615,50 +9566,38 @@ mod tests {
         orch.store_parsed_file_for_project(&parsed, Some(project_id))
             .await
             .unwrap();
-        let doc = crate::parser::CodeParser::to_code_document(
-            &parsed,
-            &project_id.to_string(),
-            "test-project",
-        );
-        orch.meili().index_code(&doc).await.unwrap();
 
         // Verify file exists
-        assert_eq!(neo4j.functions.read().await.len(), 1);
-        assert_eq!(meili.code_documents.read().await.len(), 1);
+        assert_eq!(indentiagraph.functions.read().await.len(), 1);
 
         // Step 2: Delete the file (simulating what watcher does)
-        GraphStore::delete_file(neo4j.as_ref(), &file_path)
+        GraphStore::delete_file(indentiagraph.as_ref(), &file_path)
             .await
             .unwrap();
-        orch.meili().delete_code(&file_path).await.unwrap();
 
-        // ── Verify Neo4j cleaned ──
-        let file = neo4j.get_file(&file_path).await.unwrap();
-        assert!(file.is_none(), "File node should be deleted from Neo4j");
+        // ── Verify IndentiaGraph cleaned ──
+        let file = indentiagraph.get_file(&file_path).await.unwrap();
+        assert!(
+            file.is_none(),
+            "File node should be deleted from IndentiaGraph"
+        );
         // Functions are cleaned via DETACH DELETE in the mock
         assert_eq!(
-            neo4j.functions.read().await.len(),
+            indentiagraph.functions.read().await.len(),
             0,
             "Functions should be deleted"
-        );
-
-        // ── Verify MeiliSearch cleaned ──
-        assert_eq!(
-            meili.code_documents.read().await.len(),
-            0,
-            "MeiliSearch documents should be deleted"
         );
     }
 
     /// Scenario 3: Rename a file → old node deleted, new created with correct relations
     #[tokio::test]
     async fn test_sync_rename_file_old_deleted_new_created() {
-        use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::models::*;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
-        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let (state, indentiagraph) = mock_app_state_with_stores();
         let orch = Orchestrator::new(state).await.unwrap();
         let project_id = uuid::Uuid::new_v4();
         let old_path = "/tmp/sync-test/src/old_name.rs".to_string();
@@ -9695,18 +9634,11 @@ mod tests {
         orch.store_parsed_file_for_project(&old_parsed, Some(project_id))
             .await
             .unwrap();
-        let doc = crate::parser::CodeParser::to_code_document(
-            &old_parsed,
-            &project_id.to_string(),
-            "test",
-        );
-        orch.meili().index_code(&doc).await.unwrap();
 
         // Step 2: Simulate rename = delete old + create new
-        GraphStore::delete_file(neo4j.as_ref(), &old_path)
+        GraphStore::delete_file(indentiagraph.as_ref(), &old_path)
             .await
             .unwrap();
-        orch.meili().delete_code(&old_path).await.unwrap();
 
         let new_parsed = ParsedFile {
             path: new_path.clone(),
@@ -9738,33 +9670,22 @@ mod tests {
         orch.store_parsed_file_for_project(&new_parsed, Some(project_id))
             .await
             .unwrap();
-        let doc = crate::parser::CodeParser::to_code_document(
-            &new_parsed,
-            &project_id.to_string(),
-            "test",
-        );
-        orch.meili().index_code(&doc).await.unwrap();
 
         // ── Verify old gone, new exists ──
-        let old_file = neo4j.get_file(&old_path).await.unwrap();
+        let old_file = indentiagraph.get_file(&old_path).await.unwrap();
         assert!(old_file.is_none(), "Old file should be deleted");
 
-        let new_file = neo4j.get_file(&new_path).await.unwrap();
+        let new_file = indentiagraph.get_file(&new_path).await.unwrap();
         assert!(new_file.is_some(), "New file should exist");
 
         // Function with new file_path should exist
-        let funcs = neo4j.functions.read().await;
+        let funcs = indentiagraph.functions.read().await;
         assert_eq!(funcs.len(), 1, "Should have exactly 1 function");
         let func = funcs.values().next().unwrap();
         assert_eq!(
             func.file_path, new_path,
             "Function should reference new path"
         );
-
-        // MeiliSearch: only new file
-        let code_docs = meili.code_documents.read().await;
-        assert_eq!(code_docs.len(), 1);
-        assert_eq!(code_docs[0].path, new_path);
     }
 
     /// Scenario 4: Modify hierarchy (EXTENDS change) — forward-compatible validation
@@ -9773,15 +9694,17 @@ mod tests {
         // EXTENDS/IMPLEMENTS don't exist yet (Plans 5/6).
         // This test validates that the cleanup_sync_data handles them as no-ops
         // and that the pattern documentation exists for future implementation.
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with_stores;
 
-        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let (state, indentiagraph) = mock_app_state_with_stores();
         let _orch = Orchestrator::new(state).await.unwrap();
 
         // cleanup_sync_data should handle EXTENDS/IMPLEMENTS without error
         // (forward-compatible no-ops)
-        let deleted = GraphStore::cleanup_sync_data(neo4j.as_ref()).await.unwrap();
+        let deleted = GraphStore::cleanup_sync_data(indentiagraph.as_ref())
+            .await
+            .unwrap();
         assert_eq!(deleted, 0, "Empty store cleanup should delete 0 entities");
 
         // Verify the Plans 5/6 cleanup pattern documentation exists
@@ -9795,12 +9718,11 @@ mod tests {
     /// Scenario 5: Bulk delete (>= BULK_SYNC_THRESHOLD files) → full sync path
     #[tokio::test]
     async fn test_sync_bulk_delete_triggers_full_sync_path() {
-        use crate::meilisearch::traits::SearchStore;
-        use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::models::*;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::test_helpers::mock_app_state_with_stores;
 
-        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let (state, indentiagraph) = mock_app_state_with_stores();
         let _orch = Orchestrator::new(state).await.unwrap();
         let project_id = uuid::Uuid::new_v4();
 
@@ -9808,7 +9730,7 @@ mod tests {
         for i in 0..60 {
             let path = format!("/tmp/bulk-test/src/file_{}.rs", i);
             GraphStore::upsert_file(
-                neo4j.as_ref(),
+                indentiagraph.as_ref(),
                 &FileNode {
                     path: path.clone(),
                     language: "rust".to_string(),
@@ -9820,12 +9742,12 @@ mod tests {
             .await
             .unwrap();
             // Link to project (mock uses project_files for delete_stale_files)
-            GraphStore::link_file_to_project(neo4j.as_ref(), &path, project_id)
+            GraphStore::link_file_to_project(indentiagraph.as_ref(), &path, project_id)
                 .await
                 .unwrap();
         }
 
-        assert_eq!(neo4j.files.read().await.len(), 60);
+        assert_eq!(indentiagraph.files.read().await.len(), 60);
 
         // Simulate keeping only 10 files (50 deletions) via delete_stale_files
         let valid_paths: Vec<String> = (0..10)
@@ -9833,29 +9755,28 @@ mod tests {
             .collect();
 
         let (files_deleted, _symbols_deleted, stale_paths) =
-            GraphStore::delete_stale_files(neo4j.as_ref(), project_id, &valid_paths)
+            GraphStore::delete_stale_files(indentiagraph.as_ref(), project_id, &valid_paths)
                 .await
                 .unwrap();
 
         assert_eq!(files_deleted, 50, "Should delete 50 stale files");
         assert_eq!(stale_paths.len(), 50, "Should return 50 deleted paths");
-        assert_eq!(neo4j.files.read().await.len(), 10, "10 files should remain");
-
-        // Simulate MeiliSearch cleanup for each stale path
-        for path in &stale_paths {
-            meili.delete_code(path).await.unwrap();
-        }
+        assert_eq!(
+            indentiagraph.files.read().await.len(),
+            10,
+            "10 files should remain"
+        );
     }
 
     /// Scenario 6: Add + delete simultaneously in debounce window → consistency
     #[tokio::test]
     async fn test_sync_add_delete_same_window_consistent() {
-        use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::models::*;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
-        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let (state, indentiagraph) = mock_app_state_with_stores();
         let orch = Orchestrator::new(state).await.unwrap();
         let project_id = uuid::Uuid::new_v4();
 
@@ -9893,22 +9814,14 @@ mod tests {
             orch.store_parsed_file_for_project(&parsed, Some(project_id))
                 .await
                 .unwrap();
-            let doc = crate::parser::CodeParser::to_code_document(
-                &parsed,
-                &project_id.to_string(),
-                "test",
-            );
-            orch.meili().index_code(&doc).await.unwrap();
         }
 
-        assert_eq!(neo4j.functions.read().await.len(), 2);
-        assert_eq!(meili.code_documents.read().await.len(), 2);
+        assert_eq!(indentiagraph.functions.read().await.len(), 2);
 
         // Simulate: delete file_a + modify file_b in same window
-        GraphStore::delete_file(neo4j.as_ref(), &file_a)
+        GraphStore::delete_file(indentiagraph.as_ref(), &file_a)
             .await
             .unwrap();
-        orch.meili().delete_code(&file_a).await.unwrap();
 
         let parsed_b_modified = ParsedFile {
             path: file_b.clone(),
@@ -9957,32 +9870,27 @@ mod tests {
             .unwrap();
 
         // ── Verify consistency ──
-        let file_a_node = neo4j.get_file(&file_a).await.unwrap();
+        let file_a_node = indentiagraph.get_file(&file_a).await.unwrap();
         assert!(file_a_node.is_none(), "file_a should be gone");
 
-        let file_b_node = neo4j.get_file(&file_b).await.unwrap();
+        let file_b_node = indentiagraph.get_file(&file_b).await.unwrap();
         assert!(file_b_node.is_some(), "file_b should exist");
 
         // file_b should have 2 functions now
-        let funcs = neo4j.functions.read().await;
+        let funcs = indentiagraph.functions.read().await;
         let file_b_funcs: Vec<_> = funcs.values().filter(|f| f.file_path == file_b).collect();
         assert_eq!(file_b_funcs.len(), 2, "file_b should have 2 functions");
-
-        // MeiliSearch: only file_b
-        let code_docs = meili.code_documents.read().await;
-        assert_eq!(code_docs.len(), 1);
-        assert_eq!(code_docs[0].path, file_b);
     }
 
     /// Scenario 7: Delete file that is source of IMPORTS → IMPORTS relations cleaned
     #[tokio::test]
     async fn test_sync_delete_import_source_cleans_relations() {
-        use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::models::*;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
-        let (state, neo4j, _meili) = mock_app_state_with_stores();
+        let (state, indentiagraph) = mock_app_state_with_stores();
         let orch = Orchestrator::new(state).await.unwrap();
 
         let importer = "/tmp/import-test/src/main.rs".to_string();
@@ -10056,33 +9964,33 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(neo4j.functions.read().await.len(), 2);
-        assert_eq!(neo4j.imports.read().await.len(), 1);
+        assert_eq!(indentiagraph.functions.read().await.len(), 2);
+        assert_eq!(indentiagraph.imports.read().await.len(), 1);
 
         // Delete the imported file — DETACH DELETE should clean relations
-        GraphStore::delete_file(neo4j.as_ref(), &imported)
+        GraphStore::delete_file(indentiagraph.as_ref(), &imported)
             .await
             .unwrap();
 
         // ── Verify ──
-        let imported_node = neo4j.get_file(&imported).await.unwrap();
+        let imported_node = indentiagraph.get_file(&imported).await.unwrap();
         assert!(imported_node.is_none(), "Imported file should be deleted");
 
         // The importer file and its import node should still exist
         // (the import statement in main.rs still references utils)
-        let importer_node = neo4j.get_file(&importer).await.unwrap();
+        let importer_node = indentiagraph.get_file(&importer).await.unwrap();
         assert!(importer_node.is_some(), "Importer file should still exist");
     }
 
-    /// Scenario 8: MeiliSearch post-deletion → search returns no phantom results
+    /// Scenario 8: post-deletion → deleted file is removed from IndentiaGraph
     #[tokio::test]
-    async fn test_sync_meilisearch_no_phantom_after_deletion() {
-        use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
+    async fn test_sync_no_phantom_after_deletion() {
+        use crate::indentiagraph::models::*;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::parser::ParsedFile;
         use crate::test_helpers::mock_app_state_with_stores;
 
-        let (state, neo4j, meili) = mock_app_state_with_stores();
+        let (state, indentiagraph) = mock_app_state_with_stores();
         let orch = Orchestrator::new(state).await.unwrap();
         let project_id = uuid::Uuid::new_v4();
 
@@ -10118,42 +10026,26 @@ mod tests {
             orch.store_parsed_file_for_project(&parsed, Some(project_id))
                 .await
                 .unwrap();
-            let doc = crate::parser::CodeParser::to_code_document(
-                &parsed,
-                &project_id.to_string(),
-                "test",
-            );
-            orch.meili().index_code(&doc).await.unwrap();
         }
 
-        assert_eq!(meili.code_documents.read().await.len(), 3);
+        assert_eq!(indentiagraph.files.read().await.len(), 3);
 
-        // Delete file_1 from both Neo4j and MeiliSearch
+        // Delete file_1 from IndentiaGraph
         let deleted_path = "/tmp/phantom-test/src/file_1.rs";
-        neo4j.delete_file(deleted_path).await.unwrap();
-        orch.meili().delete_code(deleted_path).await.unwrap();
+        indentiagraph.delete_file(deleted_path).await.unwrap();
 
-        // ── Verify no phantom documents ──
-        let code_docs = meili.code_documents.read().await;
-        assert_eq!(code_docs.len(), 2, "Should have 2 documents after deletion");
-
-        // Verify deleted file is not in results
-        let phantom = code_docs.iter().find(|d| d.path == deleted_path);
+        // ── Verify deleted file is gone from IndentiaGraph ──
+        let file = indentiagraph.get_file(deleted_path).await.unwrap();
         assert!(
-            phantom.is_none(),
-            "Deleted file should not be in MeiliSearch"
+            file.is_none(),
+            "Deleted file should not be in IndentiaGraph"
         );
 
         // Verify remaining files are correct
-        let paths: Vec<&str> = code_docs.iter().map(|d| d.path.as_str()).collect();
-        assert!(paths.contains(&"/tmp/phantom-test/src/file_0.rs"));
-        assert!(paths.contains(&"/tmp/phantom-test/src/file_2.rs"));
-
-        // Search should not find the deleted file
-        let results = orch.meili().search_code("func_1", 10, None).await.unwrap();
-        assert!(
-            results.is_empty(),
-            "Search for deleted file's function should return empty"
+        assert_eq!(
+            indentiagraph.files.read().await.len(),
+            2,
+            "Should have 2 files after deletion"
         );
     }
 
@@ -10166,15 +10058,15 @@ mod tests {
         // and completes within a reasonable time.
         //
         // This tests the DATA PREPARATION path (Vec allocation, HashMap building,
-        // chunking logic). The actual Neo4j UNWIND is tested via integration tests.
-        use crate::neo4j::batch::{BoltMap, BATCH_SIZE};
-        use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
+        // chunking logic). The actual IndentiaGraph UNWIND is tested via integration tests.
+        use crate::indentiagraph::batch::{BoltMap, BATCH_SIZE};
+        use crate::indentiagraph::models::*;
+        use crate::indentiagraph::traits::GraphStore;
         use crate::parser::FunctionCall;
 
         let start = std::time::Instant::now();
 
-        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mock_store = std::sync::Arc::new(crate::indentiagraph::mock::MockGraphStore::new());
         let state = mock_app_state_with_graph(mock_store.clone());
         let _orch = Orchestrator::new(state).await.unwrap();
 
@@ -10318,10 +10210,10 @@ mod tests {
     async fn test_batch_stress_cleanup_pattern() {
         // Validates that the cleanup LIMIT loop pattern scales correctly
         // with the mock store's cleanup_sync_data implementation.
-        use crate::neo4j::models::*;
-        use crate::neo4j::traits::GraphStore;
+        use crate::indentiagraph::models::*;
+        use crate::indentiagraph::traits::GraphStore;
 
-        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mock_store = std::sync::Arc::new(crate::indentiagraph::mock::MockGraphStore::new());
 
         let file_base = "/tmp/stress-cleanup/src";
 
@@ -10391,10 +10283,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_heritage_extends_implements_wired_in_pipeline() {
-        use crate::neo4j::models::*;
+        use crate::indentiagraph::models::*;
         use crate::parser::ParsedFile;
 
-        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mock_store = std::sync::Arc::new(crate::indentiagraph::mock::MockGraphStore::new());
         let state = mock_app_state_with_graph(mock_store.clone());
         let orch = Orchestrator::new(state).await.unwrap();
 
@@ -10508,10 +10400,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_heritage_no_edges_when_no_inheritance() {
-        use crate::neo4j::models::*;
+        use crate::indentiagraph::models::*;
         use crate::parser::ParsedFile;
 
-        let mock_store = std::sync::Arc::new(crate::neo4j::mock::MockGraphStore::new());
+        let mock_store = std::sync::Arc::new(crate::indentiagraph::mock::MockGraphStore::new());
         let state = mock_app_state_with_graph(mock_store.clone());
         let orch = Orchestrator::new(state).await.unwrap();
 

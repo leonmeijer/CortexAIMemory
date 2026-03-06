@@ -222,7 +222,7 @@ fn test_cjs_hook_wrong_event_type() {
 fn test_cjs_hook_server_down_fast_timeout() {
     // Server not reachable → should exit 0 within timeout budget
     let dir = create_temp_project_dir(19998); // port not listening
-    let input = make_pre_tool_use_input("Grep", json!({"pattern": "neo4j query"}));
+    let input = make_pre_tool_use_input("Grep", json!({"pattern": "indentiagraph query"}));
 
     let start = Instant::now();
     let (exit_code, stdout, _stderr) = run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
@@ -277,8 +277,8 @@ fn test_cjs_hook_match_success_with_mock() {
 
             // Send mock response
             let response_body = json!({
-                "context": "## \u{1f9e0} Skill \"Neo4j Perf\" (confidence 85%)\n- Use UNWIND for batch ops\n",
-                "skill_name": "Neo4j Perf",
+                "context": "## \u{1f9e0} Skill \"IndentiaGraph Perf\" (confidence 85%)\n- Use UNWIND for batch ops\n",
+                "skill_name": "IndentiaGraph Perf",
                 "note_ids": ["00000000-0000-0000-0000-000000000001"],
             });
             let body_str = serde_json::to_string(&response_body).unwrap();
@@ -294,7 +294,10 @@ fn test_cjs_hook_match_success_with_mock() {
     });
 
     let dir = create_temp_project_dir(port);
-    let input = make_pre_tool_use_input("Grep", json!({"pattern": "neo4j query optimization"}));
+    let input = make_pre_tool_use_input(
+        "Grep",
+        json!({"pattern": "indentiagraph query optimization"}),
+    );
 
     let (exit_code, stdout, stderr) = run_cjs_hook(&input, dir.path(), Duration::from_secs(5));
 
@@ -319,7 +322,7 @@ fn test_cjs_hook_match_success_with_mock() {
         .as_str()
         .unwrap();
     assert!(
-        ctx.contains("Neo4j Perf") || ctx.contains("UNWIND"),
+        ctx.contains("IndentiaGraph Perf") || ctx.contains("UNWIND"),
         "Context should contain skill content, got: {}",
         ctx
     );
@@ -420,7 +423,7 @@ fn test_session_start_hook_with_mock() {
             let response_body = json!({
                 "active_skills": [
                     {
-                        "name": "Neo4j Perf",
+                        "name": "IndentiaGraph Perf",
                         "description": "Query optimization",
                         "energy": 0.85,
                         "note_count": 12,
@@ -484,7 +487,7 @@ fn test_session_start_hook_with_mock() {
         ctx
     );
     assert!(
-        ctx.contains("Neo4j Perf"),
+        ctx.contains("IndentiaGraph Perf"),
         "Context should mention skill name"
     );
     assert!(
@@ -672,7 +675,7 @@ async fn test_hook_activate_endpoint_match() {
         .json(&json!({
             "project_id": "00333b5f-2d0a-4467-9c98-155e55d2b7e5",
             "tool_name": "Grep",
-            "tool_input": {"pattern": "neo4j query"},
+            "tool_input": {"pattern": "indentiagraph query"},
         }))
         .timeout(Duration::from_secs(5))
         .send()

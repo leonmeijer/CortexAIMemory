@@ -857,7 +857,7 @@ static BUILT_IN_NAMES: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
     s
 });
 
-/// Get a reference to the full set of built-in names (for Neo4j cleanup queries).
+/// Get a reference to the full set of built-in names (for IndentiaGraph cleanup queries).
 pub fn builtin_names() -> &'static HashSet<&'static str> {
     &BUILT_IN_NAMES
 }

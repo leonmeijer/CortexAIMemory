@@ -8,7 +8,7 @@
 # This formula downloads pre-built binaries from GitHub Releases.
 # SHA256 checksums are updated automatically by the release CI.
 class ProjectOrchestrator < Formula
-  desc "AI agent orchestrator with Neo4j knowledge graph, Meilisearch, and Tree-sitter"
+  desc "AI agent orchestrator with IndentiaGraph knowledge graph, Meilisearch, and Tree-sitter"
   homepage "https://github.com/this-rs/project-orchestrator"
   license "MIT"
   version "VERSION_PLACEHOLDER"
@@ -61,7 +61,7 @@ class ProjectOrchestrator < Formula
       The MCP server binary is at: #{opt_bin}/mcp_server
       The CLI tool is at: #{opt_bin}/orch
 
-      Before starting, ensure Neo4j and MeiliSearch are running.
+      Before starting, ensure IndentiaGraph and MeiliSearch are running.
     EOS
   end
 

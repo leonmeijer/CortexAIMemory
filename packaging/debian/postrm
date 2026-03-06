@@ -4,14 +4,14 @@ set -e
 case "$1" in
     purge)
         # Remove user and group
-        if getent passwd orchestrator >/dev/null 2>&1; then
-            userdel orchestrator || true
-            echo "Removed system user 'orchestrator'"
+        if getent passwd cortex >/dev/null 2>&1; then
+            userdel cortex || true
+            echo "Removed system user 'cortex'"
         fi
 
         # Remove data and config directories
-        rm -rf /var/lib/project-orchestrator
-        rm -rf /etc/project-orchestrator
+        rm -rf /var/lib/cortex
+        rm -rf /etc/cortex
 
         # Reload systemd
         systemctl daemon-reload || true

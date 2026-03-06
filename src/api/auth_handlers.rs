@@ -1,7 +1,7 @@
 //! Authentication route handlers — Google OAuth, password login, JWT token, user info.
 //!
 //! Endpoints:
-//! - `POST /auth/login`           — Email/password login (root account + Neo4j users)
+//! - `POST /auth/login`           — Email/password login (root account + IndentiaGraph users)
 //! - `GET  /auth/google`          — Returns the Google OAuth authorization URL
 //! - `POST /auth/google/callback` — Exchanges auth code for JWT + user info
 //! - `GET  /auth/me`              — Returns the authenticated user (protected)
@@ -14,7 +14,7 @@ use crate::auth::google::GoogleOAuthClient;
 use crate::auth::jwt::encode_jwt;
 use crate::auth::oidc::OidcClient;
 use crate::auth::refresh;
-use crate::neo4j::models::UserNode;
+use crate::indentiagraph::models::UserNode;
 use crate::AuthConfig;
 use axum::{
     extract::{Query as AxumQuery, State},
@@ -126,7 +126,7 @@ impl From<UserNode> for UserResponse {
             email: u.email,
             name: u.name,
             picture_url: u.picture_url,
-            is_root: false, // Neo4j users are never root
+            is_root: false, // IndentiaGraph users are never root
         }
     }
 }
@@ -152,7 +152,7 @@ async fn create_refresh_token_and_cookie(
 
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .create_refresh_token(user_id, &token_hash, expires_at)
         .await?;
 
@@ -227,7 +227,7 @@ pub async fn get_auth_providers(
 /// Flow:
 /// 1. Check that auth is configured and password auth is available
 /// 2. Try root account first (in-memory, no DB hit)
-/// 3. If not root, look up user in Neo4j by email + provider "password"
+/// 3. If not root, look up user in IndentiaGraph by email + provider "password"
 /// 4. Verify password with bcrypt
 /// 5. Return JWT access token in body + refresh token in HttpOnly cookie
 ///
@@ -290,10 +290,10 @@ pub async fn password_login(
         }
     }
 
-    // 2. Look up user in Neo4j by email + provider "password"
+    // 2. Look up user in IndentiaGraph by email + provider "password"
     let user = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_user_by_email_and_provider(&req.email, "password")
         .await?
         .ok_or_else(invalid_credentials)?;
@@ -334,7 +334,7 @@ pub async fn password_login(
 /// POST /auth/register — Create a new password-authenticated account.
 ///
 /// Only available when `allow_registration` is true in auth config.
-/// Creates a user in Neo4j with bcrypt-hashed password and returns
+/// Creates a user in IndentiaGraph with bcrypt-hashed password and returns
 /// JWT + user info (auto-login after registration).
 pub async fn register(
     State(state): State<OrchestratorState>,
@@ -356,7 +356,7 @@ pub async fn register(
     // 3. Check email uniqueness for password provider
     let existing = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_user_by_email_and_provider(&req.email, "password")
         .await?;
     if existing.is_some() {
@@ -369,10 +369,10 @@ pub async fn register(
     let password_hash = bcrypt::hash(&req.password, 12)
         .map_err(|e| AppError::Internal(anyhow::anyhow!("Failed to hash password: {}", e)))?;
 
-    // 5. Create user in Neo4j
+    // 5. Create user in IndentiaGraph
     let user = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .create_password_user(&req.email, &req.name, &password_hash)
         .await?;
 
@@ -463,7 +463,7 @@ pub async fn google_login(
 /// POST /auth/google/callback — Exchange authorization code for JWT + user.
 ///
 /// 1. Exchanges the Google auth code for user info (using dynamic redirect_uri if origin provided)
-/// 2. Upserts the user in Neo4j (creates on first login, updates on subsequent)
+/// 2. Upserts the user in IndentiaGraph (creates on first login, updates on subsequent)
 /// 3. Returns a JWT token + user info
 pub async fn google_callback(
     State(state): State<OrchestratorState>,
@@ -494,21 +494,25 @@ pub async fn google_callback(
         ));
     }
 
-    // 3. Upsert user in Neo4j
+    // 3. Upsert user in IndentiaGraph
     let now = Utc::now();
     let user_node = UserNode {
         id: Uuid::new_v4(), // Will be overridden by MERGE if existing
         email: google_user.email.clone(),
         name: google_user.name.clone(),
         picture_url: google_user.picture.clone(),
-        auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+        auth_provider: crate::indentiagraph::models::AuthProvider::Oidc,
         external_id: Some(google_user.google_id.clone()),
         password_hash: None,
         created_at: now,
         last_login_at: now,
     };
 
-    let user = state.orchestrator.neo4j().upsert_user(&user_node).await?;
+    let user = state
+        .orchestrator
+        .indentiagraph()
+        .upsert_user(&user_node)
+        .await?;
 
     // 4. Generate JWT
     let token = encode_jwt(
@@ -570,7 +574,7 @@ pub async fn oidc_login(
 /// POST /auth/oidc/callback — Exchange OIDC authorization code for JWT + user.
 ///
 /// 1. Exchanges the auth code via the generic OIDC client (using dynamic redirect_uri if origin provided)
-/// 2. Upserts the user in Neo4j with auth_provider="oidc" + external_id=sub
+/// 2. Upserts the user in IndentiaGraph with auth_provider="oidc" + external_id=sub
 /// 3. Returns a JWT token + user info
 pub async fn oidc_callback(
     State(state): State<OrchestratorState>,
@@ -608,21 +612,25 @@ pub async fn oidc_callback(
         ));
     }
 
-    // 3. Upsert user in Neo4j
+    // 3. Upsert user in IndentiaGraph
     let now = Utc::now();
     let user_node = UserNode {
         id: Uuid::new_v4(),
         email: oidc_user.email.clone(),
         name: oidc_user.name.clone(),
         picture_url: oidc_user.picture.clone(),
-        auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+        auth_provider: crate::indentiagraph::models::AuthProvider::Oidc,
         external_id: Some(oidc_user.external_id.clone()),
         password_hash: None,
         created_at: now,
         last_login_at: now,
     };
 
-    let user = state.orchestrator.neo4j().upsert_user(&user_node).await?;
+    let user = state
+        .orchestrator
+        .indentiagraph()
+        .upsert_user(&user_node)
+        .await?;
 
     // 4. Generate JWT
     let token = encode_jwt(
@@ -649,7 +657,7 @@ pub async fn oidc_callback(
 /// GET /auth/me — Returns the authenticated user's info.
 ///
 /// Requires a valid JWT token (via `require_auth` middleware + `AuthUser` extractor).
-/// Falls back to JWT claims when the user isn't found in Neo4j (e.g. root account).
+/// Falls back to JWT claims when the user isn't found in IndentiaGraph (e.g. root account).
 /// Sets `is_root: true` when the user ID matches the root account's deterministic UUID.
 pub async fn get_me(
     State(state): State<OrchestratorState>,
@@ -664,10 +672,10 @@ pub async fn get_me(
             Uuid::new_v5(&Uuid::NAMESPACE_URL, root.email.as_bytes()) == user.user_id
         });
 
-    // Try to fetch full user from Neo4j (may have updated picture, etc.)
+    // Try to fetch full user from IndentiaGraph (may have updated picture, etc.)
     match state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_user_by_id(user.user_id)
         .await?
     {
@@ -676,7 +684,7 @@ pub async fn get_me(
             resp.is_root = is_root;
             Ok(Json(resp))
         }
-        // Root account or users not yet in Neo4j — use JWT claims directly
+        // Root account or users not yet in IndentiaGraph — use JWT claims directly
         None => Ok(Json(UserResponse {
             id: user.user_id,
             email: user.email,
@@ -719,7 +727,7 @@ pub async fn refresh_token(
     let token_hash = refresh::hash_token(&raw_token);
     let token_node = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .validate_refresh_token(&token_hash)
         .await?
         .ok_or_else(|| AppError::Unauthorized("Invalid or expired refresh token".to_string()))?;
@@ -727,18 +735,18 @@ pub async fn refresh_token(
     // 3. Revoke old refresh token (rotation — each token is single-use)
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .revoke_refresh_token(&token_hash)
         .await?;
 
     // 4. Look up user info for JWT claims
     let user = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_user_by_id(token_node.user_id)
         .await?;
 
-    // For root accounts (not in Neo4j), fall back to auth config
+    // For root accounts (not in IndentiaGraph), fall back to auth config
     let (user_id, email, name) = match user {
         Some(u) => (u.id, u.email, u.name),
         None => {
@@ -811,7 +819,7 @@ pub async fn logout(
         // Best-effort revocation — don't fail if token is already revoked or not found
         let _ = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .revoke_refresh_token(&token_hash)
             .await;
     }
@@ -905,14 +913,14 @@ async fn try_ws_ticket_via_cookie(
     let token_hash = refresh::hash_token(&raw_token);
     let token_node = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .validate_refresh_token(&token_hash)
         .await
         .ok()??;
 
     let (user_id, email, name) = match state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_user_by_id(token_node.user_id)
         .await
         .ok()?
@@ -1133,7 +1141,7 @@ mod tests {
             email: "alice@ffs.holdings".to_string(),
             name: "Alice".to_string(),
             picture_url: Some("https://example.com/photo.jpg".to_string()),
-            auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+            auth_provider: crate::indentiagraph::models::AuthProvider::Oidc,
             external_id: Some("google-123".to_string()),
             password_hash: None,
             created_at: now,
@@ -1141,7 +1149,7 @@ mod tests {
         };
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .upsert_user(&user_node)
             .await
             .unwrap();
@@ -1187,7 +1195,7 @@ mod tests {
             email: "bob@ffs.holdings".to_string(),
             name: "Bob".to_string(),
             picture_url: None,
-            auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+            auth_provider: crate::indentiagraph::models::AuthProvider::Oidc,
             external_id: Some("google-456".to_string()),
             password_hash: None,
             created_at: now,
@@ -1195,7 +1203,7 @@ mod tests {
         };
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .upsert_user(&user_node)
             .await
             .unwrap();
@@ -1206,7 +1214,7 @@ mod tests {
         let expires_at = Utc::now() + chrono::Duration::days(7);
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .create_refresh_token(user_id, &token_hash, expires_at)
             .await
             .unwrap();
@@ -1293,7 +1301,7 @@ mod tests {
             email: "carol@ffs.holdings".to_string(),
             name: "Carol".to_string(),
             picture_url: None,
-            auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+            auth_provider: crate::indentiagraph::models::AuthProvider::Oidc,
             external_id: Some("google-789".to_string()),
             password_hash: None,
             created_at: now,
@@ -1301,7 +1309,7 @@ mod tests {
         };
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .upsert_user(&user_node)
             .await
             .unwrap();
@@ -1312,13 +1320,13 @@ mod tests {
         let expires_at = Utc::now() + chrono::Duration::days(7);
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .create_refresh_token(user_id, &token_hash, expires_at)
             .await
             .unwrap();
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .revoke_refresh_token(&token_hash)
             .await
             .unwrap();
@@ -1349,7 +1357,7 @@ mod tests {
             email: "dave@ffs.holdings".to_string(),
             name: "Dave".to_string(),
             picture_url: None,
-            auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+            auth_provider: crate::indentiagraph::models::AuthProvider::Oidc,
             external_id: Some("google-101".to_string()),
             password_hash: None,
             created_at: now,
@@ -1357,7 +1365,7 @@ mod tests {
         };
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .upsert_user(&user_node)
             .await
             .unwrap();
@@ -1368,7 +1376,7 @@ mod tests {
         let expires_at = Utc::now() + chrono::Duration::days(7);
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .create_refresh_token(user_id, &token_hash, expires_at)
             .await
             .unwrap();
@@ -1419,7 +1427,7 @@ mod tests {
             email: "eve@ffs.holdings".to_string(),
             name: "Eve".to_string(),
             picture_url: None,
-            auth_provider: crate::neo4j::models::AuthProvider::Password,
+            auth_provider: crate::indentiagraph::models::AuthProvider::Password,
             external_id: None,
             password_hash: Some("hash".to_string()),
             created_at: now,
@@ -1427,7 +1435,7 @@ mod tests {
         };
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .upsert_user(&user_node)
             .await
             .unwrap();
@@ -1438,7 +1446,7 @@ mod tests {
         let expires_at = Utc::now() + chrono::Duration::days(7);
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .create_refresh_token(user_id, &token_hash, expires_at)
             .await
             .unwrap();
@@ -1629,14 +1637,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_login_neo4j_user_success() {
+    async fn test_login_indentiagraph_user_success() {
         let (app, state) = test_auth_app_with_state(Some(auth_config_with_root())).await;
 
         // Create a password user in the mock store
         let password_hash = bcrypt::hash("userpass456", 4).unwrap();
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .create_password_user("alice@ffs.holdings", "Alice", &password_hash)
             .await
             .unwrap();
@@ -1660,14 +1668,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_login_neo4j_user_wrong_password() {
+    async fn test_login_indentiagraph_user_wrong_password() {
         let (app, state) = test_auth_app_with_state(Some(auth_config_with_root())).await;
 
         // Create a password user
         let password_hash = bcrypt::hash("correctpass", 4).unwrap();
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .create_password_user("bob@ffs.holdings", "Bob", &password_hash)
             .await
             .unwrap();
@@ -1904,7 +1912,7 @@ mod tests {
         let password_hash = bcrypt::hash("existing123", 4).unwrap();
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .create_password_user("existing@ffs.holdings", "Existing", &password_hash)
             .await
             .unwrap();

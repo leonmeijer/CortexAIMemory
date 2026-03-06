@@ -5,7 +5,7 @@
 
 use super::hashing::{hash_function_body, hash_function_signature, similarity_score};
 use super::models::*;
-use crate::neo4j::models::FunctionNode;
+use crate::indentiagraph::models::FunctionNode;
 use crate::parser::ParsedFile;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;

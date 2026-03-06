@@ -36,7 +36,7 @@ OpenAI Agents SDK supports MCP (Model Context Protocol), allowing your agents to
         ┌─────────────────────┼─────────────────────┐
         ▼                     ▼                     ▼
 ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
-│    NEO4J      │     │  MEILISEARCH  │     │  TREE-SITTER  │
+│    INDENTIAGRAPH      │     │  MEILISEARCH  │     │  TREE-SITTER  │
 │  (Knowledge   │     │   (Semantic   │     │    (Code      │
 │    Graph)     │     │    Search)    │     │   Parsing)    │
 └───────────────┘     └───────────────┘     └───────────────┘
@@ -73,9 +73,9 @@ mcp_server = MCPServer(
     name="project-orchestrator",
     command="/path/to/mcp_server",
     env={
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "orchestrator123",
+        "INDENTIAGRAPH_URI": "ws://localhost:8000",
+        "INDENTIAGRAPH_USER": "indentiagraph",
+        "INDENTIAGRAPH_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
         "MEILISEARCH_KEY": "orchestrator-meili-key-change-me",
     }
@@ -99,9 +99,9 @@ const mcpServer = new MCPServer({
   name: 'project-orchestrator',
   command: '/path/to/mcp_server',
   env: {
-    NEO4J_URI: 'bolt://localhost:7687',
-    NEO4J_USER: 'neo4j',
-    NEO4J_PASSWORD: 'orchestrator123',
+    INDENTIAGRAPH_URI: 'ws://localhost:8000',
+    INDENTIAGRAPH_USER: 'indentiagraph',
+    INDENTIAGRAPH_PASSWORD: 'orchestrator123',
     MEILISEARCH_URL: 'http://localhost:7700',
     MEILISEARCH_KEY: 'orchestrator-meili-key-change-me',
   },
@@ -129,9 +129,9 @@ mcp = MCPServer(
     name="project-orchestrator",
     command="/path/to/mcp_server",
     env={
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "orchestrator123",
+        "INDENTIAGRAPH_URI": "ws://localhost:8000",
+        "INDENTIAGRAPH_USER": "indentiagraph",
+        "INDENTIAGRAPH_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
         "MEILISEARCH_KEY": "orchestrator-meili-key-change-me",
     }
@@ -182,9 +182,9 @@ async function main() {
     name: 'project-orchestrator',
     command: '/path/to/mcp_server',
     env: {
-      NEO4J_URI: 'bolt://localhost:7687',
-      NEO4J_USER: 'neo4j',
-      NEO4J_PASSWORD: 'orchestrator123',
+      INDENTIAGRAPH_URI: 'ws://localhost:8000',
+      INDENTIAGRAPH_USER: 'indentiagraph',
+      INDENTIAGRAPH_PASSWORD: 'orchestrator123',
       MEILISEARCH_URL: 'http://localhost:7700',
       MEILISEARCH_KEY: 'orchestrator-meili-key-change-me',
     },
@@ -411,7 +411,7 @@ mcp = MCPServer(command="/absolute/path/to/mcp_server")
 ```bash
 # Backend services not running
 docker compose ps
-docker compose up -d neo4j meilisearch
+docker compose up -d indentiagraph meilisearch
 ```
 
 ### Tool timeout

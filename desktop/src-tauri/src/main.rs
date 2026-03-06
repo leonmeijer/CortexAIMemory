@@ -47,7 +47,7 @@ fn proceed_to_main() {
 /// Returns the JSON body from the `/health` endpoint, which includes:
 /// - `status`: "ok" | "degraded" | "unhealthy"
 /// - `version`: semver string
-/// - `services.neo4j`: "connected" | "disconnected"
+/// - `services.indentiagraph`: "connected" | "disconnected"
 /// - `services.meilisearch`: "connected" | "disconnected"
 ///
 /// Returns `null` if the server is not reachable yet.
@@ -395,7 +395,7 @@ fn main() {
                     }
                     // We only check that the HTTP listener is up (any response),
                     // NOT that services are connected. /health may return 503 when
-                    // Neo4j is still starting — that's fine, the Docker health loop
+                    // IndentiaGraph is still starting — that's fine, the Docker health loop
                     // below handles service readiness.
                     if reqwest::blocking::get(&health_url).is_ok() {
                         tracing::info!(

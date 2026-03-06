@@ -215,7 +215,7 @@ impl ActivationBuffer {
     /// Returns the number of skills penalized.
     pub async fn apply_penalties(
         &self,
-        graph_store: &dyn crate::neo4j::traits::GraphStore,
+        graph_store: &dyn crate::indentiagraph::traits::GraphStore,
     ) -> anyhow::Result<usize> {
         let candidates = self.get_penalty_candidates();
         let mut penalized = 0;
@@ -297,7 +297,7 @@ mod tests {
         let project_id = Uuid::new_v4();
         let skill_id = Uuid::new_v4();
 
-        let is_miss = buffer.record_activation(project_id, skill_id, "neo4j", None);
+        let is_miss = buffer.record_activation(project_id, skill_id, "indentiagraph", None);
         assert!(!is_miss);
         assert_eq!(buffer.total_events(), 1);
     }
@@ -308,8 +308,8 @@ mod tests {
         let project_id = Uuid::new_v4();
         let skill_id = Uuid::new_v4();
 
-        buffer.record_activation(project_id, skill_id, "neo4j", None);
-        let is_miss = buffer.record_activation(project_id, skill_id, "neo4j", None);
+        buffer.record_activation(project_id, skill_id, "indentiagraph", None);
+        let is_miss = buffer.record_activation(project_id, skill_id, "indentiagraph", None);
         assert!(is_miss, "Same pattern within window should be a miss");
     }
 
@@ -319,7 +319,7 @@ mod tests {
         let project_id = Uuid::new_v4();
         let skill_id = Uuid::new_v4();
 
-        buffer.record_activation(project_id, skill_id, "neo4j", None);
+        buffer.record_activation(project_id, skill_id, "indentiagraph", None);
         let is_miss = buffer.record_activation(project_id, skill_id, "api", None);
         assert!(!is_miss, "Different pattern should not be a miss");
     }
@@ -330,8 +330,9 @@ mod tests {
         let project_id = Uuid::new_v4();
         let skill_id = Uuid::new_v4();
 
-        buffer.record_activation(project_id, skill_id, "neo4j", Some("src/a.rs"));
-        let is_miss = buffer.record_activation(project_id, skill_id, "neo4j", Some("src/b.rs"));
+        buffer.record_activation(project_id, skill_id, "indentiagraph", Some("src/a.rs"));
+        let is_miss =
+            buffer.record_activation(project_id, skill_id, "indentiagraph", Some("src/b.rs"));
         assert!(
             !is_miss,
             "Same pattern but different file should not be a miss"
@@ -454,9 +455,9 @@ mod tests {
         let project_b = Uuid::new_v4();
         let skill_id = Uuid::new_v4();
 
-        buffer.record_activation(project_a, skill_id, "neo4j", None);
+        buffer.record_activation(project_a, skill_id, "indentiagraph", None);
         // Same pattern but different project — should NOT be a miss
-        let is_miss = buffer.record_activation(project_b, skill_id, "neo4j", None);
+        let is_miss = buffer.record_activation(project_b, skill_id, "indentiagraph", None);
         assert!(!is_miss, "Different projects should be isolated");
     }
 
@@ -475,16 +476,16 @@ mod tests {
         let project_id = Uuid::new_v4();
         let skill_id = Uuid::new_v4();
 
-        // Activation 1: "neo4j" → no miss (first time)
-        buffer.record_activation(project_id, skill_id, "neo4j", None);
-        // Activation 2: "neo4j" again → miss #1 (re-search = context wasn't helpful)
-        buffer.record_activation(project_id, skill_id, "neo4j", None);
-        // Activation 3: "neo4j" again → miss #2
-        buffer.record_activation(project_id, skill_id, "neo4j", None);
-        // Activation 4: "neo4j" again → miss #3
-        buffer.record_activation(project_id, skill_id, "neo4j", None);
-        // Activation 5: "neo4j" again → miss #4
-        buffer.record_activation(project_id, skill_id, "neo4j", None);
+        // Activation 1: "indentiagraph" → no miss (first time)
+        buffer.record_activation(project_id, skill_id, "indentiagraph", None);
+        // Activation 2: "indentiagraph" again → miss #1 (re-search = context wasn't helpful)
+        buffer.record_activation(project_id, skill_id, "indentiagraph", None);
+        // Activation 3: "indentiagraph" again → miss #2
+        buffer.record_activation(project_id, skill_id, "indentiagraph", None);
+        // Activation 4: "indentiagraph" again → miss #3
+        buffer.record_activation(project_id, skill_id, "indentiagraph", None);
+        // Activation 5: "indentiagraph" again → miss #4
+        buffer.record_activation(project_id, skill_id, "indentiagraph", None);
 
         // Verify hit rate: 4 misses out of 5 → hit_rate = 1/5 = 0.2
         let (hit_rate, total) = buffer.get_skill_hit_rate(skill_id).unwrap();

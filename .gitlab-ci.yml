@@ -1,0 +1,639 @@
+# =============================================================================
+# CortexAIMemory — GitLab CI/CD Pipeline
+#
+# Binaries: cortex, cortex-cli, cortex-mcp, cortex-mem, cortex-mem-hook
+# Backend:  SurrealDB (IndentiaGraph) + Meilisearch (optioneel)
+# Registry: GitLab Container Registry (via Buildah)
+#
+# Stages:
+#   test    — unit tests + linting
+#   build   — cross-platform binaries
+#   package — .deb, .rpm, .tar.gz, .zip
+#   docker  — Buildah image push naar GitLab registry
+#   release — GitLab Release aanmaken met assets
+# =============================================================================
+
+stages:
+  - test
+  - build
+  - package
+  - docker
+  - release
+
+# =============================================================================
+# Globale variabelen
+# =============================================================================
+variables:
+  # Cargo caching — project-dir zodat cache gedeeld wordt tussen jobs
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  RUST_BACKTRACE: "1"
+
+  # Vaste binaire namen (workspace)
+  BINARIES: "cortex cortex-cli cortex-mcp cortex-mem cortex-mem-hook"
+
+  # Docker registry (GitLab Container Registry)
+  DOCKER_IMAGE: "$CI_REGISTRY_IMAGE"
+
+  # Rust toolchain versie
+  RUST_VERSION: "1.85"
+
+# =============================================================================
+# Globale cache-configuratie (shared key per branch)
+# cargo registry en git worden gecached; target/ alleen voor test/lint jobs
+# om te voorkomen dat stale artifacts build-jobs besmetten.
+# =============================================================================
+.cargo_cache: &cargo_cache
+  cache:
+    key: "cargo-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+    policy: pull-push
+
+.cargo_cache_pull: &cargo_cache_pull
+  cache:
+    key: "cargo-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+    policy: pull
+
+# =============================================================================
+# Reusable Rust image base
+# =============================================================================
+.rust_image: &rust_image
+  image: "rust:${RUST_VERSION}"
+
+# =============================================================================
+# STAGE: test
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# test:lint — formattering en clippy
+# -----------------------------------------------------------------------------
+test:lint:
+  stage: test
+  <<: *rust_image
+  <<: *cargo_cache
+  before_script:
+    - rustup component add rustfmt clippy
+  script:
+    - echo "=== Rust toolchain ==="
+    - rustc --version && cargo --version
+    - echo "=== Formattering controleren ==="
+    - cargo fmt --all --check
+    - echo "=== Clippy (alle targets, alle features) ==="
+    - cargo clippy --all-targets --all-features -- -D warnings
+  rules:
+    # Altijd uitvoeren: op branches, MRs en tags
+    - when: on_success
+
+# -----------------------------------------------------------------------------
+# test:unit — unit tests (geen externe services nodig, mock backends)
+# -----------------------------------------------------------------------------
+test:unit:
+  stage: test
+  <<: *rust_image
+  <<: *cargo_cache
+  script:
+    - echo "=== Rust toolchain ==="
+    - rustc --version && cargo --version
+    - echo "=== Unit tests (lib) ==="
+    - cargo test --lib
+    - echo "=== Parser tests ==="
+    - cargo test --test parser_tests
+    - echo "=== cortex-core tests ==="
+    - cargo test -p cortex-core
+    - echo "=== cortex-graph tests ==="
+    - cargo test -p cortex-graph
+    - echo "=== cortex-indentiagraph tests ==="
+    - cargo test -p cortex-indentiagraph
+    - echo "=== cortex-mem tests ==="
+    - cargo test -p cortex-mem
+  rules:
+    # Niet op tags — tags gaan direct naar build/package/release
+    - if: '$CI_COMMIT_TAG'
+      when: never
+    - when: on_success
+
+# -----------------------------------------------------------------------------
+# test:integration — integratietests met SurrealDB als service
+# Alleen op main branch en tags (kostbare resources)
+# -----------------------------------------------------------------------------
+test:integration:
+  stage: test
+  <<: *rust_image
+  <<: *cargo_cache_pull
+  services:
+    - name: surrealdb/surrealdb:v2.3.2
+      alias: surrealdb
+      command:
+        - start
+        - --log=info
+        - --user=root
+        - --pass=root
+        - memory
+  variables:
+    # SurrealDB verbinding voor de tests
+    SURREALDB_URL: "ws://surrealdb:8000"
+    GRAPH_BACKEND: "indentiagraph"
+    SURREAL_USER: "root"
+    SURREAL_PASS: "root"
+    SURREAL_NS: "cortex_test"
+    SURREAL_DB: "cortex_test"
+  before_script:
+    - echo "=== Wachten op SurrealDB ==="
+    - |
+      timeout 60 sh -c '
+        until curl -sf http://surrealdb:8000/health > /dev/null 2>&1; do
+          echo "SurrealDB nog niet beschikbaar, wacht 2 seconden..."
+          sleep 2
+        done
+      '
+    - echo "SurrealDB is beschikbaar!"
+  script:
+    - echo "=== Integratietests uitvoeren ==="
+    - cargo test --test integration_tests
+  rules:
+    # Alleen op main branch en tags
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+
+# =============================================================================
+# STAGE: build
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# build:linux-x86_64 — native Linux x86_64 build
+# Noot: fastembed/ort-sys downloadt ONNX Runtime zelf voor deze target.
+# -----------------------------------------------------------------------------
+build:linux-x86_64:
+  stage: build
+  <<: *rust_image
+  <<: *cargo_cache
+  before_script:
+    - rustup target add x86_64-unknown-linux-gnu
+    - apt-get update -qq && apt-get install -y -qq build-essential pkg-config
+  script:
+    - echo "=== Build Linux x86_64 ==="
+    - rustc --version && cargo --version
+    - cargo build --workspace --release --target x86_64-unknown-linux-gnu
+    - echo "=== Binary-groottes ==="
+    - |
+      for bin in $BINARIES; do
+        ls -lh "target/x86_64-unknown-linux-gnu/release/$bin" 2>/dev/null || echo "WAARSCHUWING: $bin niet gevonden"
+      done
+  artifacts:
+    name: "cortex-linux-x86_64-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - target/x86_64-unknown-linux-gnu/release/cortex
+      - target/x86_64-unknown-linux-gnu/release/cortex-cli
+      - target/x86_64-unknown-linux-gnu/release/cortex-mcp
+      - target/x86_64-unknown-linux-gnu/release/cortex-mem
+      - target/x86_64-unknown-linux-gnu/release/cortex-mem-hook
+    expire_in: 1 hour
+  rules:
+    - when: on_success
+
+# -----------------------------------------------------------------------------
+# build:linux-aarch64 — cross-compilatie voor ARM64 via `cross`
+# Gebruikt Cross.toml voor vendored OpenSSL en ONNX Runtime passthrough.
+# -----------------------------------------------------------------------------
+build:linux-aarch64:
+  stage: build
+  <<: *rust_image
+  <<: *cargo_cache
+  before_script:
+    # cross heeft Docker nodig — in GitLab CI gebruiken we de Docker executor
+    # of een runner met Docker-in-Docker. cross downloadt een pre-built image.
+    - cargo install cross --git https://github.com/cross-rs/cross --locked
+    - rustup target add aarch64-unknown-linux-gnu
+    - echo "=== ONNX Runtime voor aarch64 voorbereiden ==="
+    - |
+      ORT_VERSION="1.23.2"
+      curl -fsSL -o /tmp/onnxruntime.tgz \
+        "https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/onnxruntime-linux-aarch64-${ORT_VERSION}.tgz"
+      mkdir -p /opt/onnxruntime-aarch64
+      tar xzf /tmp/onnxruntime.tgz -C /opt/onnxruntime-aarch64 --strip-components=1
+      echo "ORT_LIB_LOCATION=/opt/onnxruntime-aarch64/lib" >> build.env
+      echo "ORT_PREFER_DYNAMIC_LINK=1" >> build.env
+    - export ORT_LIB_LOCATION=/opt/onnxruntime-aarch64/lib
+    - export ORT_PREFER_DYNAMIC_LINK=1
+  script:
+    - echo "=== Cross-compile Linux aarch64 ==="
+    - cross build --workspace --release --target aarch64-unknown-linux-gnu --features vendored-openssl
+    - echo "=== Binary-groottes ==="
+    - |
+      for bin in $BINARIES; do
+        ls -lh "target/aarch64-unknown-linux-gnu/release/$bin" 2>/dev/null || echo "WAARSCHUWING: $bin niet gevonden"
+      done
+  artifacts:
+    name: "cortex-linux-aarch64-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - target/aarch64-unknown-linux-gnu/release/cortex
+      - target/aarch64-unknown-linux-gnu/release/cortex-cli
+      - target/aarch64-unknown-linux-gnu/release/cortex-mcp
+      - target/aarch64-unknown-linux-gnu/release/cortex-mem
+      - target/aarch64-unknown-linux-gnu/release/cortex-mem-hook
+      - /opt/onnxruntime-aarch64/lib/libonnxruntime.so*
+    expire_in: 1 hour
+  rules:
+    - when: on_success
+
+# -----------------------------------------------------------------------------
+# build:windows-x86_64 — cross-compilatie voor Windows via cargo-xwin
+# allow_failure: true omdat Windows cross-compile fragiel kan zijn.
+# -----------------------------------------------------------------------------
+build:windows-x86_64:
+  stage: build
+  <<: *rust_image
+  <<: *cargo_cache
+  allow_failure: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq clang llvm lld
+    - rustup target add x86_64-pc-windows-msvc
+    - cargo install cargo-xwin --locked
+  script:
+    - echo "=== Cross-compile Windows x86_64 ==="
+    - cargo xwin build --workspace --release --target x86_64-pc-windows-msvc
+    - echo "=== Windows binary-groottes ==="
+    - |
+      for bin in $BINARIES; do
+        ls -lh "target/x86_64-pc-windows-msvc/release/${bin}.exe" 2>/dev/null || echo "WAARSCHUWING: ${bin}.exe niet gevonden"
+      done
+  artifacts:
+    name: "cortex-windows-x86_64-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - target/x86_64-pc-windows-msvc/release/cortex.exe
+      - target/x86_64-pc-windows-msvc/release/cortex-cli.exe
+      - target/x86_64-pc-windows-msvc/release/cortex-mcp.exe
+      - target/x86_64-pc-windows-msvc/release/cortex-mem.exe
+      - target/x86_64-pc-windows-msvc/release/cortex-mem-hook.exe
+    expire_in: 1 hour
+  rules:
+    - when: on_success
+
+# -----------------------------------------------------------------------------
+# build:macos-arm64 — native macOS ARM64 build op een macOS GitLab Runner
+# allow_failure: true omdat de runner optioneel beschikbaar is.
+# -----------------------------------------------------------------------------
+build:macos-arm64:
+  stage: build
+  tags:
+    - macos
+    - arm64
+  allow_failure: true
+  variables:
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  script:
+    - echo "=== Build macOS arm64 (native runner) ==="
+    - rustc --version && cargo --version
+    - cargo build --workspace --release
+    - echo "=== macOS binary-groottes ==="
+    - |
+      for bin in $BINARIES; do
+        ls -lh "target/release/$bin" 2>/dev/null || echo "WAARSCHUWING: $bin niet gevonden"
+      done
+  artifacts:
+    name: "cortex-macos-arm64-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - target/release/cortex
+      - target/release/cortex-cli
+      - target/release/cortex-mcp
+      - target/release/cortex-mem
+      - target/release/cortex-mem-hook
+    expire_in: 1 hour
+  cache:
+    key: "cargo-macos-arm64-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cargo/registry/
+      - .cargo/git/
+  rules:
+    - when: on_success
+
+# =============================================================================
+# STAGE: package
+# Alleen op tags — packaging is zinloos zonder versienummer.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# package:deb — Debian-pakket bouwen via cargo-deb
+# Gebruikt de x86_64 pre-built binaries (geen hercompilatie).
+# -----------------------------------------------------------------------------
+package:deb:
+  stage: package
+  <<: *rust_image
+  <<: *cargo_cache_pull
+  needs:
+    - job: build:linux-x86_64
+      artifacts: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq build-essential pkg-config
+    # cargo-deb voor .deb packaging
+    - cargo install cargo-deb --locked
+    # Binaries naar target/release kopiëren (cargo-deb zoekt daar standaard)
+    - mkdir -p target/release
+    - |
+      for bin in $BINARIES; do
+        cp "target/x86_64-unknown-linux-gnu/release/$bin" "target/release/$bin"
+        chmod +x "target/release/$bin"
+      done
+  script:
+    - echo "=== Debian-pakket bouwen voor x86_64 ==="
+    # --no-build: gebruik de al-gebouwde binaries
+    - cargo deb --no-build --target x86_64-unknown-linux-gnu
+    - echo "=== Gegenereerde .deb bestanden ==="
+    - find target -name "*.deb" -exec ls -lh {} \;
+  artifacts:
+    name: "cortex-deb-x86_64-$CI_COMMIT_TAG"
+    paths:
+      - target/**/*.deb
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+
+# -----------------------------------------------------------------------------
+# package:rpm — RPM-pakket bouwen via cargo-generate-rpm
+# allow_failure: true omdat RPM-tooling soms problemen geeft.
+# -----------------------------------------------------------------------------
+package:rpm:
+  stage: package
+  <<: *rust_image
+  <<: *cargo_cache_pull
+  needs:
+    - job: build:linux-x86_64
+      artifacts: true
+  allow_failure: true
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq rpm build-essential pkg-config
+    # cargo-generate-rpm — vervangt de verouderde cargo-rpm
+    - cargo install cargo-generate-rpm --locked
+    # Binaries naar target/release kopiëren
+    - mkdir -p target/release
+    - |
+      for bin in $BINARIES; do
+        cp "target/x86_64-unknown-linux-gnu/release/$bin" "target/release/$bin"
+        chmod +x "target/release/$bin"
+      done
+  script:
+    - echo "=== RPM-pakket bouwen voor x86_64 ==="
+    - cargo generate-rpm
+    - echo "=== Gegenereerde .rpm bestanden ==="
+    - find target -name "*.rpm" -exec ls -lh {} \;
+  artifacts:
+    name: "cortex-rpm-x86_64-$CI_COMMIT_TAG"
+    paths:
+      - target/**/*.rpm
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+
+# -----------------------------------------------------------------------------
+# package:tar-linux — tarball voor Linux x86_64
+# Lichtgewicht: alpine zonder cargo nodig.
+# -----------------------------------------------------------------------------
+package:tar-linux:
+  stage: package
+  image: alpine:3.19
+  needs:
+    - job: build:linux-x86_64
+      artifacts: true
+  before_script:
+    - apk add --no-cache tar gzip
+  script:
+    - echo "=== Linux x86_64 tarball aanmaken ==="
+    - |
+      ARCHIVE="cortex-${CI_COMMIT_TAG}-linux-x86_64.tar.gz"
+      tar czf "$ARCHIVE" \
+        -C target/x86_64-unknown-linux-gnu/release \
+        cortex cortex-cli cortex-mcp cortex-mem cortex-mem-hook
+      echo "Tarball aangemaakt: $ARCHIVE"
+      ls -lh "$ARCHIVE"
+  artifacts:
+    name: "cortex-tar-linux-x86_64-$CI_COMMIT_TAG"
+    paths:
+      - "cortex-*-linux-x86_64.tar.gz"
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+
+# -----------------------------------------------------------------------------
+# package:tar-linux-aarch64 — tarball voor Linux aarch64
+# -----------------------------------------------------------------------------
+package:tar-linux-aarch64:
+  stage: package
+  image: alpine:3.19
+  needs:
+    - job: build:linux-aarch64
+      artifacts: true
+  allow_failure: true
+  before_script:
+    - apk add --no-cache tar gzip
+  script:
+    - echo "=== Linux aarch64 tarball aanmaken ==="
+    - |
+      ARCHIVE="cortex-${CI_COMMIT_TAG}-linux-aarch64.tar.gz"
+      tar czf "$ARCHIVE" \
+        -C target/aarch64-unknown-linux-gnu/release \
+        cortex cortex-cli cortex-mcp cortex-mem cortex-mem-hook
+      echo "Tarball aangemaakt: $ARCHIVE"
+      ls -lh "$ARCHIVE"
+  artifacts:
+    name: "cortex-tar-linux-aarch64-$CI_COMMIT_TAG"
+    paths:
+      - "cortex-*-linux-aarch64.tar.gz"
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+
+# -----------------------------------------------------------------------------
+# package:zip-windows — ZIP-archief voor Windows x86_64
+# allow_failure: true omdat Windows build optioneel is.
+# -----------------------------------------------------------------------------
+package:zip-windows:
+  stage: package
+  image: alpine:3.19
+  needs:
+    - job: build:windows-x86_64
+      artifacts: true
+  allow_failure: true
+  before_script:
+    - apk add --no-cache zip
+  script:
+    - echo "=== Windows x86_64 ZIP aanmaken ==="
+    - |
+      ARCHIVE="cortex-${CI_COMMIT_TAG}-windows-x86_64.zip"
+      zip "$ARCHIVE" \
+        target/x86_64-pc-windows-msvc/release/cortex.exe \
+        target/x86_64-pc-windows-msvc/release/cortex-cli.exe \
+        target/x86_64-pc-windows-msvc/release/cortex-mcp.exe \
+        target/x86_64-pc-windows-msvc/release/cortex-mem.exe \
+        target/x86_64-pc-windows-msvc/release/cortex-mem-hook.exe
+      echo "ZIP aangemaakt: $ARCHIVE"
+      ls -lh "$ARCHIVE"
+  artifacts:
+    name: "cortex-zip-windows-x86_64-$CI_COMMIT_TAG"
+    paths:
+      - "cortex-*-windows-x86_64.zip"
+    expire_in: 7 days
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+
+# =============================================================================
+# STAGE: docker
+# Buildah (GEEN Kaniko, GEEN Docker-in-Docker) — conform Indentia beleid.
+# Vereist: GitLab runner met Buildah beschikbaar (geen Docker socket nodig).
+# =============================================================================
+docker:build:
+  stage: docker
+  image: quay.io/buildah/stable
+  needs:
+    - job: build:linux-x86_64
+      artifacts: true
+  variables:
+    # Buildah storage driver
+    STORAGE_DRIVER: overlay
+    BUILDAH_ISOLATION: chroot
+  before_script:
+    # Genereer auth.json voor GitLab Container Registry
+    - |
+      AUTH=$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 -w0)
+      AUTHFILE="$HOME/.config/containers/auth.json"
+      mkdir -p "$(dirname "$AUTHFILE")"
+      printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" "$AUTH" > "$AUTHFILE"
+      echo "Auth configuratie aangemaakt voor registry: $CI_REGISTRY"
+    # Binaries klaarleggen voor de Dockerfile (wordt verwacht in target/release/)
+    - mkdir -p target/release
+    - |
+      for bin in $BINARIES; do
+        cp "target/x86_64-unknown-linux-gnu/release/$bin" "target/release/$bin"
+        chmod +x "target/release/$bin"
+      done
+  script:
+    - echo "=== Docker image bouwen met Buildah ==="
+    # Bepaal tags
+    - |
+      IMAGE_LATEST="${DOCKER_IMAGE}:latest"
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        IMAGE_TAG="${DOCKER_IMAGE}:${CI_COMMIT_TAG}"
+        echo "Tag-build: $IMAGE_TAG + $IMAGE_LATEST"
+      else
+        IMAGE_TAG="${DOCKER_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+        echo "Branch-build: $IMAGE_TAG + $IMAGE_LATEST"
+      fi
+    # Buildah bud — multi-stage build zoals gedefinieerd in Dockerfile
+    - |
+      buildah bud \
+        --tag "$IMAGE_LATEST" \
+        --tag "$IMAGE_TAG" \
+        --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+        --label "org.opencontainers.image.version=${CI_COMMIT_TAG:-$CI_COMMIT_SHORT_SHA}" \
+        --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
+        .
+    # Push naar GitLab Container Registry (altijd met --authfile)
+    - buildah push --authfile "$HOME/.config/containers/auth.json" "$IMAGE_LATEST"
+    - buildah push --authfile "$HOME/.config/containers/auth.json" "$IMAGE_TAG"
+    - echo "=== Image gepusht ==="
+    - echo "  $IMAGE_LATEST"
+    - echo "  $IMAGE_TAG"
+  rules:
+    # Alleen op main branch en tags
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: on_success
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+
+# =============================================================================
+# STAGE: release
+# GitLab Release aanmaken met alle build-artefacten als assets.
+# =============================================================================
+release:gitlab:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs:
+    - job: package:deb
+      artifacts: true
+    - job: package:tar-linux
+      artifacts: true
+    # Optionele artefacten — allow_failure jobs; artifacts zijn niet gegarandeerd
+    - job: package:rpm
+      artifacts: true
+      optional: true
+    - job: package:tar-linux-aarch64
+      artifacts: true
+      optional: true
+    - job: package:zip-windows
+      artifacts: true
+      optional: true
+  script:
+    - echo "=== GitLab Release aanmaken voor tag: $CI_COMMIT_TAG ==="
+    - |
+      # Samenvatting van de release assets weergeven
+      echo "Beschikbare artefacten:"
+      ls -lh *.deb 2>/dev/null || true
+      ls -lh *.tar.gz 2>/dev/null || true
+      ls -lh *.rpm 2>/dev/null || true
+      ls -lh *.zip 2>/dev/null || true
+      find target -name "*.deb" -o -name "*.rpm" 2>/dev/null || true
+  release:
+    name: "CortexAIMemory $CI_COMMIT_TAG"
+    description: |
+      ## CortexAIMemory $CI_COMMIT_TAG
+
+      AI agent orchestrator met pluggable graph backend (SurrealDB/IndentiaGraph),
+      Meilisearch semantic search, en Tree-sitter code parsing.
+
+      ### Binaries
+      - `cortex` — Hoofdserver (REST API + WebSocket + MCP)
+      - `cortex-cli` — CLI tool
+      - `cortex-mcp` — MCP server voor Claude Code integratie
+      - `cortex-mem` — Memory worker daemon (port 37777)
+      - `cortex-mem-hook` — Claude Code hook binary
+
+      ### Installatie (Linux x86_64)
+      ```bash
+      # Via tarball
+      tar xzf cortex-${CI_COMMIT_TAG}-linux-x86_64.tar.gz
+      sudo mv cortex cortex-cli cortex-mcp cortex-mem cortex-mem-hook /usr/local/bin/
+
+      # Via Debian package
+      sudo dpkg -i cortex-ai-memory_*.deb
+      ```
+
+      ### Quick Start
+      ```bash
+      cortex serve --port 8080
+      ```
+    tag_name: "$CI_COMMIT_TAG"
+    assets:
+      links:
+        - name: "Linux x86_64 (tar.gz)"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/cortex-$CI_COMMIT_TAG-linux-x86_64.tar.gz?job=package:tar-linux"
+          link_type: package
+        - name: "Linux aarch64 (tar.gz)"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/cortex-$CI_COMMIT_TAG-linux-aarch64.tar.gz?job=package:tar-linux-aarch64"
+          link_type: package
+        - name: "Debian Package (x86_64)"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/browse/target/?job=package:deb"
+          link_type: package
+        - name: "RPM Package (x86_64)"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/browse/target/?job=package:rpm"
+          link_type: package
+        - name: "Windows x86_64 (zip)"
+          url: "$CI_PROJECT_URL/-/jobs/artifacts/$CI_COMMIT_TAG/raw/cortex-$CI_COMMIT_TAG-windows-x86_64.zip?job=package:zip-windows"
+          link_type: package
+        - name: "Docker Image"
+          url: "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+          link_type: image
+  rules:
+    # Uitsluitend op tags
+    - if: '$CI_COMMIT_TAG'
+      when: on_success

@@ -12,10 +12,10 @@
 // This migration converts existing Google OAuth users to the new schema.
 // It is idempotent — safe to run multiple times.
 //
-// Run with:
-//   cypher-shell -u neo4j -p <password> < migrations/001_user_auth_provider.cypher
-//
-// Or in the Neo4j Browser, paste each statement separately.
+// Legacy note:
+//   This file contains Cypher from a previous backend era and is kept only as
+//   historical reference. It is not used by the current IndentiaGraph
+//   (SurrealDB) runtime path.
 // =============================================================================
 
 // Step 1: Migrate existing Google users → OIDC provider

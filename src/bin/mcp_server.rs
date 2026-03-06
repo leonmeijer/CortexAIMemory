@@ -1,7 +1,7 @@
 //! MCP Server Binary — HTTP Proxy Mode
 //!
 //! This binary runs a lightweight MCP server that proxies tool calls to the
-//! project-orchestrator REST API. It communicates over stdio for integration
+//! Cortex REST API. It communicates over stdio for integration
 //! with Claude Code and other MCP clients.
 //!
 //! # Environment Variables
@@ -13,7 +13,7 @@
 //!
 //! The MCP server is a thin proxy: it receives MCP tool calls over stdio,
 //! translates them to HTTP REST requests, and returns the results. It does NOT
-//! connect to Neo4j, Meilisearch, or any other backend directly — all state
+//! connect to IndentiaGraph, SurrealDB, or any other backend directly — all state
 //! lives in the REST API server.
 //!
 //! # Claude Code Integration
@@ -23,8 +23,8 @@
 //! ```json
 //! {
 //!   "mcpServers": {
-//!     "project-orchestrator": {
-//!       "command": "/path/to/mcp_server",
+//!     "cortex": {
+//!       "command": "/path/to/cortex-mcp",
 //!       "env": {
 //!         "PO_SERVER_URL": "http://127.0.0.1:8080",
 //!         "PO_AUTH_TOKEN": "<jwt-session-token>"
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
         anyhow!(
             "PO_SERVER_URL environment variable is required.\n\
              The MCP server operates as an HTTP proxy to the REST API.\n\
-             Set PO_SERVER_URL to the orchestrator server URL (e.g. http://127.0.0.1:8080)."
+             Set PO_SERVER_URL to the cortex server URL (e.g. http://127.0.0.1:8080)."
         )
     })?;
 

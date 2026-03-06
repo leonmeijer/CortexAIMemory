@@ -6,7 +6,7 @@ use crate::api::{
 };
 use crate::chat::ChatManager;
 use crate::events::{EventEmitter, HybridEmitter, NatsEmitter};
-use crate::neo4j::models::{
+use crate::indentiagraph::models::{
     AffectsRelation, CommitNode, ConstraintNode, DecisionNode, DecisionStatus,
     DecisionTimelineEntry, MilestoneNode, MilestoneStatus, PlanNode, PlanStatus, ReleaseNode,
     ReleaseStatus, StepNode, TaskNode, TaskWithPlan,
@@ -143,8 +143,8 @@ impl ServerState {
 /// Per-service health status in the health response
 #[derive(Serialize)]
 pub struct ServiceHealthStatus {
-    pub neo4j: String,
-    pub meilisearch: String,
+    pub indentiagraph: String,
+    pub graph: String,
     /// NATS connection status: "connected", "disconnected", or "disabled".
     pub nats: String,
 }
@@ -158,22 +158,15 @@ pub struct HealthResponse {
     pub services: Option<ServiceHealthStatus>,
 }
 
-/// Health check handler — verifies actual connectivity to Neo4j, Meilisearch, and NATS.
+/// Health check handler — verifies actual connectivity to IndentiaGraph and NATS.
 ///
 /// Returns:
-/// - 200 + `"ok"` if both Neo4j and Meilisearch are connected
-/// - 200 + `"degraded"` if Neo4j is connected but Meilisearch is not
-/// - 503 + `"unhealthy"` if Neo4j is disconnected (critical dependency)
+/// - 200 + `"ok"` if IndentiaGraph is connected
+/// - 503 + `"unhealthy"` if IndentiaGraph is disconnected (critical dependency)
 pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json<HealthResponse>) {
-    let neo4j_ok = state
+    let indentiagraph_ok = state
         .orchestrator
-        .neo4j()
-        .health_check()
-        .await
-        .unwrap_or(false);
-    let meili_ok = state
-        .orchestrator
-        .meili()
+        .indentiagraph()
         .health_check()
         .await
         .unwrap_or(false);
@@ -191,15 +184,9 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
         None => "disabled",
     };
 
-    let status = if neo4j_ok && meili_ok {
-        "ok"
-    } else if neo4j_ok {
-        "degraded"
-    } else {
-        "unhealthy"
-    };
+    let status = if indentiagraph_ok { "ok" } else { "unhealthy" };
 
-    let http_status = if neo4j_ok {
+    let http_status = if indentiagraph_ok {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
@@ -211,12 +198,12 @@ pub async fn health(State(state): State<OrchestratorState>) -> (StatusCode, Json
             status: status.to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             services: Some(ServiceHealthStatus {
-                neo4j: if neo4j_ok {
+                indentiagraph: if indentiagraph_ok {
                     "connected".to_string()
                 } else {
                     "disconnected".to_string()
                 },
-                meilisearch: if meili_ok {
+                graph: if indentiagraph_ok {
                     "connected".to_string()
                 } else {
                     "disconnected".to_string()
@@ -330,7 +317,7 @@ pub async fn list_plans(
 
     let (plans, total) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_plans_filtered(
             project_id,
             query.workspace_slug.as_deref(),
@@ -542,7 +529,7 @@ pub async fn list_all_tasks(
 
     let (tasks, total) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_all_tasks_filtered(
             query.plan_id,
             query.project_id,
@@ -631,7 +618,7 @@ pub async fn get_decision(
 ) -> Result<Json<DecisionNode>, AppError> {
     let decision = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_decision(decision_id)
         .await?
         .ok_or(AppError::NotFound("Decision not found".into()))?;
@@ -705,14 +692,14 @@ pub async fn search_decisions(
     if let Some(ref ws_slug) = query.workspace_slug {
         let workspace = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_workspace_by_slug(ws_slug)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Workspace not found: {}", ws_slug)))?;
 
         let projects = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .list_workspace_projects(workspace.id)
             .await?;
 
@@ -778,7 +765,7 @@ pub async fn get_decisions_affecting(
 ) -> Result<Json<Vec<DecisionNode>>, AppError> {
     let results = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_decisions_affecting(
             &params.entity_type,
             &params.entity_id,
@@ -804,7 +791,7 @@ pub async fn add_decision_affects(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .add_decision_affects(
             decision_id,
             &req.entity_type,
@@ -826,7 +813,7 @@ pub async fn remove_decision_affects(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .remove_decision_affects(decision_id, &entity_type, &entity_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -849,7 +836,7 @@ pub async fn remove_decision_affects_query(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .remove_decision_affects(decision_id, &query.entity_type, &query.entity_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -862,7 +849,7 @@ pub async fn list_decision_affects(
 ) -> Result<Json<Vec<AffectsRelation>>, AppError> {
     let affects = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_decision_affects(decision_id)
         .await?;
     Ok(Json(affects))
@@ -875,7 +862,7 @@ pub async fn supersede_decision(
 ) -> Result<StatusCode, AppError> {
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .supersede_decision(new_id, old_id)
         .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -900,7 +887,7 @@ pub async fn get_decision_timeline(
 ) -> Result<Json<Vec<DecisionTimelineEntry>>, AppError> {
     let entries = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_decision_timeline(params.task_id, params.from.as_deref(), params.to.as_deref())
         .await?;
     Ok(Json(entries))
@@ -940,7 +927,7 @@ pub async fn sync_directory(
             .map_err(|_| AppError::BadRequest(format!("Invalid project_id: {}", pid_str)))?;
         let project = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_project(pid)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", pid_str)))?;
@@ -958,16 +945,19 @@ pub async fn sync_directory(
     if let Some(pid) = project_id {
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .update_project_synced(pid)
             .await?;
 
         // Spawn auto-anchor in background: link notes to newly synced files
-        let neo4j = state.orchestrator.neo4j_arc();
-        let neo4j_topo = neo4j.clone();
+        let indentiagraph = state.orchestrator.indentiagraph_arc();
+        let indentiagraph_topo = indentiagraph.clone();
         tokio::spawn(async move {
-            match crate::skills::activation::auto_anchor_notes_for_project(neo4j.as_ref(), pid)
-                .await
+            match crate::skills::activation::auto_anchor_notes_for_project(
+                indentiagraph.as_ref(),
+                pid,
+            )
+            .await
             {
                 Ok(r) if r.anchors_created > 0 => {
                     tracing::info!(
@@ -986,8 +976,11 @@ pub async fn sync_directory(
 
         // Spawn topology firewall check in background: detect violations and create gotcha notes
         tokio::spawn(async move {
-            match crate::orchestrator::topology_hook::check_topology_post_sync(neo4j_topo, pid)
-                .await
+            match crate::orchestrator::topology_hook::check_topology_post_sync(
+                indentiagraph_topo,
+                pid,
+            )
+            .await
             {
                 Ok(r) if r.notes_created > 0 => {
                     tracing::info!(
@@ -1114,7 +1107,7 @@ pub async fn start_watch(
     // Register project context if project_id is provided (multi-project aware)
     if let Some(ref pid_str) = req.project_id {
         if let Ok(pid) = uuid::Uuid::parse_str(pid_str) {
-            if let Some(project) = state.orchestrator.neo4j().get_project(pid).await? {
+            if let Some(project) = state.orchestrator.indentiagraph().get_project(pid).await? {
                 watcher
                     .register_project(path, project.id, project.slug)
                     .await
@@ -1178,7 +1171,11 @@ pub async fn add_step(
     Json(req): Json<AddStepRequest>,
 ) -> Result<Json<StepNode>, AppError> {
     // Get current step count to determine order
-    let steps = state.orchestrator.neo4j().get_task_steps(task_id).await?;
+    let steps = state
+        .orchestrator
+        .indentiagraph()
+        .get_task_steps(task_id)
+        .await?;
     let order = steps.len() as u32;
 
     let step = StepNode::new(order, req.description, req.verification);
@@ -1196,7 +1193,11 @@ pub async fn get_task_steps(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
 ) -> Result<Json<Vec<StepNode>>, AppError> {
-    let steps = state.orchestrator.neo4j().get_task_steps(task_id).await?;
+    let steps = state
+        .orchestrator
+        .indentiagraph()
+        .get_task_steps(task_id)
+        .await?;
     Ok(Json(steps))
 }
 
@@ -1207,7 +1208,7 @@ pub async fn get_step(
 ) -> Result<Json<StepNode>, AppError> {
     let step = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_step(step_id)
         .await?
         .ok_or(AppError::NotFound("Step not found".into()))?;
@@ -1254,7 +1255,7 @@ pub async fn get_step_progress(
 ) -> Result<Json<StepProgressResponse>, AppError> {
     let (completed, total) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_task_step_progress(task_id)
         .await?;
 
@@ -1298,7 +1299,7 @@ pub async fn get_plan_constraints(
 ) -> Result<Json<Vec<ConstraintNode>>, AppError> {
     let constraints = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_plan_constraints(plan_id)
         .await?;
     Ok(Json(constraints))
@@ -1311,7 +1312,7 @@ pub async fn get_constraint(
 ) -> Result<Json<ConstraintNode>, AppError> {
     let constraint = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_constraint(constraint_id)
         .await?
         .ok_or(AppError::NotFound("Constraint not found".into()))?;
@@ -1322,7 +1323,7 @@ pub async fn get_constraint(
 #[derive(Deserialize)]
 pub struct UpdateConstraintRequest {
     pub description: Option<String>,
-    pub constraint_type: Option<crate::neo4j::models::ConstraintType>,
+    pub constraint_type: Option<crate::indentiagraph::models::ConstraintType>,
     pub enforced_by: Option<String>,
 }
 
@@ -1354,7 +1355,7 @@ pub async fn delete_constraint(
 }
 
 // ============================================================================
-// Meilisearch maintenance
+// Search and graph maintenance
 // ============================================================================
 
 /// Response for cleanup operations
@@ -1364,48 +1365,13 @@ pub struct CleanupResponse {
     pub message: String,
 }
 
-/// Response for index stats
-#[derive(Serialize)]
-pub struct MeiliStatsResponse {
-    pub code_documents: usize,
-    pub is_indexing: bool,
-}
-
-/// Delete orphan documents from Meilisearch (documents without project_id)
-pub async fn delete_meilisearch_orphans(
-    State(state): State<OrchestratorState>,
-) -> Result<Json<CleanupResponse>, AppError> {
-    state
-        .orchestrator
-        .meili()
-        .delete_orphan_code_documents()
-        .await?;
-
-    Ok(Json(CleanupResponse {
-        success: true,
-        message: "Orphan documents deleted".to_string(),
-    }))
-}
-
-/// Get Meilisearch code index statistics
-pub async fn get_meilisearch_stats(
-    State(state): State<OrchestratorState>,
-) -> Result<Json<MeiliStatsResponse>, AppError> {
-    let stats = state.orchestrator.meili().get_code_stats().await?;
-
-    Ok(Json(MeiliStatsResponse {
-        code_documents: stats.total_documents,
-        is_indexing: stats.is_indexing,
-    }))
-}
-
 /// POST /api/admin/cleanup-cross-project-calls — Remove spurious CALLS relationships between different projects
 pub async fn cleanup_cross_project_calls(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let deleted = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .cleanup_cross_project_calls()
         .await?;
     Ok(Json(serde_json::json!({ "deleted_count": deleted })))
@@ -1415,7 +1381,11 @@ pub async fn cleanup_cross_project_calls(
 pub async fn cleanup_builtin_calls(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let deleted = state.orchestrator.neo4j().cleanup_builtin_calls().await?;
+    let deleted = state
+        .orchestrator
+        .indentiagraph()
+        .cleanup_builtin_calls()
+        .await?;
     Ok(Json(serde_json::json!({ "deleted_count": deleted })))
 }
 
@@ -1425,24 +1395,24 @@ pub async fn migrate_calls_confidence(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let updated = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .migrate_calls_confidence()
         .await?;
     Ok(Json(serde_json::json!({ "updated_count": updated })))
 }
 
-/// POST /api/admin/cleanup-sync-data — Delete all sync data (File/Function/Struct nodes) and Meilisearch code index
+/// POST /api/admin/cleanup-sync-data — Delete all sync data (File/Function/Struct nodes)
 pub async fn cleanup_sync_data(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let deleted = state.orchestrator.neo4j().cleanup_sync_data().await?;
-    // Also clean ALL Meilisearch code documents to avoid stale/duplicate entries
-    if let Err(e) = state.orchestrator.meili().delete_all_code().await {
-        tracing::warn!("Failed to clean Meilisearch code index: {}", e);
-    }
+    let deleted = state
+        .orchestrator
+        .indentiagraph()
+        .cleanup_sync_data()
+        .await?;
     Ok(Json(serde_json::json!({
         "deleted_count": deleted,
-        "message": "Sync data and Meilisearch code index cleaned. Run sync_project to rebuild."
+        "message": "Sync data cleaned. Run sync_project to rebuild."
     })))
 }
 
@@ -1461,9 +1431,9 @@ pub struct CreateCommitRequest {
     /// Accepts either simple strings `["a.rs"]` or objects `[{"path": "a.rs", "additions": 10}]`.
     #[serde(
         default,
-        deserialize_with = "crate::neo4j::models::deserialize_files_changed"
+        deserialize_with = "crate::indentiagraph::models::deserialize_files_changed"
     )]
-    pub files_changed: Option<Vec<crate::neo4j::models::FileChangedInfo>>,
+    pub files_changed: Option<Vec<crate::indentiagraph::models::FileChangedInfo>>,
     /// Project UUID (enables incremental sync + analytics)
     pub project_id: Option<String>,
 }
@@ -1503,12 +1473,12 @@ pub async fn create_commit(
 
     let sync_triggered = !files_changed.is_empty() && project_id.is_some();
 
-    // Resolve project to get root_path (for path resolution) and slug (for MeiliSearch).
-    // File nodes in Neo4j use absolute paths, so TOUCHES relations require absolute paths.
+    // Resolve project to get root_path (for path resolution) and slug (for search filters).
+    // File nodes in IndentiaGraph use absolute paths, so TOUCHES relations require absolute paths.
     let project_info = if let Some(pid) = project_id {
         state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_project(pid)
             .await
             .ok()
@@ -1522,7 +1492,7 @@ pub async fn create_commit(
     let project_slug = project_info.as_ref().map(|p| p.slug.clone());
 
     // Resolve relative paths to absolute using project root_path
-    let files_changed: Vec<crate::neo4j::models::FileChangedInfo> = files_changed
+    let files_changed: Vec<crate::indentiagraph::models::FileChangedInfo> = files_changed
         .into_iter()
         .map(|mut f| {
             if let Some(ref root) = project_root {
@@ -1540,7 +1510,7 @@ pub async fn create_commit(
         let commit_hash = commit.hash.clone();
         if let Err(e) = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .create_commit_touches(&commit_hash, &files_changed)
             .await
         {
@@ -1564,7 +1534,7 @@ pub async fn create_commit(
         let pid_str = pid.to_string();
         tokio::spawn(async move {
             if let Err(e) = orch_invalidate
-                .neo4j()
+                .indentiagraph()
                 .invalidate_context_cards(&paths_for_invalidate, &pid_str)
                 .await
             {
@@ -1589,14 +1559,18 @@ pub async fn create_commit(
                     }
                 }
             }
-            if let Err(e) = orch2.neo4j().update_project_synced(pid).await {
+            if let Err(e) = orch2.indentiagraph().update_project_synced(pid).await {
                 tracing::warn!("Failed to update last_synced: {}", e);
             }
             orch2.analytics_debouncer().trigger(pid);
             orch2.co_change_debouncer().trigger(pid);
 
             // Auto-anchor notes to newly synced files
-            match crate::skills::activation::auto_anchor_notes_for_project(orch2.neo4j(), pid).await
+            match crate::skills::activation::auto_anchor_notes_for_project(
+                orch2.indentiagraph(),
+                pid,
+            )
+            .await
             {
                 Ok(r) if r.anchors_created > 0 => {
                     tracing::info!(
@@ -1657,7 +1631,11 @@ pub async fn get_task_commits(
     State(state): State<OrchestratorState>,
     Path(task_id): Path<Uuid>,
 ) -> Result<Json<Vec<CommitNode>>, AppError> {
-    let commits = state.orchestrator.neo4j().get_task_commits(task_id).await?;
+    let commits = state
+        .orchestrator
+        .indentiagraph()
+        .get_task_commits(task_id)
+        .await?;
     Ok(Json(commits))
 }
 
@@ -1679,7 +1657,11 @@ pub async fn get_plan_commits(
     State(state): State<OrchestratorState>,
     Path(plan_id): Path<Uuid>,
 ) -> Result<Json<Vec<CommitNode>>, AppError> {
-    let commits = state.orchestrator.neo4j().get_plan_commits(plan_id).await?;
+    let commits = state
+        .orchestrator
+        .indentiagraph()
+        .get_plan_commits(plan_id)
+        .await?;
     Ok(Json(commits))
 }
 
@@ -1691,10 +1673,10 @@ pub async fn get_plan_commits(
 pub async fn get_commit_files(
     State(state): State<OrchestratorState>,
     Path(commit_sha): Path<String>,
-) -> Result<Json<Vec<crate::neo4j::models::CommitFileInfo>>, AppError> {
+) -> Result<Json<Vec<crate::indentiagraph::models::CommitFileInfo>>, AppError> {
     let files = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_commit_files(&commit_sha)
         .await?;
     Ok(Json(files))
@@ -1711,10 +1693,10 @@ pub struct FileHistoryQuery {
 pub async fn get_file_history(
     State(state): State<OrchestratorState>,
     Query(query): Query<FileHistoryQuery>,
-) -> Result<Json<Vec<crate::neo4j::models::FileHistoryEntry>>, AppError> {
+) -> Result<Json<Vec<crate::indentiagraph::models::FileHistoryEntry>>, AppError> {
     let history = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_file_history(&query.path, query.limit)
         .await?;
     Ok(Json(history))
@@ -1732,10 +1714,10 @@ pub async fn get_co_change_graph(
     State(state): State<OrchestratorState>,
     Path(project_id): Path<Uuid>,
     Query(query): Query<CoChangeGraphQuery>,
-) -> Result<Json<Vec<crate::neo4j::models::CoChangePair>>, AppError> {
+) -> Result<Json<Vec<crate::indentiagraph::models::CoChangePair>>, AppError> {
     let pairs = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_co_change_graph(
             project_id,
             query.min_count.unwrap_or(3),
@@ -1757,10 +1739,10 @@ pub struct FileCoChangersQuery {
 pub async fn get_file_co_changers(
     State(state): State<OrchestratorState>,
     Query(query): Query<FileCoChangersQuery>,
-) -> Result<Json<Vec<crate::neo4j::models::CoChanger>>, AppError> {
+) -> Result<Json<Vec<crate::indentiagraph::models::CoChanger>>, AppError> {
     let changers = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_file_co_changers(
             &query.path,
             query.min_count.unwrap_or(3),
@@ -1778,7 +1760,7 @@ pub async fn backfill_commit_touches(
     // Resolve project
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project_by_slug(&project_slug)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_slug)))?;
@@ -1792,10 +1774,10 @@ pub async fn backfill_commit_touches(
     Ok(Json(result))
 }
 
-/// POST /api/admin/reindex-decisions — Reindex all decisions from Neo4j into MeiliSearch.
+/// POST /api/admin/reindex-decisions — Reindex all decisions for BM25 decision search.
 ///
-/// Reads all Decision nodes from Neo4j and upserts them into MeiliSearch.
-/// Useful after MeiliSearch data loss or rebuild.
+/// Reads all Decision nodes and refreshes their indexable metadata.
+/// Useful after search data loss or rebuild.
 pub async fn reindex_decisions(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1829,7 +1811,7 @@ pub async fn backfill_decision_embeddings(
     })))
 }
 
-/// POST /api/admin/backfill-decision-project-slugs — Backfill project_slug on DecisionDocuments in Meilisearch
+/// POST /api/admin/backfill-decision-project-slugs — Backfill project_slug on indexed decisions
 pub async fn backfill_decision_project_slugs(
     State(state): State<OrchestratorState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -1851,7 +1833,7 @@ pub async fn backfill_discussed(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let (sessions, entities, relations) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .backfill_discussed()
         .await
         .map_err(AppError::Internal)?;
@@ -1887,7 +1869,7 @@ pub async fn update_fabric_scores(
     // Verify project exists
     let _project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project(project_id)
         .await
         .map_err(AppError::Internal)?
@@ -1925,7 +1907,7 @@ pub async fn update_fabric_scores(
     }
 
     // Also compute churn, knowledge_density, and risk scores
-    let neo = state.orchestrator.neo4j();
+    let neo = state.orchestrator.indentiagraph();
     let churn = neo
         .compute_churn_scores(project_id)
         .await
@@ -1973,7 +1955,7 @@ pub async fn bootstrap_knowledge_fabric(
     // Verify project exists
     let project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project(project_id)
         .await
         .map_err(AppError::Internal)?
@@ -2002,7 +1984,7 @@ pub async fn bootstrap_knowledge_fabric(
         })),
     }
 
-    // Step 2: Reindex decisions from Neo4j into MeiliSearch
+    // Step 2: Reindex decisions for search
     match state.orchestrator.plan_manager().reindex_decisions().await {
         Ok((total, indexed)) => completed.push(serde_json::json!({
             "step": "reindex_decisions",
@@ -2033,7 +2015,7 @@ pub async fn bootstrap_knowledge_fabric(
         })),
     }
 
-    // Step 2c: Backfill decision project_slugs in Meilisearch
+    // Step 2c: Backfill decision project_slugs in indexed search data
     match state
         .orchestrator
         .plan_manager()
@@ -2052,7 +2034,12 @@ pub async fn bootstrap_knowledge_fabric(
     }
 
     // Step 3: Backfill DISCUSSED relations
-    match state.orchestrator.neo4j().backfill_discussed().await {
+    match state
+        .orchestrator
+        .indentiagraph()
+        .backfill_discussed()
+        .await
+    {
         Ok((sessions, entities, relations)) => completed.push(serde_json::json!({
             "step": "backfill_discussed",
             "sessions_processed": sessions,
@@ -2093,7 +2080,7 @@ pub async fn bootstrap_knowledge_fabric(
     }
 
     // Step 5: Compute churn, knowledge density, and risk scores
-    let neo = state.orchestrator.neo4j();
+    let neo = state.orchestrator.indentiagraph();
     if let Ok(churn) = neo.compute_churn_scores(project_id).await {
         let count = churn.len();
         let _ = neo.batch_update_churn_scores(&churn).await;
@@ -2134,16 +2121,16 @@ pub async fn reinforce_isomorphic_synapses(
     // Verify project exists
     let _project = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project(project_id)
         .await
         .map_err(AppError::Internal)?
         .ok_or_else(|| AppError::NotFound(format!("Project not found: {}", project_id)))?;
 
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
 
     // Find isomorphic groups (files sharing same WL hash)
-    let groups = neo4j
+    let groups = indentiagraph
         .find_isomorphic_groups(&project_id.to_string(), 2)
         .await
         .map_err(AppError::Internal)?;
@@ -2157,7 +2144,10 @@ pub async fn reinforce_isomorphic_synapses(
         let mut note_ids: Vec<uuid::Uuid> = Vec::new();
         let entity_type = crate::notes::models::EntityType::File;
         for file_path in &group.members {
-            if let Ok(notes) = neo4j.get_notes_for_entity(&entity_type, file_path).await {
+            if let Ok(notes) = indentiagraph
+                .get_notes_for_entity(&entity_type, file_path)
+                .await
+            {
                 for note in notes {
                     if !note_ids.contains(&note.id) {
                         note_ids.push(note.id);
@@ -2170,10 +2160,13 @@ pub async fn reinforce_isomorphic_synapses(
         if note_ids.len() >= 2 {
             // Boost energy for each note
             for nid in &note_ids {
-                let _ = neo4j.boost_energy(*nid, 0.1).await;
+                let _ = indentiagraph.boost_energy(*nid, 0.1).await;
             }
             // Reinforce synapses between all note pairs
-            match neo4j.reinforce_synapses(&note_ids, synapse_boost).await {
+            match indentiagraph
+                .reinforce_synapses(&note_ids, synapse_boost)
+                .await
+            {
                 Ok(count) => {
                     total_synapses_reinforced += count as u64;
                     total_groups += 1;
@@ -2221,7 +2214,7 @@ pub async fn detect_skills(
     // Verify project exists
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project(project_id)
         .await
         .map_err(AppError::Internal)?
@@ -2231,12 +2224,16 @@ pub async fn detect_skills(
     if body.force {
         let existing_skills = state
             .orchestrator
-            .neo4j()
+            .indentiagraph()
             .get_skills_for_project(project_id)
             .await
             .map_err(AppError::Internal)?;
         for skill in &existing_skills {
-            let _ = state.orchestrator.neo4j().delete_skill(skill.id).await;
+            let _ = state
+                .orchestrator
+                .indentiagraph()
+                .delete_skill(skill.id)
+                .await;
         }
         tracing::info!(
             %project_id,
@@ -2249,10 +2246,13 @@ pub async fn detect_skills(
     let config = crate::skills::SkillDetectionConfig::default();
     let start = std::time::Instant::now();
 
-    let result =
-        crate::skills::detect_skills_pipeline(state.orchestrator.neo4j(), project_id, &config)
-            .await
-            .map_err(AppError::Internal)?;
+    let result = crate::skills::detect_skills_pipeline(
+        state.orchestrator.indentiagraph(),
+        project_id,
+        &config,
+    )
+    .await
+    .map_err(AppError::Internal)?;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
@@ -2293,7 +2293,7 @@ pub async fn auto_anchor_notes(
     // Verify project exists
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project(project_id)
         .await
         .map_err(AppError::Internal)?
@@ -2302,7 +2302,7 @@ pub async fn auto_anchor_notes(
     let start = std::time::Instant::now();
 
     let result = crate::skills::activation::auto_anchor_notes_for_project(
-        state.orchestrator.neo4j(),
+        state.orchestrator.indentiagraph(),
         project_id,
     )
     .await
@@ -2344,7 +2344,7 @@ pub async fn skill_maintenance(
     // Verify project exists
     state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_project(project_id)
         .await
         .map_err(AppError::Internal)?
@@ -2356,7 +2356,7 @@ pub async fn skill_maintenance(
     let result = match body.level.as_str() {
         "hourly" => {
             crate::skills::maintenance::run_hourly_maintenance(
-                state.orchestrator.neo4j(),
+                state.orchestrator.indentiagraph(),
                 project_id,
                 &config,
             )
@@ -2364,7 +2364,7 @@ pub async fn skill_maintenance(
         }
         "daily" => {
             crate::skills::maintenance::run_daily_maintenance(
-                state.orchestrator.neo4j(),
+                state.orchestrator.indentiagraph(),
                 project_id,
                 &config,
             )
@@ -2372,7 +2372,7 @@ pub async fn skill_maintenance(
         }
         "weekly" => {
             crate::skills::maintenance::run_weekly_maintenance(
-                state.orchestrator.neo4j(),
+                state.orchestrator.indentiagraph(),
                 project_id,
                 &config,
             )
@@ -2380,7 +2380,7 @@ pub async fn skill_maintenance(
         }
         "full" => {
             crate::skills::maintenance::run_full_maintenance(
-                state.orchestrator.neo4j(),
+                state.orchestrator.indentiagraph(),
                 project_id,
                 &config,
             )
@@ -2468,7 +2468,7 @@ pub async fn list_releases(
 
     let (releases, total) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_releases_filtered(
             project_id,
             query.status_filter.to_vec(),
@@ -2591,7 +2591,7 @@ pub async fn get_release(
 ) -> Result<Json<ReleaseDetailsResponse>, AppError> {
     let details = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_release_details(release_id)
         .await?
         .ok_or(AppError::NotFound("Release not found".into()))?;
@@ -2655,7 +2655,7 @@ pub async fn list_milestones(
 
     let (milestones, total) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .list_milestones_filtered(
             project_id,
             query.status_filter.to_vec(),
@@ -2786,18 +2786,18 @@ pub async fn get_milestone(
     Path(milestone_id): Path<Uuid>,
     Query(query): Query<MilestoneGetQuery>,
 ) -> Result<Json<MilestoneDetailsResponse>, AppError> {
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
     let include_tasks = query.include_tasks.unwrap_or(true);
 
     // Fetch milestone node — use lightweight query when flat tasks are not needed
     let (milestone, flat_tasks) = if include_tasks {
-        let (m, tasks) = neo4j
+        let (m, tasks) = indentiagraph
             .get_milestone_details(milestone_id)
             .await?
             .ok_or(AppError::NotFound("Milestone not found".into()))?;
         (m, tasks)
     } else {
-        let m = neo4j
+        let m = indentiagraph
             .get_milestone(milestone_id)
             .await?
             .ok_or(AppError::NotFound("Milestone not found".into()))?;
@@ -2805,10 +2805,12 @@ pub async fn get_milestone(
     };
 
     // Always load plans → tasks → steps hierarchy
-    let tasks_with_plan = neo4j.get_milestone_tasks_with_plans(milestone_id).await?;
+    let tasks_with_plan = indentiagraph
+        .get_milestone_tasks_with_plans(milestone_id)
+        .await?;
 
     let (total, completed, in_progress, pending) =
-        neo4j.get_milestone_progress(milestone_id).await?;
+        indentiagraph.get_milestone_progress(milestone_id).await?;
 
     let percentage = if total > 0 {
         (completed as f64 / total as f64) * 100.0
@@ -2816,7 +2818,9 @@ pub async fn get_milestone(
         0.0
     };
 
-    let mut steps_map = neo4j.get_milestone_steps_batch(milestone_id).await?;
+    let mut steps_map = indentiagraph
+        .get_milestone_steps_batch(milestone_id)
+        .await?;
 
     let mut plan_order: Vec<Uuid> = Vec::new();
     let mut plan_map: std::collections::HashMap<
@@ -2909,7 +2913,7 @@ pub async fn get_milestone_progress(
 ) -> Result<Json<MilestoneProgressResponse>, AppError> {
     let (total, completed, in_progress, pending) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_milestone_progress(milestone_id)
         .await?;
 
@@ -2972,7 +2976,7 @@ pub async fn get_task_blockers(
 ) -> Result<Json<Vec<TaskNode>>, AppError> {
     let blockers = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_task_blockers(task_id)
         .await?;
     Ok(Json(blockers))
@@ -2985,7 +2989,7 @@ pub async fn get_tasks_blocked_by(
 ) -> Result<Json<Vec<TaskNode>>, AppError> {
     let blocked = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_tasks_blocked_by(task_id)
         .await?;
     Ok(Json(blocked))
@@ -3022,7 +3026,7 @@ pub async fn get_plan_dependency_graph(
 ) -> Result<Json<DependencyGraphResponse>, AppError> {
     let (tasks, edges) = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_plan_dependency_graph(plan_id)
         .await?;
 
@@ -3059,7 +3063,7 @@ pub async fn get_plan_critical_path(
 ) -> Result<Json<CriticalPathResponse>, AppError> {
     let tasks = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_plan_critical_path(plan_id)
         .await?;
 
@@ -3111,14 +3115,15 @@ pub async fn get_project_roadmap(
     State(state): State<OrchestratorState>,
     Path(project_id): Path<Uuid>,
 ) -> Result<Json<RoadmapResponse>, AppError> {
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
 
     // Get milestones with their tasks and progress
-    let milestone_nodes = neo4j.list_project_milestones(project_id).await?;
+    let milestone_nodes = indentiagraph.list_project_milestones(project_id).await?;
     let mut milestones = Vec::new();
     for m in milestone_nodes {
-        let tasks = neo4j.get_milestone_tasks(m.id).await?;
-        let (total, completed, in_progress, pending) = neo4j.get_milestone_progress(m.id).await?;
+        let tasks = indentiagraph.get_milestone_tasks(m.id).await?;
+        let (total, completed, in_progress, pending) =
+            indentiagraph.get_milestone_progress(m.id).await?;
         let percentage = if total > 0 {
             (completed as f64 / total as f64) * 100.0
         } else {
@@ -3138,10 +3143,10 @@ pub async fn get_project_roadmap(
     }
 
     // Get releases with their tasks and commits
-    let release_nodes = neo4j.list_project_releases(project_id).await?;
+    let release_nodes = indentiagraph.list_project_releases(project_id).await?;
     let mut releases = Vec::new();
     for r in release_nodes {
-        let details = neo4j.get_release_details(r.id).await?;
+        let details = indentiagraph.get_release_details(r.id).await?;
         if let Some((release, tasks, commits)) = details {
             releases.push(RoadmapRelease {
                 release,
@@ -3152,7 +3157,8 @@ pub async fn get_project_roadmap(
     }
 
     // Get project progress
-    let (total, completed, in_progress, pending) = neo4j.get_project_progress(project_id).await?;
+    let (total, completed, in_progress, pending) =
+        indentiagraph.get_project_progress(project_id).await?;
     let percentage = if total > 0 {
         (completed as f32 / total as f32) * 100.0
     } else {
@@ -3167,8 +3173,10 @@ pub async fn get_project_roadmap(
     };
 
     // Get dependency graph for all tasks in the project
-    let all_tasks = neo4j.get_project_tasks(project_id).await?;
-    let edges = neo4j.get_project_task_dependencies(project_id).await?;
+    let all_tasks = indentiagraph.get_project_tasks(project_id).await?;
+    let edges = indentiagraph
+        .get_project_task_dependencies(project_id)
+        .await?;
 
     let nodes: Vec<DependencyGraphNode> = all_tasks
         .into_iter()
@@ -3273,7 +3281,7 @@ mod tests {
         let req: UpdateConstraintRequest = serde_json::from_str(json).unwrap();
         assert_eq!(
             req.constraint_type,
-            Some(crate::neo4j::models::ConstraintType::Performance)
+            Some(crate::indentiagraph::models::ConstraintType::Performance)
         );
         assert_eq!(req.description, Some("Must be fast".to_string()));
         assert_eq!(req.enforced_by, None);
@@ -3381,7 +3389,7 @@ mod tests {
     // ================================================================
 
     use crate::api::routes::create_router;
-    use crate::neo4j::models::MilestoneStatus;
+    use crate::indentiagraph::models::MilestoneStatus;
     use crate::orchestrator::{FileWatcher, Orchestrator};
     use crate::test_helpers::{
         mock_app_state, test_bearer_token, test_milestone, test_plan, test_project, test_step,
@@ -3408,28 +3416,44 @@ mod tests {
 
         // Create a project
         let project = test_project();
-        app_state.neo4j.create_project(&project).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_project(&project)
+            .await
+            .unwrap();
 
         // Create a project milestone
         let milestone = test_milestone(project.id, "Q1 Release");
-        app_state.neo4j.create_milestone(&milestone).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_milestone(&milestone)
+            .await
+            .unwrap();
 
         // Create a plan linked to project
         let plan = test_plan();
-        app_state.neo4j.create_plan(&plan).await.unwrap();
+        app_state.indentiagraph.create_plan(&plan).await.unwrap();
 
         // Create two tasks and link them to the milestone
         let task1 = test_task_titled("Backend API");
         let task2 = test_task_titled("Frontend UI");
-        app_state.neo4j.create_task(plan.id, &task1).await.unwrap();
-        app_state.neo4j.create_task(plan.id, &task2).await.unwrap();
         app_state
-            .neo4j
+            .indentiagraph
+            .create_task(plan.id, &task1)
+            .await
+            .unwrap();
+        app_state
+            .indentiagraph
+            .create_task(plan.id, &task2)
+            .await
+            .unwrap();
+        app_state
+            .indentiagraph
             .add_task_to_milestone(milestone.id, task1.id)
             .await
             .unwrap();
         app_state
-            .neo4j
+            .indentiagraph
             .add_task_to_milestone(milestone.id, task2.id)
             .await
             .unwrap();
@@ -3437,8 +3461,16 @@ mod tests {
         // Add steps to task1
         let step1 = test_step(0, "Create endpoint");
         let step2 = test_step(1, "Add tests");
-        app_state.neo4j.create_step(task1.id, &step1).await.unwrap();
-        app_state.neo4j.create_step(task1.id, &step2).await.unwrap();
+        app_state
+            .indentiagraph
+            .create_step(task1.id, &step1)
+            .await
+            .unwrap();
+        app_state
+            .indentiagraph
+            .create_step(task1.id, &step2)
+            .await
+            .unwrap();
 
         let orchestrator = Arc::new(Orchestrator::new(app_state).await.unwrap());
         let watcher = Arc::new(tokio::sync::RwLock::new(FileWatcher::new(

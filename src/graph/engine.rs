@@ -3,13 +3,13 @@
 //! The `AnalyticsEngine` trait is the single entry point for all analytics
 //! consumers (sync pipeline, MCP handlers). It encapsulates:
 //!
-//! 1. **Extraction**: Neo4j → petgraph via `GraphExtractor`
+//! 1. **Extraction**: IndentiaGraph → petgraph via `GraphExtractor`
 //! 2. **Computation**: PageRank, Betweenness, Louvain, Clustering, WCC
-//! 3. **Persistence**: Write scores back to Neo4j via `AnalyticsWriter`
+//! 3. **Persistence**: Write scores back to IndentiaGraph via `AnalyticsWriter`
 //!
 //! The trait also enables mocking in downstream consumer tests.
 
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::GraphStore;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -57,12 +57,12 @@ pub struct ProjectAnalytics {
 pub trait AnalyticsEngine: Send + Sync {
     /// Compute and persist analytics for a project's file import graph.
     ///
-    /// Pipeline: extract file graph → compute_all → write scores to Neo4j → return analytics.
+    /// Pipeline: extract file graph → compute_all → write scores to IndentiaGraph → return analytics.
     async fn analyze_file_graph(&self, project_id: Uuid) -> Result<GraphAnalytics>;
 
     /// Compute and persist analytics for a project's function call graph.
     ///
-    /// Pipeline: extract function graph → compute_all → write scores to Neo4j → return analytics.
+    /// Pipeline: extract function graph → compute_all → write scores to IndentiaGraph → return analytics.
     async fn analyze_function_graph(&self, project_id: Uuid) -> Result<GraphAnalytics>;
 
     /// Full analysis: compute both file and function graphs, persist scores.
@@ -76,7 +76,7 @@ pub trait AnalyticsEngine: Send + Sync {
     /// into a single weighted graph. Produces `fabric_pagerank`, `fabric_betweenness`,
     /// and `fabric_community_id` scores that reflect both structural AND temporal coupling.
     ///
-    /// Pipeline: extract fabric graph → compute_all → write scores to Neo4j → return analytics.
+    /// Pipeline: extract fabric graph → compute_all → write scores to IndentiaGraph → return analytics.
     async fn analyze_fabric_graph(
         &self,
         project_id: Uuid,
@@ -343,7 +343,7 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
         project_id: Uuid,
     ) -> Result<Vec<crate::graph::process::Process>> {
         use crate::graph::process::{self, ProcessConfig};
-        use crate::neo4j::models::ProcessNode;
+        use crate::indentiagraph::models::ProcessNode;
 
         // 1. Extract function CALLS graph
         let graph = self.extractor.extract_function_graph(project_id).await?;
@@ -419,8 +419,8 @@ impl AnalyticsEngine for GraphAnalyticsEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::models::{FileNode, FunctionNode, Visibility};
+    use crate::indentiagraph::mock::MockGraphStore;
+    use crate::indentiagraph::models::{FileNode, FunctionNode, Visibility};
     use crate::test_helpers::test_project;
 
     /// Seed a project with files forming two clusters connected by one edge.

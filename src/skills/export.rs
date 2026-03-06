@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use uuid::Uuid;
 
-use crate::neo4j::traits::GraphStore;
+use crate::indentiagraph::traits::GraphStore;
 use crate::skills::package::{
     PackageMetadata, PackageStats, PortableDecision, PortableNote, PortableSkill, SkillPackage,
     CURRENT_SCHEMA_VERSION, FORMAT_ID,
@@ -101,7 +101,7 @@ pub async fn export_skill(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::mock::MockGraphStore;
+    use crate::indentiagraph::mock::MockGraphStore;
 
     #[tokio::test]
     async fn test_export_skill_basic() {
@@ -131,7 +131,7 @@ mod tests {
             importance: crate::notes::models::NoteImportance::High,
             scope: crate::notes::models::NoteScope::Project,
             content: "Always use UNWIND for batches".to_string(),
-            tags: vec!["neo4j".to_string()],
+            tags: vec!["indentiagraph".to_string()],
             anchors: vec![],
             created_at: Utc::now(),
             created_by: "test".to_string(),
@@ -145,6 +145,8 @@ mod tests {
             changes: vec![],
             assertion_rule: None,
             last_assertion_result: None,
+            valid_at: None,
+            invalid_at: None,
         };
         store
             .add_skill_member(skill_id, "note", note1.id)

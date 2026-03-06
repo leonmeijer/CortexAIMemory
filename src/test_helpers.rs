@@ -4,9 +4,8 @@
 //! and helpers for building mock AppState / Orchestrator / ToolHandler instances.
 #![allow(dead_code)]
 
-use crate::meilisearch::mock::MockSearchStore;
-use crate::neo4j::mock::MockGraphStore;
-use crate::neo4j::models::*;
+use crate::indentiagraph::mock::MockGraphStore;
+use crate::indentiagraph::models::*;
 use crate::notes::{Note, NoteImportance, NoteScope, NoteType};
 use crate::plan::models::*;
 use crate::{AppState, AuthConfig};
@@ -20,16 +19,15 @@ use uuid::Uuid;
 /// Create a mock AppState with empty in-memory backends
 pub fn mock_app_state() -> AppState {
     AppState {
-        neo4j: Arc::new(MockGraphStore::new()),
-        meili: Arc::new(MockSearchStore::new()),
+        indentiagraph: Arc::new(MockGraphStore::new()),
         parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
         config: Arc::new(crate::Config {
             setup_completed: true,
-            neo4j_uri: "bolt://mock:7687".to_string(),
-            neo4j_user: "neo4j".to_string(),
-            neo4j_password: "mock".to_string(),
-            meilisearch_url: "http://mock:7700".to_string(),
-            meilisearch_key: "mock-key".to_string(),
+            indentiagraph_uri: "ws://mock:8000".to_string(),
+            indentiagraph_user: "indentiagraph".to_string(),
+            indentiagraph_password: "mock".to_string(),
+            surreal_namespace: "test".to_string(),
+            surreal_database: "test".to_string(),
             nats_url: None,
             workspace_path: ".".to_string(),
             server_port: 0,
@@ -58,19 +56,18 @@ pub fn mock_app_state() -> AppState {
     }
 }
 
-/// Create a mock AppState with pre-seeded backends
-pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> AppState {
+/// Create a mock AppState with pre-seeded graph backend
+pub fn mock_app_state_with(graph: MockGraphStore) -> AppState {
     AppState {
-        neo4j: Arc::new(graph),
-        meili: Arc::new(search),
+        indentiagraph: Arc::new(graph),
         parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
         config: Arc::new(crate::Config {
             setup_completed: true,
-            neo4j_uri: "bolt://mock:7687".to_string(),
-            neo4j_user: "neo4j".to_string(),
-            neo4j_password: "mock".to_string(),
-            meilisearch_url: "http://mock:7700".to_string(),
-            meilisearch_key: "mock-key".to_string(),
+            indentiagraph_uri: "ws://mock:8000".to_string(),
+            indentiagraph_user: "indentiagraph".to_string(),
+            indentiagraph_password: "mock".to_string(),
+            surreal_namespace: "test".to_string(),
+            surreal_database: "test".to_string(),
             nats_url: None,
             workspace_path: ".".to_string(),
             server_port: 0,
@@ -102,16 +99,15 @@ pub fn mock_app_state_with(graph: MockGraphStore, search: MockSearchStore) -> Ap
 /// Create a mock AppState with a shared Arc<MockGraphStore> (allows direct access in tests)
 pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
     AppState {
-        neo4j: graph,
-        meili: Arc::new(MockSearchStore::new()),
+        indentiagraph: graph,
         parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
         config: Arc::new(crate::Config {
             setup_completed: true,
-            neo4j_uri: "bolt://mock:7687".to_string(),
-            neo4j_user: "neo4j".to_string(),
-            neo4j_password: "mock".to_string(),
-            meilisearch_url: "http://mock:7700".to_string(),
-            meilisearch_key: "mock-key".to_string(),
+            indentiagraph_uri: "ws://mock:8000".to_string(),
+            indentiagraph_user: "indentiagraph".to_string(),
+            indentiagraph_password: "mock".to_string(),
+            surreal_namespace: "test".to_string(),
+            surreal_database: "test".to_string(),
             nats_url: None,
             workspace_path: ".".to_string(),
             server_port: 0,
@@ -140,24 +136,21 @@ pub fn mock_app_state_with_graph(graph: Arc<MockGraphStore>) -> AppState {
     }
 }
 
-/// Create a mock AppState with shared access to BOTH graph and search stores.
+/// Create a mock AppState with shared access to the graph store.
 ///
-/// Returns (AppState, Arc<MockGraphStore>, Arc<MockSearchStore>) so tests can
-/// inspect both stores after operations.
-pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockSearchStore>) {
+/// Returns (AppState, Arc<MockGraphStore>) so tests can inspect the store after operations.
+pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>) {
     let graph = Arc::new(MockGraphStore::new());
-    let meili = Arc::new(MockSearchStore::new());
     let state = AppState {
-        neo4j: graph.clone(),
-        meili: meili.clone(),
+        indentiagraph: graph.clone(),
         parser: Arc::new(crate::parser::CodeParser::new().expect("parser init")),
         config: Arc::new(crate::Config {
             setup_completed: true,
-            neo4j_uri: "bolt://mock:7687".to_string(),
-            neo4j_user: "neo4j".to_string(),
-            neo4j_password: "mock".to_string(),
-            meilisearch_url: "http://mock:7700".to_string(),
-            meilisearch_key: "mock-key".to_string(),
+            indentiagraph_uri: "ws://mock:8000".to_string(),
+            indentiagraph_user: "indentiagraph".to_string(),
+            indentiagraph_password: "mock".to_string(),
+            surreal_namespace: "test".to_string(),
+            surreal_database: "test".to_string(),
             nats_url: None,
             workspace_path: ".".to_string(),
             server_port: 0,
@@ -184,7 +177,7 @@ pub fn mock_app_state_with_stores() -> (AppState, Arc<MockGraphStore>, Arc<MockS
             config_yaml_path: None,
         }),
     };
-    (state, graph, meili)
+    (state, graph)
 }
 
 /// Create a test AuthConfig suitable for integration tests.
@@ -419,7 +412,7 @@ pub fn test_user() -> UserNode {
         email: "test@ffs.holdings".to_string(),
         name: "Test User".to_string(),
         picture_url: Some("https://lh3.googleusercontent.com/test".to_string()),
-        auth_provider: crate::neo4j::models::AuthProvider::Oidc,
+        auth_provider: crate::indentiagraph::models::AuthProvider::Oidc,
         external_id: Some("google-id-123456".to_string()),
         password_hash: None,
         created_at: chrono::Utc::now(),
@@ -448,7 +441,7 @@ mod tests {
     #[test]
     fn test_mock_app_state_creation() {
         let state = mock_app_state();
-        assert_eq!(state.config.neo4j_uri, "bolt://mock:7687");
+        assert_eq!(state.config.indentiagraph_uri, "ws://mock:8000");
     }
 
     #[test]
@@ -472,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn test_mock_state_can_create_plan_manager() {
         let state = mock_app_state();
-        let pm = crate::plan::PlanManager::new(state.neo4j.clone(), state.meili.clone());
+        let pm = crate::plan::PlanManager::new(state.indentiagraph.clone());
 
         let plan = test_plan();
         let req = CreatePlanRequest {
@@ -490,11 +483,11 @@ mod tests {
     #[tokio::test]
     async fn test_mock_state_can_create_note_manager() {
         let state = mock_app_state();
-        let nm = crate::notes::NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let nm = crate::notes::NoteManager::new(state.indentiagraph.clone());
 
         let project = test_project();
         // Store project first so note_to_document can find it
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
 
         let req = crate::notes::CreateNoteRequest {
             project_id: Some(project.id),

@@ -7,9 +7,9 @@
 //! - `SkillActivationHook` (in-process hook callback for PreToolUse)
 //! - `GET /api/hooks/resolve-project` REST endpoint
 //!
-//! Results are cached for 5 minutes to avoid repeated Neo4j lookups.
+//! Results are cached for 5 minutes to avoid repeated IndentiaGraph lookups.
 
-use crate::neo4j::traits::GraphStore;
+use crate::indentiagraph::traits::GraphStore;
 use crate::skills::hook_extractor::extract_file_context;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -92,7 +92,7 @@ pub(crate) fn find_longest_prefix_match(
     })
 }
 
-/// Load project entries from Neo4j (or cache), expanding root_paths.
+/// Load project entries from IndentiaGraph (or cache), expanding root_paths.
 ///
 /// Returns the cached entries if still valid, otherwise fetches from graph_store
 /// and updates the cache.
@@ -117,7 +117,7 @@ pub(crate) async fn load_project_entries(
         }
     }
 
-    // Cache miss or expired — fetch all projects from Neo4j
+    // Cache miss or expired — fetch all projects from IndentiaGraph
     let projects = graph_store.list_projects().await?;
 
     let now = Instant::now();
@@ -169,7 +169,7 @@ pub(crate) async fn load_project_entries(
 ///
 /// # Arguments
 ///
-/// * `graph_store` - Access to Neo4j for project list (cached for 5 min)
+/// * `graph_store` - Access to IndentiaGraph for project list (cached for 5 min)
 /// * `tool_name` - Claude Code tool name (e.g., "Read", "Bash", "Grep")
 /// * `tool_input` - Raw JSON input of the tool call
 /// * `cwd` - Working directory of the Claude Code session

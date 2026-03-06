@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use super::engine::AnalyticsEngine;
-use crate::neo4j::traits::GraphStore;
+use crate::indentiagraph::traits::GraphStore;
 use std::sync::Arc;
 
 /// Debounced analytics trigger for incremental sync scenarios.

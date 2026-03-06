@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::neo4j::traits::GraphStore;
+use crate::indentiagraph::traits::GraphStore;
 use crate::skills::detection::SkillDetectionConfig;
 use crate::skills::evolution::{analyze_evolution, execute_evolution, EvolutionResult};
 use crate::skills::lifecycle::{update_skill_lifecycle, MetricsUpdateResult, SkillLifecycleConfig};
@@ -357,7 +357,7 @@ mod tests {
     // Async maintenance tests (MockGraphStore)
     // ================================================================
 
-    use crate::neo4j::mock::MockGraphStore;
+    use crate::indentiagraph::mock::MockGraphStore;
     use crate::skills::models::{SkillNode, SkillStatus};
     use chrono::Utc;
     use uuid::Uuid;

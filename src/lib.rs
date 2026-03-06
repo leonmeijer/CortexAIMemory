@@ -1,9 +1,9 @@
 #![recursion_limit = "256"]
-//! Project Orchestrator
+//! CortexAIMemory
 //!
-//! An AI agent orchestrator with:
-//! - Neo4j knowledge graph for code structure and relationships
-//! - Meilisearch for fast semantic search
+//! AI memory and orchestration with:
+//! - IndentiaGraph knowledge graph for code structure and relationships
+//! - SurrealDB native full-text and vector search
 //! - Tree-sitter for precise code parsing
 //! - Plan management for coordinated multi-agent development
 //! - MCP server for Claude Code integration
@@ -14,9 +14,8 @@ pub mod chat;
 pub mod embeddings;
 pub mod events;
 pub mod graph;
+pub mod indentiagraph;
 pub mod mcp;
-pub mod meilisearch;
-pub mod neo4j;
 pub mod neurons;
 pub mod notes;
 pub mod orchestrator;
@@ -67,8 +66,8 @@ pub struct YamlConfig {
     #[serde(default)]
     pub infra_mode: Option<String>,
     pub server: ServerYamlConfig,
-    pub neo4j: Neo4jYamlConfig,
-    pub meilisearch: MeilisearchYamlConfig,
+    #[serde(alias = "indentiagraph", alias = "surrealdb")]
+    pub indentiagraph: IndentiaGraphYamlConfig,
     pub nats: NatsYamlConfig,
     pub chat: ChatYamlConfig,
     pub embeddings: EmbeddingsYamlConfig,
@@ -108,38 +107,40 @@ impl Default for ServerYamlConfig {
     }
 }
 
-/// Neo4j configuration section
+/// IndentiaGraph configuration section
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct Neo4jYamlConfig {
+pub struct IndentiaGraphYamlConfig {
     pub uri: String,
     pub user: String,
     pub password: String,
+    #[serde(default = "default_surreal_namespace")]
+    pub namespace: String,
+    #[serde(default = "default_surreal_database")]
+    pub database: String,
 }
 
-impl Default for Neo4jYamlConfig {
+fn default_surreal_namespace() -> String {
+    "cortex".into()
+}
+
+fn default_surreal_database() -> String {
+    "memory".into()
+}
+
+fn default_indentiagraph_uri() -> String {
+    // Persisted on local disk by default (single-binary mode, no external DB required).
+    "surrealkv://./.cortex/indentiagraph".into()
+}
+
+impl Default for IndentiaGraphYamlConfig {
     fn default() -> Self {
         Self {
-            uri: "bolt://localhost:7687".into(),
-            user: "neo4j".into(),
-            password: "orchestrator123".into(),
-        }
-    }
-}
-
-/// Meilisearch configuration section
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct MeilisearchYamlConfig {
-    pub url: String,
-    pub key: String,
-}
-
-impl Default for MeilisearchYamlConfig {
-    fn default() -> Self {
-        Self {
-            url: "http://localhost:7700".into(),
-            key: "orchestrator-meili-key-change-me".into(),
+            uri: default_indentiagraph_uri(),
+            user: "root".into(),
+            password: "root".into(),
+            namespace: default_surreal_namespace(),
+            database: default_surreal_database(),
         }
     }
 }
@@ -211,7 +212,7 @@ pub struct EmbeddingsYamlConfig {
 ///
 /// Supports three modes depending on which sub-sections are present:
 /// - **No-auth**: No `auth` section in YAML → `auth_config = None` → open access
-/// - **Password**: `root_account` present → email/password login (root from config, others from Neo4j)
+/// - **Password**: `root_account` present → email/password login (root from config, others from IndentiaGraph)
 /// - **OIDC**: `oidc` present → generic OpenID Connect (Google, Microsoft, Okta, Keycloak…)
 ///
 /// Both `root_account` and `oidc` can coexist for maximum flexibility.
@@ -440,11 +441,11 @@ pub struct Config {
     /// When false, the setup wizard should be shown instead of the main app.
     /// Defaults to true for backward compat.
     pub setup_completed: bool,
-    pub neo4j_uri: String,
-    pub neo4j_user: String,
-    pub neo4j_password: String,
-    pub meilisearch_url: String,
-    pub meilisearch_key: String,
+    pub indentiagraph_uri: String,
+    pub indentiagraph_user: String,
+    pub indentiagraph_password: String,
+    pub surreal_namespace: String,
+    pub surreal_database: String,
     /// NATS server URL (optional — enables inter-process event sync)
     pub nats_url: Option<String>,
     pub workspace_path: String,
@@ -531,11 +532,19 @@ impl Config {
         // 2. Build Config with env var overrides
         Ok(Self {
             setup_completed: yaml.setup_completed,
-            neo4j_uri: std::env::var("NEO4J_URI").unwrap_or(yaml.neo4j.uri),
-            neo4j_user: std::env::var("NEO4J_USER").unwrap_or(yaml.neo4j.user),
-            neo4j_password: std::env::var("NEO4J_PASSWORD").unwrap_or(yaml.neo4j.password),
-            meilisearch_url: std::env::var("MEILISEARCH_URL").unwrap_or(yaml.meilisearch.url),
-            meilisearch_key: std::env::var("MEILISEARCH_KEY").unwrap_or(yaml.meilisearch.key),
+            indentiagraph_uri: std::env::var("SURREALDB_URL")
+                .or_else(|_| std::env::var("INDENTIAGRAPH_URI"))
+                .unwrap_or(yaml.indentiagraph.uri),
+            indentiagraph_user: std::env::var("SURREALDB_USERNAME")
+                .or_else(|_| std::env::var("INDENTIAGRAPH_USER"))
+                .unwrap_or(yaml.indentiagraph.user),
+            indentiagraph_password: std::env::var("SURREALDB_PASSWORD")
+                .or_else(|_| std::env::var("INDENTIAGRAPH_PASSWORD"))
+                .unwrap_or(yaml.indentiagraph.password),
+            surreal_namespace: std::env::var("SURREALDB_NAMESPACE")
+                .unwrap_or(yaml.indentiagraph.namespace),
+            surreal_database: std::env::var("SURREALDB_DATABASE")
+                .unwrap_or(yaml.indentiagraph.database),
             nats_url: std::env::var("NATS_URL").ok().or(yaml.nats.url),
             workspace_path: std::env::var("WORKSPACE_PATH").unwrap_or(yaml.server.workspace_path),
             server_port: std::env::var("SERVER_PORT")
@@ -598,9 +607,9 @@ impl Config {
     /// Search order when `yaml_path` is `None`:
     /// 1. `./config.yaml` (current working directory)
     /// 2. Platform-specific app config dir:
-    ///    - macOS: `~/Library/Application Support/project-orchestrator/config.yaml`
-    ///    - Linux: `~/.config/project-orchestrator/config.yaml`
-    ///    - Windows: `%APPDATA%/ProjectOrchestrator/config.yaml`
+    ///    - macOS: `~/Library/Application Support/cortex/config.yaml`
+    ///    - Linux: `~/.config/cortex/config.yaml`
+    ///    - Windows: `%APPDATA%/Cortex/config.yaml`
     ///
     /// This ensures the MCP server binary (which may be spawned with an arbitrary
     /// CWD by Claude Code) can still find the config written by the desktop app.
@@ -623,10 +632,15 @@ impl Config {
         // 1. Platform-specific app config directory (same as desktop app)
         if let Some(config_dir) = dirs::config_dir() {
             #[cfg(target_os = "windows")]
-            let app_dir = config_dir.join("ProjectOrchestrator");
+            let app_dir = config_dir.join("Cortex");
             #[cfg(not(target_os = "windows"))]
-            let app_dir = config_dir.join("project-orchestrator");
+            let app_dir = config_dir.join("cortex");
             candidates.push(app_dir.join("config.yaml"));
+            // Backward compatibility with the legacy project-orchestrator directory name.
+            #[cfg(target_os = "windows")]
+            candidates.push(config_dir.join("ProjectOrchestrator").join("config.yaml"));
+            #[cfg(not(target_os = "windows"))]
+            candidates.push(config_dir.join("project-orchestrator").join("config.yaml"));
         }
 
         // 2. CWD fallback (useful for dev / CLI usage)
@@ -672,8 +686,7 @@ impl Config {
 /// Shared application state
 #[derive(Clone)]
 pub struct AppState {
-    pub neo4j: Arc<dyn neo4j::GraphStore>,
-    pub meili: Arc<dyn meilisearch::SearchStore>,
+    pub indentiagraph: Arc<dyn indentiagraph::GraphStore>,
     pub parser: Arc<parser::CodeParser>,
     pub config: Arc<Config>,
 }
@@ -681,25 +694,21 @@ pub struct AppState {
 impl AppState {
     /// Create new application state with all services initialized
     pub async fn new(config: Config) -> Result<Self> {
-        let neo4j = Arc::new(
-            neo4j::client::Neo4jClient::new(
-                &config.neo4j_uri,
-                &config.neo4j_user,
-                &config.neo4j_password,
+        let indentiagraph: Arc<dyn indentiagraph::GraphStore> = Arc::new(
+            cortex_indentiagraph::IndentiaGraphStore::new(
+                &config.indentiagraph_uri,
+                &config.surreal_namespace,
+                &config.surreal_database,
+                &config.indentiagraph_user,
+                &config.indentiagraph_password,
             )
             .await?,
-        );
-
-        let meili = Arc::new(
-            meilisearch::client::MeiliClient::new(&config.meilisearch_url, &config.meilisearch_key)
-                .await?,
         );
 
         let parser = Arc::new(parser::CodeParser::new()?);
 
         Ok(Self {
-            neo4j,
-            meili,
+            indentiagraph,
             parser,
             config: Arc::new(config),
         })
@@ -710,7 +719,7 @@ impl AppState {
 // Server entry point (for embedding in Tauri or other hosts)
 // ============================================================================
 
-/// Start the orchestrator server with the given configuration.
+/// Start the Cortex server with the given configuration.
 ///
 /// This is the main entry point for embedding the server in another application
 /// (e.g., Tauri desktop). It initializes all services, creates the Axum router,
@@ -723,7 +732,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     // ────────────────────────────────────────────────────────────────────
     // Setup-only mode: if the wizard hasn't been completed yet, start a
     // minimal server that only serves /health and /api/setup-status.
-    // This avoids connecting to Neo4j/MeiliSearch (which are likely not
+    // This avoids connecting to graph-backed services (which are likely not
     // configured yet) and lets the frontend show the setup wizard.
     // ────────────────────────────────────────────────────────────────────
     if !config.setup_completed {
@@ -746,8 +755,10 @@ pub async fn start_server(mut config: Config) -> Result<()> {
     }
 
     // Initialize application state
-    tracing::info!("Connecting to Neo4j at {}...", config.neo4j_uri);
-    tracing::info!("Connecting to Meilisearch at {}...", config.meilisearch_url);
+    tracing::info!(
+        "Connecting to IndentiaGraph at {}...",
+        config.indentiagraph_uri
+    );
 
     let state = AppState::new(config.clone()).await?;
     tracing::info!("Connected to databases");
@@ -796,7 +807,7 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         let mut w = orchestrator::FileWatcher::new(orchestrator.clone());
 
         // Auto-register all known projects for watching
-        match orchestrator.neo4j().list_projects().await {
+        match orchestrator.indentiagraph().list_projects().await {
             Ok(projects) => {
                 let mut registered = 0usize;
                 let mut skipped = 0usize;
@@ -906,45 +917,52 @@ pub async fn start_server(mut config: Config) -> Result<()> {
                         let stale_threshold = chrono::Utc::now() - chrono::Duration::hours(24);
 
                         for (pid, slug) in &skill_project_ids {
-                            let needs_run =
-                                match orch_skills.neo4j().get_skills_for_project(*pid).await {
-                                    Ok(skills) if skills.is_empty() => {
+                            let needs_run = match orch_skills
+                                .indentiagraph()
+                                .get_skills_for_project(*pid)
+                                .await
+                            {
+                                Ok(skills) if skills.is_empty() => {
+                                    tracing::debug!(
+                                        "Skill warm-up: '{}' has no skills, bootstrapping...",
+                                        slug
+                                    );
+                                    Some(true) // bootstrap
+                                }
+                                Ok(skills) => {
+                                    // Check if any skill is stale (updated_at > 24h ago)
+                                    let oldest = skills
+                                        .iter()
+                                        .map(|s| s.updated_at)
+                                        .min()
+                                        .unwrap_or(chrono::Utc::now());
+                                    if oldest < stale_threshold {
                                         tracing::debug!(
-                                            "Skill warm-up: '{}' has no skills, bootstrapping...",
-                                            slug
-                                        );
-                                        Some(true) // bootstrap
-                                    }
-                                    Ok(skills) => {
-                                        // Check if any skill is stale (updated_at > 24h ago)
-                                        let oldest = skills
-                                            .iter()
-                                            .map(|s| s.updated_at)
-                                            .min()
-                                            .unwrap_or(chrono::Utc::now());
-                                        if oldest < stale_threshold {
-                                            tracing::debug!(
                                             "Skill warm-up: '{}' has stale skills, refreshing...",
                                             slug
                                         );
-                                            Some(false) // refresh
-                                        } else {
-                                            None // fresh, skip
-                                        }
+                                        Some(false) // refresh
+                                    } else {
+                                        None // fresh, skip
                                     }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Skill warm-up: failed to check skills for '{}': {}",
-                                            slug,
-                                            e
-                                        );
-                                        None
-                                    }
-                                };
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Skill warm-up: failed to check skills for '{}': {}",
+                                        slug,
+                                        e
+                                    );
+                                    None
+                                }
+                            };
 
                             if let Some(is_bootstrap) = needs_run {
-                                match detect_skills_pipeline(orch_skills.neo4j(), *pid, &config)
-                                    .await
+                                match detect_skills_pipeline(
+                                    orch_skills.indentiagraph(),
+                                    *pid,
+                                    &config,
+                                )
+                                .await
                                 {
                                     Ok(result) => {
                                         tracing::info!(
@@ -1044,13 +1062,9 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         if let Some(ref auth) = config.auth_config {
             chat_config.jwt_secret = Some(auth.jwt_secret.clone());
         }
-        let mut cm = chat::ChatManager::new(
-            orchestrator.neo4j_arc(),
-            orchestrator.meili_arc(),
-            chat_config,
-        )
-        .await
-        .with_event_emitter(event_bus.clone());
+        let mut cm = chat::ChatManager::new(orchestrator.indentiagraph_arc(), chat_config)
+            .await
+            .with_event_emitter(event_bus.clone());
         // Pass config.yaml path so permission changes can be persisted to disk
         if let Some(ref yaml_path) = config.config_yaml_path {
             cm = cm.with_config_yaml_path(yaml_path.clone());
@@ -1239,14 +1253,10 @@ server:
   port: 9090
   workspace_path: /tmp/test
 
-neo4j:
-  uri: bolt://db:7687
+indentiagraph:
+  uri: ws://db:8000
   user: admin
   password: secret
-
-meilisearch:
-  url: http://search:7700
-  key: test-key
 
 auth:
   google_client_id: "123.apps.googleusercontent.com"
@@ -1261,8 +1271,7 @@ auth:
         let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.server.port, 9090);
         assert_eq!(config.server.workspace_path, "/tmp/test");
-        assert_eq!(config.neo4j.uri, "bolt://db:7687");
-        assert_eq!(config.meilisearch.key, "test-key");
+        assert_eq!(config.indentiagraph.uri, "ws://db:8000");
 
         let auth = config.auth.unwrap();
         // Legacy Google fields are now Option<String>
@@ -1284,8 +1293,8 @@ auth:
         let yaml = r#"
 server:
   port: 8080
-neo4j:
-  uri: bolt://localhost:7687
+indentiagraph:
+  uri: ws://localhost:8000
 "#;
         let config: YamlConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.auth.is_none());
@@ -1296,9 +1305,11 @@ neo4j:
         let config = YamlConfig::default();
         assert_eq!(config.server.port, 8080);
         assert_eq!(config.server.workspace_path, ".");
-        assert_eq!(config.neo4j.uri, "bolt://localhost:7687");
-        assert_eq!(config.neo4j.user, "neo4j");
-        assert_eq!(config.meilisearch.url, "http://localhost:7700");
+        assert_eq!(
+            config.indentiagraph.uri,
+            "surrealkv://./.cortex/indentiagraph"
+        );
+        assert_eq!(config.indentiagraph.user, "root");
         assert!(config.auth.is_none());
     }
 
@@ -1367,17 +1378,16 @@ auth:
         // Helper to clear all config env vars
         fn clear_env() {
             for var in &[
-                "NEO4J_URI",
-                "NEO4J_USER",
-                "NEO4J_PASSWORD",
-                "MEILISEARCH_URL",
-                "MEILISEARCH_KEY",
+                "INDENTIAGRAPH_URI",
+                "INDENTIAGRAPH_USER",
+                "INDENTIAGRAPH_PASSWORD",
                 "WORKSPACE_PATH",
                 "SERVER_PORT",
                 "SERVE_FRONTEND",
                 "FRONTEND_PATH",
             ] {
-                std::env::remove_var(var);
+                // SAFETY: single-threaded test environment
+                unsafe { std::env::remove_var(var) };
             }
         }
 
@@ -1385,13 +1395,10 @@ auth:
         let yaml = r#"
 server:
   port: 9999
-neo4j:
-  uri: bolt://yaml-host:7687
+indentiagraph:
+  uri: ws://yaml-host:8000
   user: yaml-user
   password: yaml-pass
-meilisearch:
-  url: http://yaml-search:7700
-  key: yaml-key
 "#;
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("config.yaml");
@@ -1402,20 +1409,22 @@ meilisearch:
 
         let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
         assert_eq!(config.server_port, 9999);
-        assert_eq!(config.neo4j_uri, "bolt://yaml-host:7687");
-        assert_eq!(config.neo4j_user, "yaml-user");
-        assert_eq!(config.meilisearch_key, "yaml-key");
+        assert_eq!(config.indentiagraph_uri, "ws://yaml-host:8000");
+        assert_eq!(config.indentiagraph_user, "yaml-user");
         assert!(config.auth_config.is_none());
 
         // --- Phase 2: Env vars override YAML ---
-        std::env::set_var("NEO4J_URI", "bolt://env-host:7687");
-        std::env::set_var("SERVER_PORT", "7777");
+        // SAFETY: single-threaded test environment
+        unsafe {
+            std::env::set_var("INDENTIAGRAPH_URI", "ws://env-host:8000");
+            std::env::set_var("SERVER_PORT", "7777");
+        }
 
         let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
-        assert_eq!(config.neo4j_uri, "bolt://env-host:7687");
+        assert_eq!(config.indentiagraph_uri, "ws://env-host:8000");
         assert_eq!(config.server_port, 7777);
         // YAML value still used where no env override
-        assert_eq!(config.neo4j_user, "yaml-user");
+        assert_eq!(config.indentiagraph_user, "yaml-user");
 
         clear_env();
 
@@ -1423,7 +1432,10 @@ meilisearch:
         let nonexistent = Path::new("/tmp/nonexistent-config-12345.yaml");
         let config = Config::from_yaml_and_env(Some(nonexistent)).unwrap();
         assert_eq!(config.server_port, 8080);
-        assert_eq!(config.neo4j_uri, "bolt://localhost:7687");
+        assert_eq!(
+            config.indentiagraph_uri,
+            "surrealkv://./.cortex/indentiagraph"
+        );
         assert!(config.auth_config.is_none());
         // Frontend defaults when no YAML
         assert!(config.serve_frontend);
@@ -1442,8 +1454,11 @@ server:
         f2.write_all(frontend_yaml.as_bytes()).unwrap();
 
         clear_env();
-        std::env::set_var("SERVE_FRONTEND", "false");
-        std::env::set_var("FRONTEND_PATH", "/custom/dist");
+        // SAFETY: single-threaded test environment
+        unsafe {
+            std::env::set_var("SERVE_FRONTEND", "false");
+            std::env::set_var("FRONTEND_PATH", "/custom/dist");
+        }
 
         let config = Config::from_yaml_and_env(Some(&frontend_file)).unwrap();
         assert!(!config.serve_frontend);
@@ -1467,17 +1482,16 @@ server:
     fn test_explicit_config_path_bypasses_auto_detect() {
         fn clear_env() {
             for var in &[
-                "NEO4J_URI",
-                "NEO4J_USER",
-                "NEO4J_PASSWORD",
-                "MEILISEARCH_URL",
-                "MEILISEARCH_KEY",
+                "INDENTIAGRAPH_URI",
+                "INDENTIAGRAPH_USER",
+                "INDENTIAGRAPH_PASSWORD",
                 "WORKSPACE_PATH",
                 "SERVER_PORT",
                 "SERVE_FRONTEND",
                 "FRONTEND_PATH",
             ] {
-                std::env::remove_var(var);
+                // SAFETY: single-threaded test environment
+                unsafe { std::env::remove_var(var) };
             }
         }
 
@@ -1488,7 +1502,7 @@ server:
         let path_a = dir_a.path().join("config.yaml");
         std::fs::write(
             &path_a,
-            "server:\n  port: 1111\nneo4j:\n  uri: bolt://host-a:7687\n",
+            "server:\n  port: 1111\nindentiagraph:\n  uri: ws://host-a:8000\n",
         )
         .unwrap();
 
@@ -1496,19 +1510,19 @@ server:
         let path_b = dir_b.path().join("config.yaml");
         std::fs::write(
             &path_b,
-            "server:\n  port: 2222\nneo4j:\n  uri: bolt://host-b:7687\n",
+            "server:\n  port: 2222\nindentiagraph:\n  uri: ws://host-b:8000\n",
         )
         .unwrap();
 
         // Explicit path_a → loads path_a values
         let config_a = Config::from_yaml_and_env(Some(&path_a)).unwrap();
         assert_eq!(config_a.server_port, 1111);
-        assert_eq!(config_a.neo4j_uri, "bolt://host-a:7687");
+        assert_eq!(config_a.indentiagraph_uri, "ws://host-a:8000");
 
         // Explicit path_b → loads path_b values (not path_a)
         let config_b = Config::from_yaml_and_env(Some(&path_b)).unwrap();
         assert_eq!(config_b.server_port, 2222);
-        assert_eq!(config_b.neo4j_uri, "bolt://host-b:7687");
+        assert_eq!(config_b.indentiagraph_uri, "ws://host-b:8000");
 
         // Explicit path to non-existent file → falls back to defaults (not auto-detect)
         let bogus = dir_a.path().join("does-not-exist.yaml");
@@ -1912,9 +1926,12 @@ chat:
         file.write_all(yaml.as_bytes()).unwrap();
 
         // Clear first
-        std::env::remove_var("CHAT_PROCESS_PATH");
-        std::env::remove_var("CLAUDE_CLI_PATH");
-        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+        // SAFETY: single-threaded test environment
+        unsafe {
+            std::env::remove_var("CHAT_PROCESS_PATH");
+            std::env::remove_var("CLAUDE_CLI_PATH");
+            std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+        }
 
         // Without env overrides → YAML values used
         let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
@@ -1923,9 +1940,12 @@ chat:
         assert_eq!(config.chat_auto_update_cli, Some(false));
 
         // Env vars override YAML
-        std::env::set_var("CHAT_PROCESS_PATH", "/env/path");
-        std::env::set_var("CLAUDE_CLI_PATH", "/env/claude");
-        std::env::set_var("CHAT_AUTO_UPDATE_CLI", "true");
+        // SAFETY: single-threaded test environment
+        unsafe {
+            std::env::set_var("CHAT_PROCESS_PATH", "/env/path");
+            std::env::set_var("CLAUDE_CLI_PATH", "/env/claude");
+            std::env::set_var("CHAT_AUTO_UPDATE_CLI", "true");
+        }
 
         let config = Config::from_yaml_and_env(Some(&file_path)).unwrap();
         assert_eq!(config.chat_process_path.as_deref(), Some("/env/path"));
@@ -1933,8 +1953,11 @@ chat:
         assert_eq!(config.chat_auto_update_cli, Some(true));
 
         // Cleanup
-        std::env::remove_var("CHAT_PROCESS_PATH");
-        std::env::remove_var("CLAUDE_CLI_PATH");
-        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+        // SAFETY: single-threaded test environment
+        unsafe {
+            std::env::remove_var("CHAT_PROCESS_PATH");
+            std::env::remove_var("CLAUDE_CLI_PATH");
+            std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+        }
     }
 }

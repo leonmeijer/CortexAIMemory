@@ -1,12 +1,12 @@
 //! Analytics results writer.
 //!
-//! Batch-updates computed analytics scores back to Neo4j nodes.
+//! Batch-updates computed analytics scores back to IndentiaGraph nodes.
 //! Uses new `GraphStore` trait methods to write PageRank, betweenness,
 //! clustering coefficient, community ID, and component ID as node properties.
 //!
 //! The write is idempotent: re-running analytics overwrites previous scores.
 
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::GraphStore;
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -15,7 +15,7 @@ use super::models::{
     FunctionAnalyticsUpdate, GraphAnalytics,
 };
 
-/// Writes analytics results back to Neo4j via the `GraphStore` trait.
+/// Writes analytics results back to IndentiaGraph via the `GraphStore` trait.
 ///
 /// Separates metrics by node type (File vs Function) and performs two
 /// batch UNWIND queries for maximum efficiency.
@@ -29,13 +29,13 @@ impl AnalyticsWriter {
         Self { store }
     }
 
-    /// Write all analytics results back to Neo4j.
+    /// Write all analytics results back to IndentiaGraph.
     ///
     /// 1. Separates metrics into File and Function updates
     /// 2. Resolves community labels from `CommunityInfo` for File nodes
     /// 3. Calls `batch_update_file_analytics` + `batch_update_function_analytics`
     ///
-    /// Nodes that no longer exist in Neo4j are silently ignored (MATCH finds nothing).
+    /// Nodes that no longer exist in IndentiaGraph are silently ignored (MATCH finds nothing).
     pub async fn write_analytics(
         &self,
         analytics: &GraphAnalytics,
@@ -103,7 +103,7 @@ impl AnalyticsWriter {
         Ok(())
     }
 
-    /// Write fabric analytics results to Neo4j as `fabric_*` properties.
+    /// Write fabric analytics results to IndentiaGraph as `fabric_*` properties.
     ///
     /// Separates File-type nodes from the graph and writes fabric-specific
     /// scores (`fabric_pagerank`, `fabric_betweenness`, `fabric_community_id`)
@@ -153,7 +153,7 @@ impl AnalyticsWriter {
         Ok(())
     }
 
-    /// Write structural DNA vectors to Neo4j.
+    /// Write structural DNA vectors to IndentiaGraph.
     ///
     /// Converts the in-memory DNA HashMap (from `structural_dna()`) to
     /// `StructuralDnaUpdate` payloads and persists via batch UNWIND.
@@ -187,7 +187,7 @@ impl AnalyticsWriter {
         Ok(())
     }
 
-    /// Write structural fingerprint vectors to Neo4j.
+    /// Write structural fingerprint vectors to IndentiaGraph.
     ///
     /// Converts the in-memory fingerprint HashMap (from `compute_structural_fingerprint()`) to
     /// `StructuralFingerprintUpdate` payloads and persists via batch UNWIND.
@@ -222,7 +222,7 @@ impl AnalyticsWriter {
         Ok(())
     }
 
-    /// Write predicted missing links to Neo4j.
+    /// Write predicted missing links to IndentiaGraph.
     ///
     /// Persists top-N link predictions as PREDICTED_LINK relationships.
     /// Old predictions are replaced on each call (idempotent).
@@ -247,7 +247,7 @@ mod tests {
     use crate::graph::models::{
         AnalyticsConfig, CodeEdge, CodeEdgeType, CodeGraph, CodeNode, CodeNodeType,
     };
-    use crate::neo4j::mock::MockGraphStore;
+    use crate::indentiagraph::mock::MockGraphStore;
 
     /// Build a small file graph for testing the writer.
     fn make_file_graph() -> CodeGraph {

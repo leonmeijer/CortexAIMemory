@@ -146,13 +146,10 @@ pub struct ChatConfig {
     pub max_sessions: usize,
     /// Timeout after which inactive sessions are closed (subprocess freed)
     pub session_timeout: Duration,
-    /// Neo4j connection details for MCP server env
-    pub neo4j_uri: String,
-    pub neo4j_user: String,
-    pub neo4j_password: String,
-    /// Meilisearch connection details for MCP server env
-    pub meilisearch_url: String,
-    pub meilisearch_key: String,
+    /// IndentiaGraph connection details for MCP server env
+    pub indentiagraph_uri: String,
+    pub indentiagraph_user: String,
+    pub indentiagraph_password: String,
     /// NATS URL for inter-process event sync (MCP ↔ desktop)
     pub nats_url: Option<String>,
     /// Maximum number of agentic turns (tool calls) per message
@@ -209,15 +206,15 @@ impl ChatConfig {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1800), // 30 minutes
             ),
-            neo4j_uri: std::env::var("NEO4J_URI")
-                .unwrap_or_else(|_| "bolt://localhost:7687".into()),
-            neo4j_user: std::env::var("NEO4J_USER").unwrap_or_else(|_| "neo4j".into()),
-            neo4j_password: std::env::var("NEO4J_PASSWORD")
-                .unwrap_or_else(|_| "orchestrator123".into()),
-            meilisearch_url: std::env::var("MEILISEARCH_URL")
-                .unwrap_or_else(|_| "http://localhost:7700".into()),
-            meilisearch_key: std::env::var("MEILISEARCH_KEY")
-                .unwrap_or_else(|_| "orchestrator-meili-key-change-me".into()),
+            indentiagraph_uri: std::env::var("SURREALDB_URL")
+                .or_else(|_| std::env::var("INDENTIAGRAPH_URI"))
+                .unwrap_or_else(|_| "surrealkv://./.cortex/indentiagraph".into()),
+            indentiagraph_user: std::env::var("SURREALDB_USERNAME")
+                .or_else(|_| std::env::var("INDENTIAGRAPH_USER"))
+                .unwrap_or_else(|_| "root".into()),
+            indentiagraph_password: std::env::var("SURREALDB_PASSWORD")
+                .or_else(|_| std::env::var("INDENTIAGRAPH_PASSWORD"))
+                .unwrap_or_else(|_| "root".into()),
             nats_url: std::env::var("NATS_URL").ok(),
             max_turns: std::env::var("CHAT_MAX_TURNS")
                 .ok()
@@ -295,11 +292,14 @@ impl ChatConfig {
     /// Build the MCP server config JSON for ClaudeCodeOptions
     pub fn mcp_server_config(&self) -> serde_json::Value {
         let mut env = serde_json::json!({
-            "NEO4J_URI": self.neo4j_uri,
-            "NEO4J_USER": self.neo4j_user,
-            "NEO4J_PASSWORD": self.neo4j_password,
-            "MEILISEARCH_URL": self.meilisearch_url,
-            "MEILISEARCH_KEY": self.meilisearch_key
+            "INDENTIAGRAPH_URI": self.indentiagraph_uri,
+            "INDENTIAGRAPH_USER": self.indentiagraph_user,
+            "INDENTIAGRAPH_PASSWORD": self.indentiagraph_password,
+            "SURREALDB_URL": self.indentiagraph_uri,
+            "SURREALDB_USERNAME": self.indentiagraph_user,
+            "SURREALDB_PASSWORD": self.indentiagraph_password,
+            "SURREALDB_NAMESPACE": std::env::var("SURREALDB_NAMESPACE").unwrap_or_else(|_| "cortex".into()),
+            "SURREALDB_DATABASE": std::env::var("SURREALDB_DATABASE").unwrap_or_else(|_| "memory".into()),
         });
 
         // Forward NATS_URL so the spawned MCP server can sync events back
@@ -335,11 +335,9 @@ mod tests {
             default_model: "claude-sonnet-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),
-            neo4j_uri: "bolt://localhost:7687".into(),
-            neo4j_user: "neo4j".into(),
-            neo4j_password: "test".into(),
-            meilisearch_url: "http://localhost:7700".into(),
-            meilisearch_key: "test-key".into(),
+            indentiagraph_uri: "surrealkv://./.cortex/indentiagraph".into(),
+            indentiagraph_user: "indentiagraph".into(),
+            indentiagraph_password: "test".into(),
             nats_url: None,
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
@@ -366,16 +364,19 @@ mod tests {
     #[test]
     fn test_from_env_lifecycle() {
         // Phase 1: defaults (clear any chat env vars first)
-        std::env::remove_var("CHAT_DEFAULT_MODEL");
-        std::env::remove_var("CHAT_MAX_SESSIONS");
-        std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
-        std::env::remove_var("MCP_SERVER_PATH");
-        std::env::remove_var("CHAT_PERMISSION_MODE");
-        std::env::remove_var("CHAT_ALLOWED_TOOLS");
-        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
-        std::env::remove_var("CHAT_PROCESS_PATH");
-        std::env::remove_var("CLAUDE_CLI_PATH");
-        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+        // SAFETY: test-only env var manipulation, single-threaded test binary
+        unsafe {
+            std::env::remove_var("CHAT_DEFAULT_MODEL");
+            std::env::remove_var("CHAT_MAX_SESSIONS");
+            std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
+            std::env::remove_var("MCP_SERVER_PATH");
+            std::env::remove_var("CHAT_PERMISSION_MODE");
+            std::env::remove_var("CHAT_ALLOWED_TOOLS");
+            std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+            std::env::remove_var("CHAT_PROCESS_PATH");
+            std::env::remove_var("CLAUDE_CLI_PATH");
+            std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+        }
 
         let config = ChatConfig::from_env();
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -394,22 +395,25 @@ mod tests {
         assert!(!config.auto_update_cli);
 
         // Phase 2: custom values
-        std::env::set_var("CHAT_DEFAULT_MODEL", "claude-sonnet-4-6");
-        std::env::set_var("CHAT_MAX_SESSIONS", "5");
-        std::env::set_var("CHAT_SESSION_TIMEOUT_SECS", "600");
-        std::env::set_var("MCP_SERVER_PATH", "/custom/path/mcp_server");
-        std::env::set_var("CHAT_PERMISSION_MODE", "default");
-        std::env::set_var(
-            "CHAT_ALLOWED_TOOLS",
-            "Bash(git *),Read,mcp__project-orchestrator__*",
-        );
-        std::env::set_var("CHAT_DISALLOWED_TOOLS", "Bash(rm -rf *), Bash(sudo *)");
-        std::env::set_var(
-            "CHAT_PROCESS_PATH",
-            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        );
-        std::env::set_var("CLAUDE_CLI_PATH", "/opt/homebrew/bin/claude");
-        std::env::set_var("CHAT_AUTO_UPDATE_CLI", "true");
+        // SAFETY: test-only env var manipulation
+        unsafe {
+            std::env::set_var("CHAT_DEFAULT_MODEL", "claude-sonnet-4-6");
+            std::env::set_var("CHAT_MAX_SESSIONS", "5");
+            std::env::set_var("CHAT_SESSION_TIMEOUT_SECS", "600");
+            std::env::set_var("MCP_SERVER_PATH", "/custom/path/mcp_server");
+            std::env::set_var("CHAT_PERMISSION_MODE", "default");
+            std::env::set_var(
+                "CHAT_ALLOWED_TOOLS",
+                "Bash(git *),Read,mcp__project-orchestrator__*",
+            );
+            std::env::set_var("CHAT_DISALLOWED_TOOLS", "Bash(rm -rf *), Bash(sudo *)");
+            std::env::set_var(
+                "CHAT_PROCESS_PATH",
+                "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+            );
+            std::env::set_var("CLAUDE_CLI_PATH", "/opt/homebrew/bin/claude");
+            std::env::set_var("CHAT_AUTO_UPDATE_CLI", "true");
+        }
 
         let config = ChatConfig::from_env();
         assert_eq!(config.default_model, "claude-sonnet-4-6");
@@ -440,8 +444,11 @@ mod tests {
         assert!(config.auto_update_cli);
 
         // Phase 2b: CSV parsing edge cases for tools
-        std::env::set_var("CHAT_ALLOWED_TOOLS", "Bash(git *), Read, Edit");
-        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        // SAFETY: test-only env var manipulation
+        unsafe {
+            std::env::set_var("CHAT_ALLOWED_TOOLS", "Bash(git *), Read, Edit");
+            std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        }
         let config = ChatConfig::from_env();
         assert_eq!(
             config.permission.allowed_tools,
@@ -450,39 +457,47 @@ mod tests {
         assert!(config.permission.disallowed_tools.is_empty());
 
         // Empty value should produce empty vec
-        std::env::set_var("CHAT_ALLOWED_TOOLS", "");
+        // SAFETY: test-only env var manipulation
+        unsafe { std::env::set_var("CHAT_ALLOWED_TOOLS", "") };
         let config = ChatConfig::from_env();
         assert!(config.permission.allowed_tools.is_empty());
 
         // Phase 3: invalid value falls back to default
-        std::env::set_var("CHAT_MAX_SESSIONS", "not_a_number");
+        // SAFETY: test-only env var manipulation
+        unsafe { std::env::set_var("CHAT_MAX_SESSIONS", "not_a_number") };
         let config = ChatConfig::from_env();
         assert_eq!(config.max_sessions, 10);
 
         // Phase 4: Default trait (clear custom env vars first)
-        std::env::remove_var("CHAT_DEFAULT_MODEL");
-        std::env::remove_var("CHAT_MAX_SESSIONS");
-        std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
-        std::env::remove_var("MCP_SERVER_PATH");
-        std::env::remove_var("CHAT_PERMISSION_MODE");
-        std::env::remove_var("CHAT_ALLOWED_TOOLS");
-        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        // SAFETY: test-only env var manipulation
+        unsafe {
+            std::env::remove_var("CHAT_DEFAULT_MODEL");
+            std::env::remove_var("CHAT_MAX_SESSIONS");
+            std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
+            std::env::remove_var("MCP_SERVER_PATH");
+            std::env::remove_var("CHAT_PERMISSION_MODE");
+            std::env::remove_var("CHAT_ALLOWED_TOOLS");
+            std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+        }
         let config = ChatConfig::default();
         assert!(!config.default_model.is_empty());
         assert!(config.max_sessions > 0);
         assert_eq!(config.permission.mode, "default");
 
         // Cleanup
-        std::env::remove_var("CHAT_DEFAULT_MODEL");
-        std::env::remove_var("CHAT_MAX_SESSIONS");
-        std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
-        std::env::remove_var("MCP_SERVER_PATH");
-        std::env::remove_var("CHAT_PERMISSION_MODE");
-        std::env::remove_var("CHAT_ALLOWED_TOOLS");
-        std::env::remove_var("CHAT_DISALLOWED_TOOLS");
-        std::env::remove_var("CHAT_PROCESS_PATH");
-        std::env::remove_var("CLAUDE_CLI_PATH");
-        std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+        // SAFETY: test-only env var manipulation
+        unsafe {
+            std::env::remove_var("CHAT_DEFAULT_MODEL");
+            std::env::remove_var("CHAT_MAX_SESSIONS");
+            std::env::remove_var("CHAT_SESSION_TIMEOUT_SECS");
+            std::env::remove_var("MCP_SERVER_PATH");
+            std::env::remove_var("CHAT_PERMISSION_MODE");
+            std::env::remove_var("CHAT_ALLOWED_TOOLS");
+            std::env::remove_var("CHAT_DISALLOWED_TOOLS");
+            std::env::remove_var("CHAT_PROCESS_PATH");
+            std::env::remove_var("CLAUDE_CLI_PATH");
+            std::env::remove_var("CHAT_AUTO_UPDATE_CLI");
+        }
     }
 
     #[test]
@@ -492,11 +507,9 @@ mod tests {
             default_model: "claude-opus-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),
-            neo4j_uri: "bolt://localhost:7687".into(),
-            neo4j_user: "neo4j".into(),
-            neo4j_password: "pass".into(),
-            meilisearch_url: "http://localhost:7700".into(),
-            meilisearch_key: "key".into(),
+            indentiagraph_uri: "surrealkv://./.cortex/indentiagraph".into(),
+            indentiagraph_user: "indentiagraph".into(),
+            indentiagraph_password: "pass".into(),
             nats_url: Some("nats://localhost:4222".into()),
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
@@ -516,7 +529,10 @@ mod tests {
         let json = config.mcp_server_config();
         let server = &json["project-orchestrator"];
         assert_eq!(server["command"], "/path/to/mcp_server");
-        assert_eq!(server["env"]["NEO4J_URI"], "bolt://localhost:7687");
+        assert_eq!(
+            server["env"]["INDENTIAGRAPH_URI"],
+            "surrealkv://./.cortex/indentiagraph"
+        );
         assert_eq!(server["env"]["NATS_URL"], "nats://localhost:4222");
     }
 
@@ -527,11 +543,9 @@ mod tests {
             default_model: "claude-opus-4-6".into(),
             max_sessions: 10,
             session_timeout: Duration::from_secs(1800),
-            neo4j_uri: "bolt://localhost:7687".into(),
-            neo4j_user: "neo4j".into(),
-            neo4j_password: "pass".into(),
-            meilisearch_url: "http://localhost:7700".into(),
-            meilisearch_key: "key".into(),
+            indentiagraph_uri: "surrealkv://./.cortex/indentiagraph".into(),
+            indentiagraph_user: "indentiagraph".into(),
+            indentiagraph_password: "pass".into(),
             nats_url: None,
             max_turns: 10,
             prompt_builder_model: "claude-opus-4-6".into(),
@@ -687,9 +701,12 @@ mod tests {
     #[test]
     fn test_retry_config_from_env() {
         // Clear any existing vars
-        std::env::remove_var("CHAT_RETRY_MAX_ATTEMPTS");
-        std::env::remove_var("CHAT_RETRY_INITIAL_DELAY_MS");
-        std::env::remove_var("CHAT_RETRY_BACKOFF_MULTIPLIER");
+        // SAFETY: test-only env var manipulation
+        unsafe {
+            std::env::remove_var("CHAT_RETRY_MAX_ATTEMPTS");
+            std::env::remove_var("CHAT_RETRY_INITIAL_DELAY_MS");
+            std::env::remove_var("CHAT_RETRY_BACKOFF_MULTIPLIER");
+        }
 
         // Defaults
         let config = RetryConfig::from_env();
@@ -697,17 +714,23 @@ mod tests {
         assert_eq!(config.initial_delay_ms, 1000);
 
         // Custom values
-        std::env::set_var("CHAT_RETRY_MAX_ATTEMPTS", "5");
-        std::env::set_var("CHAT_RETRY_INITIAL_DELAY_MS", "500");
-        std::env::set_var("CHAT_RETRY_BACKOFF_MULTIPLIER", "1.5");
+        // SAFETY: test-only env var manipulation
+        unsafe {
+            std::env::set_var("CHAT_RETRY_MAX_ATTEMPTS", "5");
+            std::env::set_var("CHAT_RETRY_INITIAL_DELAY_MS", "500");
+            std::env::set_var("CHAT_RETRY_BACKOFF_MULTIPLIER", "1.5");
+        }
         let config = RetryConfig::from_env();
         assert_eq!(config.max_attempts, 5);
         assert_eq!(config.initial_delay_ms, 500);
         assert!((config.backoff_multiplier - 1.5).abs() < f64::EPSILON);
 
         // Cleanup
-        std::env::remove_var("CHAT_RETRY_MAX_ATTEMPTS");
-        std::env::remove_var("CHAT_RETRY_INITIAL_DELAY_MS");
-        std::env::remove_var("CHAT_RETRY_BACKOFF_MULTIPLIER");
+        // SAFETY: test-only env var manipulation
+        unsafe {
+            std::env::remove_var("CHAT_RETRY_MAX_ATTEMPTS");
+            std::env::remove_var("CHAT_RETRY_INITIAL_DELAY_MS");
+            std::env::remove_var("CHAT_RETRY_BACKOFF_MULTIPLIER");
+        }
     }
 }

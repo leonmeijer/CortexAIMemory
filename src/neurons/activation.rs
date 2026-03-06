@@ -18,7 +18,7 @@ use tracing::debug;
 use uuid::Uuid;
 
 use crate::embeddings::EmbeddingProvider;
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::GraphStore;
 use crate::notes::{Note, NoteImportance, NoteType};
 
 use super::config::SpreadingActivationConfig;
@@ -95,7 +95,7 @@ impl SpreadingActivationEngine {
     /// Decisions don't have the same fields as Notes, so we create a lightweight
     /// Note carrier with the decision's content. The `entity_type` field on
     /// `ActivatedNote` distinguishes decisions from real notes.
-    fn decision_to_synthetic_note(decision: &crate::neo4j::models::DecisionNode) -> Note {
+    fn decision_to_synthetic_note(decision: &crate::indentiagraph::models::DecisionNode) -> Note {
         let mut note = Note::new(
             None, // Decisions are task-scoped, not project-scoped
             NoteType::Observation,
@@ -398,8 +398,8 @@ impl SpreadingActivationEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::GraphStore;
+    use crate::indentiagraph::mock::MockGraphStore;
+    use crate::indentiagraph::GraphStore;
     use crate::notes::{NoteImportance, NoteType};
 
     /// Helper: create a mock provider that returns a fixed embedding

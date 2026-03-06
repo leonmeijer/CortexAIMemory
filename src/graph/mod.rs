@@ -8,13 +8,13 @@
 //! ## Architecture
 //!
 //! ```text
-//! Neo4j (GraphStore) ──► extraction ──► petgraph::DiGraph
+//! IndentiaGraph (GraphStore) ──► extraction ──► petgraph::DiGraph
 //!                                            │
 //!                                       algorithms
 //!                                            │
 //!                                    GraphAnalytics result
 //!                                            │
-//!                                        writer ──► Neo4j (batch update)
+//!                                        writer ──► IndentiaGraph (batch update)
 //!                                            │
 //!                              AnalyticsEngine (orchestrator)
 //! ```
@@ -23,8 +23,8 @@
 //!
 //! - [`models`] — Data structures (NodeMetrics, CommunityInfo, GraphAnalytics, AnalyticsConfig)
 //! - [`algorithms`] — Algorithm implementations (PageRank, Betweenness, Louvain, Clustering, WCC)
-//! - [`extraction`] — Neo4j → petgraph conversion via GraphStore trait
-//! - [`writer`] — Batch-write results back to Neo4j via GraphStore trait
+//! - [`extraction`] — IndentiaGraph → petgraph conversion via GraphStore trait
+//! - [`writer`] — Batch-write results back to IndentiaGraph via GraphStore trait
 //! - [`engine`] — `AnalyticsEngine` trait and `GraphAnalyticsEngine` orchestrator
 //! - [`debouncer`] — `AnalyticsDebouncer` for coalescing rapid-fire triggers
 //! - [`mock`] — `MockAnalyticsEngine` for testing (cfg(test) only)

@@ -63,21 +63,21 @@ COPY crates ./crates/
 # This must match the actual module layout so the dep-cache layer is valid.
 # Module directories (16):
 #   api, auth, chat, embeddings, events, graph, mcp, meilisearch,
-#   neo4j, neurons, notes, orchestrator, parser, plan, resolver, skills
+#   indentiagraph, neurons, notes, orchestrator, parser, plan, resolver, skills
 # Single files: setup_claude.rs, update.rs
 # Binary: bin/mcp_server.rs
 RUN mkdir -p src/bin \
              src/api src/auth src/chat src/embeddings src/events \
-             src/graph src/mcp src/meilisearch src/neo4j src/neurons \
+             src/graph src/mcp src/meilisearch src/indentiagraph src/neurons \
              src/notes src/orchestrator src/parser src/plan \
              src/resolver src/skills && \
     echo "fn main() {}" > src/main.rs && \
     echo "fn main() {}" > src/cli.rs && \
     echo "fn main() {}" > src/bin/mcp_server.rs && \
-    echo "pub mod api; pub mod auth; pub mod chat; pub mod embeddings; pub mod events; pub mod graph; pub mod mcp; pub mod meilisearch; pub mod neo4j; pub mod neurons; pub mod notes; pub mod orchestrator; pub mod parser; pub mod plan; pub mod resolver; pub mod setup_claude; pub mod skills; pub mod update;" > src/lib.rs && \
+    echo "pub mod api; pub mod auth; pub mod chat; pub mod embeddings; pub mod events; pub mod graph; pub mod mcp; pub mod meilisearch; pub mod indentiagraph; pub mod neurons; pub mod notes; pub mod orchestrator; pub mod parser; pub mod plan; pub mod resolver; pub mod setup_claude; pub mod skills; pub mod update;" > src/lib.rs && \
     echo "" > src/setup_claude.rs && \
     echo "" > src/update.rs && \
-    for dir in api auth chat embeddings events graph mcp meilisearch neo4j neurons notes orchestrator parser plan resolver skills; do \
+    for dir in api auth chat embeddings events graph mcp meilisearch indentiagraph neurons notes orchestrator parser plan resolver skills; do \
         echo "" > "src/$dir/mod.rs"; \
     done
 
@@ -114,7 +114,7 @@ FROM debian:trixie-slim AS runtime
 
 # OCI labels
 LABEL org.opencontainers.image.source="https://github.com/this-rs/project-orchestrator"
-LABEL org.opencontainers.image.description="AI agent orchestrator with Neo4j knowledge graph, Meilisearch, and Tree-sitter"
+LABEL org.opencontainers.image.description="AI agent orchestrator with IndentiaGraph knowledge graph, Meilisearch, and Tree-sitter"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL org.opencontainers.image.vendor="OpenClaw"
 

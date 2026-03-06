@@ -7,7 +7,7 @@ set -e
 ORCHESTRATOR_URL="${ORCHESTRATOR_URL:-http://localhost:8080}"
 
 case "$1" in
-  # Neo4j/Graph queries via API
+  # IndentiaGraph/Graph queries via API
   context)
     PLAN_ID=$2
     TASK_ID=$3

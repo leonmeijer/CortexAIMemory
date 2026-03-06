@@ -8,7 +8,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::graph::models::TopologySeverity;
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::GraphStore;
 use crate::notes::models::{Note, NoteFilters, NoteImportance, NoteType};
 
 /// Result of a post-sync topology check.
@@ -28,14 +28,14 @@ pub struct TopologyCheckHookResult {
 /// Violations are deduplicated using the tag `topology-violation:<fingerprint>`
 /// where fingerprint = `rule_id:violator:target`.
 pub async fn check_topology_post_sync(
-    neo4j: Arc<dyn GraphStore>,
+    indentiagraph: Arc<dyn GraphStore>,
     project_id: Uuid,
 ) -> anyhow::Result<TopologyCheckHookResult> {
     let pid = project_id.to_string();
     let mut result = TopologyCheckHookResult::default();
 
     // 1. Run topology rules
-    let violations = neo4j.check_topology_rules(&pid).await?;
+    let violations = indentiagraph.check_topology_rules(&pid).await?;
     result.violations_found = violations.len();
 
     if violations.is_empty() {
@@ -48,7 +48,7 @@ pub async fn check_topology_post_sync(
         limit: Some(500),
         ..Default::default()
     };
-    let (existing_notes, _) = neo4j
+    let (existing_notes, _) = indentiagraph
         .list_notes(Some(project_id), None, &filters)
         .await
         .unwrap_or((vec![], 0));
@@ -121,7 +121,7 @@ pub async fn check_topology_post_sync(
         ];
 
         // Create the note
-        if let Err(e) = neo4j.create_note(&note).await {
+        if let Err(e) = indentiagraph.create_note(&note).await {
             tracing::warn!(
                 "Failed to create topology violation note for {}: {}",
                 violation.violator_path,
@@ -131,7 +131,7 @@ pub async fn check_topology_post_sync(
         }
 
         // Link note to the violator file
-        if let Err(e) = neo4j
+        if let Err(e) = indentiagraph
             .link_note_to_entity(
                 note.id,
                 &crate::notes::models::EntityType::File,
@@ -150,7 +150,7 @@ pub async fn check_topology_post_sync(
 
         // Link note to the target file if present
         if let Some(ref target) = violation.target_path {
-            if let Err(e) = neo4j
+            if let Err(e) = indentiagraph
                 .link_note_to_entity(
                     note.id,
                     &crate::notes::models::EntityType::File,
@@ -176,7 +176,7 @@ mod tests {
     use crate::graph::models::{
         TopologyRule, TopologyRuleType, TopologySeverity, TopologyViolation,
     };
-    use crate::neo4j::mock::MockGraphStore;
+    use crate::indentiagraph::mock::MockGraphStore;
 
     #[tokio::test]
     async fn test_no_violations_returns_empty() {
@@ -200,15 +200,15 @@ mod tests {
             project_id: pid.to_string(),
             rule_type: TopologyRuleType::MustNotImport,
             source_pattern: "src/api/**".to_string(),
-            target_pattern: Some("src/neo4j/**".to_string()),
+            target_pattern: Some("src/indentiagraph/**".to_string()),
             threshold: None,
             severity: TopologySeverity::Error,
-            description: "API must not import Neo4j directly".to_string(),
+            description: "API must not import IndentiaGraph directly".to_string(),
         };
         mock.create_topology_rule(&rule).await.unwrap();
 
         // Mock doesn't produce violations, so result should be 0
-        // (real check_topology_rules with Neo4j would produce violations)
+        // (real check_topology_rules with IndentiaGraph would produce violations)
         let result = check_topology_post_sync(mock, pid).await.unwrap();
         assert_eq!(result.violations_found, 0);
     }
@@ -220,7 +220,7 @@ mod tests {
             rule_description: "test rule".to_string(),
             rule_type: TopologyRuleType::MustNotImport,
             violator_path: "src/api/handler.rs".to_string(),
-            target_path: Some("src/neo4j/client.rs".to_string()),
+            target_path: Some("src/indentiagraph/client.rs".to_string()),
             severity: TopologySeverity::Error,
             details: "test details".to_string(),
             violation_score: 0.9,
@@ -233,7 +233,7 @@ mod tests {
         );
         assert_eq!(
             fingerprint,
-            "topology-violation:r1:src/api/handler.rs:src/neo4j/client.rs"
+            "topology-violation:r1:src/api/handler.rs:src/indentiagraph/client.rs"
         );
     }
 

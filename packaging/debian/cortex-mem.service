@@ -1,0 +1,28 @@
+[Unit]
+Description=Cortex Memory Worker — Claude Code memory plugin daemon
+Documentation=https://github.com/this-rs/cortex-ai-memory
+After=network.target cortex.service
+Wants=cortex.service
+
+[Service]
+Type=simple
+User=cortex
+Group=cortex
+ExecStart=/usr/bin/cortex-mem
+WorkingDirectory=/var/lib/cortex
+EnvironmentFile=-/etc/cortex/env
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cortex-mem
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/cortex
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

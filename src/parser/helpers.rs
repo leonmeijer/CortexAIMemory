@@ -1,6 +1,6 @@
 //! Common helper functions for code parsing across all languages
 
-use crate::neo4j::models::*;
+use crate::indentiagraph::models::*;
 
 /// Get the text content of a node
 pub fn get_text<'a>(node: &tree_sitter::Node<'a>, source: &'a str) -> Option<&'a str> {

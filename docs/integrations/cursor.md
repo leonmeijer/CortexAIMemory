@@ -52,9 +52,9 @@ Add the following to your Cursor `settings.json`:
     "project-orchestrator": {
       "command": "/path/to/mcp_server",
       "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "orchestrator123",
+        "INDENTIAGRAPH_URI": "ws://localhost:8000",
+        "INDENTIAGRAPH_USER": "indentiagraph",
+        "INDENTIAGRAPH_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
         "MEILISEARCH_KEY": "orchestrator-meili-key-change-me"
       }
@@ -81,9 +81,9 @@ For project-specific settings, create `.cursor/mcp.json` in your project root:
     "project-orchestrator": {
       "command": "/path/to/mcp_server",
       "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "orchestrator123",
+        "INDENTIAGRAPH_URI": "ws://localhost:8000",
+        "INDENTIAGRAPH_USER": "indentiagraph",
+        "INDENTIAGRAPH_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
         "MEILISEARCH_KEY": "orchestrator-meili-key-change-me"
       }
@@ -375,9 +375,9 @@ Complete configuration for Cursor:
     "project-orchestrator": {
       "command": "/Users/me/tools/mcp_server",
       "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "orchestrator123",
+        "INDENTIAGRAPH_URI": "ws://localhost:8000",
+        "INDENTIAGRAPH_USER": "indentiagraph",
+        "INDENTIAGRAPH_PASSWORD": "orchestrator123",
         "MEILISEARCH_URL": "http://localhost:7700",
         "MEILISEARCH_KEY": "orchestrator-meili-key-change-me",
         "RUST_LOG": "info"

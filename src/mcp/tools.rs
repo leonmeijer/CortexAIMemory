@@ -154,6 +154,10 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "get_propagated_notes" => Some(("note", "get_propagated")),
         "get_propagated_knowledge" => Some(("note", "get_propagated_knowledge")),
         "get_entity_notes" => Some(("note", "get_entity")),
+        "add_episode" => Some(("note", "add_episode")),
+        "get_episodes" => Some(("note", "get_episodes")),
+        "search_episodes" => Some(("note", "search_episodes")),
+        "search_notes_at_time" => Some(("note", "search_at_time")),
 
         // Workspace
         "list_workspaces" => Some(("workspace", "list")),
@@ -288,8 +292,6 @@ pub fn resolve_legacy_alias(name: &str) -> Option<(&'static str, &'static str)> 
         "start_watch" => Some(("admin", "start_watch")),
         "stop_watch" => Some(("admin", "stop_watch")),
         "watch_status" => Some(("admin", "watch_status")),
-        "get_meilisearch_stats" => Some(("admin", "meilisearch_stats")),
-        "delete_meilisearch_orphans" => Some(("admin", "delete_meilisearch_orphans")),
         "cleanup_cross_project_calls" => Some(("admin", "cleanup_cross_project_calls")),
         "cleanup_builtin_calls" => Some(("admin", "cleanup_builtin_calls")),
         "migrate_calls_confidence" => Some(("admin", "migrate_calls_confidence")),
@@ -572,30 +574,34 @@ fn commit_tool() -> ToolDefinition {
 fn note_tool() -> ToolDefinition {
     ToolDefinition {
         name: "note".to_string(),
-        description: "Manage knowledge notes. Actions: list, create, get, update, delete, search, search_semantic, confirm, invalidate, supersede, link_to_entity, unlink_from_entity, get_context, get_needing_review, list_project, get_propagated, get_entity, get_context_knowledge, get_propagated_knowledge".to_string(),
+        description: "Manage knowledge notes. Actions: list, create, get, update, delete, search, search_semantic, confirm, invalidate, supersede, link_to_entity, unlink_from_entity, get_context, get_needing_review, list_project, get_propagated, get_entity, get_context_knowledge, get_propagated_knowledge, add_episode, get_episodes, search_episodes, search_at_time, invalidate_temporal".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["list", "create", "get", "update", "delete", "search", "search_semantic", "confirm", "invalidate", "supersede", "link_to_entity", "unlink_from_entity", "get_context", "get_needing_review", "list_project", "get_propagated", "get_entity", "get_context_knowledge", "get_propagated_knowledge"],
+                    "enum": ["list", "create", "get", "update", "delete", "search", "search_semantic", "confirm", "invalidate", "supersede", "link_to_entity", "unlink_from_entity", "get_context", "get_needing_review", "list_project", "get_propagated", "get_entity", "get_context_knowledge", "get_propagated_knowledge", "add_episode", "get_episodes", "search_episodes", "search_at_time", "invalidate_temporal"],
                     "description": "Operation to perform"
                 },
                 "note_id": {"type": "string", "description": "Note UUID"},
                 "project_id": {"type": "string", "description": "Project UUID"},
                 "note_type": {"type": "string", "description": "Type: guideline, gotcha, pattern, context, tip, observation, assertion"},
-                "content": {"type": "string", "description": "Note content (create/update)"},
+                "content": {"type": "string", "description": "Note content (create/update/add_episode)"},
                 "importance": {"type": "string", "description": "Importance: critical, high, medium, low"},
                 "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags"},
                 "status": {"type": "string", "description": "Status filter (list)"},
-                "query": {"type": "string", "description": "Search query (search/search_semantic)"},
+                "query": {"type": "string", "description": "Search query (search/search_semantic/search_at_time)"},
                 "superseded_by_id": {"type": "string", "description": "New note UUID (supersede)"},
                 "entity_type": {"type": "string", "description": "Entity type (link_to_entity/unlink_from_entity/get_context/get_entity)"},
                 "entity_id": {"type": "string", "description": "Entity identifier (link_to_entity/unlink_from_entity/get_context/get_entity)"},
                 "slug": {"type": "string", "description": "Project slug (list_project/get_propagated)"},
                 "file_path": {"type": "string", "description": "File path (get_propagated)"},
                 "limit": {"type": "integer", "description": "Max items"},
-                "offset": {"type": "integer", "description": "Skip items"}
+                "offset": {"type": "integer", "description": "Skip items"},
+                "episode_name": {"type": "string", "description": "Episode name/title (add_episode)"},
+                "episode_source": {"type": "string", "description": "Episode source: conversation, code, document, event (add_episode)"},
+                "at_time": {"type": "string", "description": "ISO 8601 datetime for temporal queries (search_at_time, invalidate_temporal)"},
+                "group_id": {"type": "string", "description": "Group ID for episode multi-tenancy (add_episode/get_episodes)"}
             })),
             required: Some(vec!["action".to_string()]),
         },
@@ -865,13 +871,13 @@ fn analysis_profile_tool() -> ToolDefinition {
 fn admin_tool() -> ToolDefinition {
     ToolDefinition {
         name: "admin".to_string(),
-        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, meilisearch_stats, delete_meilisearch_orphans, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, install_hooks".to_string(),
+        description: "Admin operations. Actions: sync_directory, start_watch, stop_watch, watch_status, cleanup_cross_project_calls, cleanup_builtin_calls, migrate_calls_confidence, cleanup_sync_data, update_staleness_scores, update_energy_scores, search_neurons, reinforce_neurons, decay_synapses, backfill_synapses, reindex_decisions, backfill_decision_embeddings, backfill_touches, backfill_discussed, update_fabric_scores, bootstrap_knowledge_fabric, reinforce_isomorphic, detect_skills, install_hooks".to_string(),
         input_schema: InputSchema {
             schema_type: "object".to_string(),
             properties: Some(json!({
                 "action": {
                     "type": "string",
-                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "meilisearch_stats", "delete_meilisearch_orphans", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "maintain_skills", "auto_anchor_notes", "install_hooks"],
+                    "enum": ["sync_directory", "start_watch", "stop_watch", "watch_status", "cleanup_cross_project_calls", "cleanup_builtin_calls", "migrate_calls_confidence", "cleanup_sync_data", "update_staleness_scores", "update_energy_scores", "search_neurons", "reinforce_neurons", "decay_synapses", "backfill_synapses", "reindex_decisions", "backfill_decision_embeddings", "backfill_touches", "backfill_discussed", "update_fabric_scores", "bootstrap_knowledge_fabric", "reinforce_isomorphic", "detect_skills", "maintain_skills", "auto_anchor_notes", "install_hooks"],
                     "description": "Operation to perform"
                 },
                 "path": {"type": "string", "description": "Directory path (sync_directory/start_watch)"},
@@ -1089,8 +1095,6 @@ mod tests {
             "start_watch",
             "stop_watch",
             "watch_status",
-            "get_meilisearch_stats",
-            "delete_meilisearch_orphans",
             "cleanup_cross_project_calls",
             "cleanup_builtin_calls",
             "migrate_calls_confidence",

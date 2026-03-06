@@ -1,72 +1,71 @@
 #!/bin/sh
-# RPM post-install script for Project Orchestrator
+# RPM post-install script for Cortex
 set -e
 
-# 1. Create system user 'orchestrator' if not exists
-if ! getent passwd orchestrator >/dev/null 2>&1; then
+# 1. Create system user 'cortex' if not exists
+if ! getent passwd cortex >/dev/null 2>&1; then
     useradd --system --no-create-home --shell /usr/sbin/nologin \
-        --home-dir /var/lib/project-orchestrator orchestrator
-    echo "Created system user 'orchestrator'"
+        --home-dir /var/lib/cortex cortex
+    echo "Created system user 'cortex'"
 fi
 
 # 2. Create working directory
-mkdir -p /var/lib/project-orchestrator
-chown orchestrator:orchestrator /var/lib/project-orchestrator
-chmod 750 /var/lib/project-orchestrator
+mkdir -p /var/lib/cortex
+chown cortex:cortex /var/lib/cortex
+chmod 750 /var/lib/cortex
 
 # 3. Create config directory
-mkdir -p /etc/project-orchestrator
+mkdir -p /etc/cortex
 
 # 4. Generate initial config if absent
-if [ ! -f /etc/project-orchestrator/config.yaml ]; then
-    cp /etc/project-orchestrator/config.yaml.example \
-       /etc/project-orchestrator/config.yaml
-    echo "Created /etc/project-orchestrator/config.yaml from example"
+if [ ! -f /etc/cortex/config.yaml ]; then
+    cp /etc/cortex/config.yaml.example \
+       /etc/cortex/config.yaml
+    echo "Created /etc/cortex/config.yaml from example"
 fi
 
 # 5. Generate env file with random secrets if absent
-if [ ! -f /etc/project-orchestrator/env ]; then
+if [ ! -f /etc/cortex/env ]; then
     JWT_SECRET=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-    MEILI_KEY=$(head -c 32 /dev/urandom | base64 | tr -d '\n')
-    cat > /etc/project-orchestrator/env <<EOF
+    cat > /etc/cortex/env <<EOF
 # Auto-generated secrets — change as needed
-NEO4J_URI=bolt://localhost:7687
-NEO4J_USER=neo4j
-NEO4J_PASSWORD=change-me
-MEILISEARCH_URL=http://localhost:7700
-MEILISEARCH_KEY=${MEILI_KEY}
+SURREALDB_URL=ws://localhost:8000
+SURREALDB_NAMESPACE=cortex
+SURREALDB_DATABASE=memory
+SURREALDB_USER=root
+SURREALDB_PASSWORD=change-me
 JWT_SECRET=${JWT_SECRET}
-RUST_LOG=info,project_orchestrator=debug
+RUST_LOG=info,cortex=debug
 EOF
-    chmod 600 /etc/project-orchestrator/env
-    chown orchestrator:orchestrator /etc/project-orchestrator/env
-    echo "Generated /etc/project-orchestrator/env with random secrets"
+    chmod 600 /etc/cortex/env
+    chown cortex:cortex /etc/cortex/env
+    echo "Generated /etc/cortex/env with random secrets"
 fi
 
 # 6. Set ownership on config files
-chown -R orchestrator:orchestrator /etc/project-orchestrator
+chown -R cortex:cortex /etc/cortex
 
 # 7. Reload systemd
 systemctl daemon-reload || true
 
 echo ""
 echo "================================================================"
-echo "  Project Orchestrator installed successfully!"
+echo "  Cortex installed successfully!"
 echo ""
-echo "  Before starting, ensure Neo4j and MeiliSearch are running."
+echo "  Before starting, ensure SurrealDB is running."
 echo "  A Docker Compose file is provided at:"
-echo "    /etc/project-orchestrator/docker-compose.services.yml"
+echo "    /etc/cortex/docker-compose.services.yml"
 echo ""
 echo "  Quick start:"
-echo "    cd /etc/project-orchestrator"
+echo "    cd /etc/cortex"
 echo "    docker compose -f docker-compose.services.yml up -d"
-echo "    sudo systemctl enable --now project-orchestrator"
+echo "    sudo systemctl enable --now cortex"
 echo ""
-echo "  Edit config: /etc/project-orchestrator/config.yaml"
-echo "  Edit secrets: /etc/project-orchestrator/env"
+echo "  Edit config: /etc/cortex/config.yaml"
+echo "  Edit secrets: /etc/cortex/env"
 echo ""
 echo "  Claude Code integration:"
-echo "    orchestrator setup-claude"
+echo "    cortex setup-claude"
 echo "    (auto-configures the MCP server in Claude Code)"
 echo "================================================================"
 echo ""

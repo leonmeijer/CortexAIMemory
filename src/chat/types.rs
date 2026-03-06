@@ -339,7 +339,7 @@ impl ChatEvent {
 #[derive(Debug, Clone)]
 pub struct ChatEventPage {
     /// The events in this page (sorted by seq ASC)
-    pub events: Vec<crate::neo4j::models::ChatEventRecord>,
+    pub events: Vec<crate::indentiagraph::models::ChatEventRecord>,
     /// Total number of events for this session
     pub total_count: usize,
     /// Whether there are more events beyond this page
@@ -366,7 +366,7 @@ pub enum ClientMessage {
     InputResponse { content: String },
 }
 
-/// Chat session metadata (persisted in Neo4j)
+/// Chat session metadata (persisted in IndentiaGraph)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
     /// Internal session ID (UUID)
@@ -425,7 +425,7 @@ pub struct CreateSessionResponse {
 /// A single message hit from full-text search
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageSearchHit {
-    /// Message ID in Meilisearch
+    /// Message ID in legacy indexed storage
     pub message_id: String,
     /// Message role (user or assistant)
     pub role: String,

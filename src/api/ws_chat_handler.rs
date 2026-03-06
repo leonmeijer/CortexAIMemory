@@ -84,13 +84,13 @@ pub async fn ws_chat(
         .as_ref()
         .ok_or_else(|| AppError::Internal(anyhow::anyhow!("Chat manager not initialized")))?;
 
-    // Validate that the session exists (in Neo4j or active)
+    // Validate that the session exists (in IndentiaGraph or active)
     let uuid = uuid::Uuid::parse_str(&session_id)
         .map_err(|_| AppError::BadRequest(format!("Invalid session ID: {}", session_id)))?;
 
     let exists = state
         .orchestrator
-        .neo4j()
+        .indentiagraph()
         .get_chat_session(uuid)
         .await
         .map_err(AppError::Internal)?;
@@ -111,11 +111,11 @@ pub async fn ws_chat(
     let last_event = query.last_event;
 
     // Pre-upgrade auth: cookie first, then ticket fallback
-    let neo4j = state.orchestrator.neo4j_arc();
+    let indentiagraph = state.orchestrator.indentiagraph_arc();
     let auth_result = super::ws_auth::ws_authenticate(
         &headers,
         &state.auth_config,
-        &neo4j,
+        &indentiagraph,
         query.ticket.as_deref(),
         &state.ws_ticket_store,
     )
@@ -200,11 +200,11 @@ async fn handle_ws_chat_loop(
     // ========================================================================
     // Phase 1: Replay persisted events since last_event
     // ========================================================================
-    // OPTIMIZATION: Skip the Neo4j query entirely when last_event is very large
+    // OPTIMIZATION: Skip the IndentiaGraph query entirely when last_event is very large
     // (e.g. Number.MAX_SAFE_INTEGER from the frontend). This means the client
     // doesn't want any historical replay — it will load history via REST and
     // only needs the live streaming snapshot (Phase 1.5). Skipping saves one
-    // Neo4j round-trip (~50-200ms) that would always return 0 events anyway.
+    // IndentiaGraph round-trip (~50-200ms) that would always return 0 events anyway.
     const SKIP_REPLAY_THRESHOLD: i64 = 1_000_000_000_000;
 
     if last_event < SKIP_REPLAY_THRESHOLD {
@@ -219,7 +219,7 @@ async fn handle_ws_chat_loop(
         let mut _max_replayed_seq: i64 = last_event;
 
         if !events.is_empty() {
-            // New format: replay ChatEventRecord from Neo4j
+            // New format: replay ChatEventRecord from IndentiaGraph
             debug!(
                 session_id = %session_id,
                 count = events.len(),
@@ -978,8 +978,8 @@ async fn handle_ws_chat_loop(
                                     WsChatClientMessage::SetAutoContinue { enabled } => {
                                         info!(session_id = %session_id, enabled = %enabled, "WS: Received set_auto_continue");
                                         // set_auto_continue works whether the session is active or idle:
-                                        // - Active: updates in-memory + Neo4j + local broadcast + NATS
-                                        // - Idle: updates Neo4j + NATS only
+                                        // - Active: updates in-memory + IndentiaGraph + local broadcast + NATS
+                                        // - Idle: updates IndentiaGraph + NATS only
                                         // No need for try_remote_send — NATS pub/sub handles cross-instance.
                                         match chat_manager.set_auto_continue(&session_id, enabled).await {
                                             Ok(()) => {
@@ -1108,7 +1108,7 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
     };
 
     // Convert to (entity_type, entity_id) tuples for add_discussed
-    // add_discussed expects Neo4j labels: "File", "Function", "Struct", "Trait", "Enum"
+    // add_discussed expects IndentiaGraph labels: "File", "Function", "Struct", "Trait", "Enum"
     let discussed_entities: Vec<(String, String)> = entities
         .into_iter()
         .map(|e| {
@@ -1124,7 +1124,7 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
         })
         .collect();
 
-    let neo4j = state.orchestrator.neo4j_arc();
+    let indentiagraph = state.orchestrator.indentiagraph_arc();
 
     // Read reinforcement config before moving into async block
     let ar_config = state.orchestrator.auto_reinforcement_config().clone();
@@ -1140,7 +1140,10 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
     // Fire-and-forget: create DISCUSSED relations + neural reinforcement
     tokio::spawn(async move {
         // Phase 1: Create DISCUSSED relations
-        match neo4j.add_discussed(session_uuid, &discussed_entities).await {
+        match indentiagraph
+            .add_discussed(session_uuid, &discussed_entities)
+            .await
+        {
             Ok(created) => {
                 if created > 0 {
                     debug!(
@@ -1171,7 +1174,7 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
         let mut boost_count = 0u64;
 
         for (entity_type_str, entity_id) in &reinforcement_entities {
-            // Map Neo4j label to notes::EntityType
+            // Map IndentiaGraph label to notes::EntityType
             let entity_type = match entity_type_str.as_str() {
                 "File" => crate::notes::EntityType::File,
                 "Function" => crate::notes::EntityType::Function,
@@ -1181,11 +1184,14 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
                 _ => continue,
             };
 
-            match neo4j.get_notes_for_entity(&entity_type, entity_id).await {
+            match indentiagraph
+                .get_notes_for_entity(&entity_type, entity_id)
+                .await
+            {
                 Ok(notes) => {
                     for note in &notes {
                         // Boost energy for each note linked to a discussed entity
-                        if let Err(e) = neo4j
+                        if let Err(e) = indentiagraph
                             .boost_energy(note.id, ar_config.chat_energy_boost)
                             .await
                         {
@@ -1216,7 +1222,7 @@ pub fn spawn_entity_extraction(state: &OrchestratorState, session_id: &str, mess
             all_note_ids.sort();
             all_note_ids.dedup();
             if all_note_ids.len() >= 2 {
-                match neo4j
+                match indentiagraph
                     .reinforce_synapses(&all_note_ids, ar_config.chat_synapse_boost)
                     .await
                 {

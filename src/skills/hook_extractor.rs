@@ -154,8 +154,8 @@ pub fn extract_file_context(tool_name: &str, tool_input: &serde_json::Value) -> 
 // MCP mega-tool pattern extraction (internal)
 // ============================================================================
 
-/// Known MCP prefix for Project Orchestrator mega-tools.
-const MCP_PO_PREFIX: &str = "mcp__project-orchestrator__";
+/// Known MCP prefixes for Cortex mega-tools (plus legacy compatibility).
+const MCP_PREFIXES: &[&str] = &["mcp__cortex__", "mcp__project-orchestrator__"];
 
 /// Key fields to extract per mega-tool, in priority order.
 /// The first matching field becomes part of the pattern string.
@@ -258,22 +258,23 @@ const MCP_KEY_FIELDS: &[(&str, &[&str])] = &[
 ///
 /// Examples:
 /// - `"task create Implement auth middleware"`  (from title)
-/// - `"code search neo4j batch UNWIND"`  (from query)
+/// - `"code search indentiagraph batch UNWIND"`  (from query)
 /// - `"note search_semantic authentication login"`  (from query)
 /// - `"admin sync_directory"`  (action only, no extra fields)
 ///
 /// # Arguments
 ///
-/// * `tool_name` - Full MCP tool name (e.g., `"mcp__project-orchestrator__task"`)
+/// * `tool_name` - Full MCP tool name (e.g., `"mcp__cortex__task"`)
 /// * `tool_input` - JSON object with `action` and tool-specific params
 fn extract_mcp_pattern(tool_name: &str, tool_input: &serde_json::Value) -> Option<String> {
     // Extract the mega-tool short name from the MCP prefix
-    let mega_tool = if let Some(suffix) = tool_name.strip_prefix(MCP_PO_PREFIX) {
-        suffix
-    } else {
-        // Non-PO MCP tool — try generic extraction with just the last segment
-        tool_name.rsplit("__").next().unwrap_or(tool_name)
-    };
+    let mega_tool = MCP_PREFIXES
+        .iter()
+        .find_map(|prefix| tool_name.strip_prefix(prefix))
+        .unwrap_or_else(|| {
+            // Non-cortex MCP tool — try generic extraction with just the last segment.
+            tool_name.rsplit("__").next().unwrap_or(tool_name)
+        });
 
     // Action is mandatory for all mega-tools
     let action = tool_input
@@ -820,11 +821,10 @@ mod tests {
 
     #[test]
     fn test_extract_file_context_edit() {
-        let input =
-            json!({"file_path": "src/neo4j/client.rs", "old_string": "a", "new_string": "b"});
+        let input = json!({"file_path": "src/indentiagraph/client.rs", "old_string": "a", "new_string": "b"});
         assert_eq!(
             extract_file_context("Edit", &input),
-            Some("src/neo4j/client.rs".to_string())
+            Some("src/indentiagraph/client.rs".to_string())
         );
     }
 
@@ -863,10 +863,10 @@ mod tests {
 
     #[test]
     fn test_extract_file_context_bash_rg_with_path() {
-        let input = json!({"command": "rg pattern src/neo4j/"});
+        let input = json!({"command": "rg pattern src/indentiagraph/"});
         assert_eq!(
             extract_file_context("Bash", &input),
-            Some("src/neo4j/".to_string())
+            Some("src/indentiagraph/".to_string())
         );
     }
 
@@ -981,10 +981,11 @@ mod tests {
 
     #[test]
     fn test_mcp_note_search_semantic() {
-        let input = json!({"action": "search_semantic", "query": "neo4j batch performance"});
+        let input =
+            json!({"action": "search_semantic", "query": "indentiagraph batch performance"});
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__note", &input),
-            Some("note search_semantic neo4j batch performance".to_string())
+            Some("note search_semantic indentiagraph batch performance".to_string())
         );
     }
 
@@ -999,10 +1000,10 @@ mod tests {
 
     #[test]
     fn test_mcp_note_link_to_entity() {
-        let input = json!({"action": "link_to_entity", "entity_type": "file", "entity_id": "src/neo4j/skill.rs"});
+        let input = json!({"action": "link_to_entity", "entity_type": "file", "entity_id": "src/indentiagraph/skill.rs"});
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__note", &input),
-            Some("note link_to_entity file src/neo4j/skill.rs".to_string())
+            Some("note link_to_entity file src/indentiagraph/skill.rs".to_string())
         );
     }
 
@@ -1010,10 +1011,10 @@ mod tests {
 
     #[test]
     fn test_mcp_code_search() {
-        let input = json!({"action": "search", "query": "neo4j batch UNWIND"});
+        let input = json!({"action": "search", "query": "indentiagraph batch UNWIND"});
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__code", &input),
-            Some("code search neo4j batch UNWIND".to_string())
+            Some("code search indentiagraph batch UNWIND".to_string())
         );
     }
 
@@ -1028,10 +1029,11 @@ mod tests {
 
     #[test]
     fn test_mcp_code_analyze_impact() {
-        let input = json!({"action": "analyze_impact", "target": "/Users/foo/src/neo4j/client.rs"});
+        let input =
+            json!({"action": "analyze_impact", "target": "/Users/foo/src/indentiagraph/client.rs"});
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__code", &input),
-            Some("code analyze_impact /Users/foo/src/neo4j/client.rs".to_string())
+            Some("code analyze_impact /Users/foo/src/indentiagraph/client.rs".to_string())
         );
     }
 
@@ -1098,10 +1100,10 @@ mod tests {
 
     #[test]
     fn test_mcp_step_create() {
-        let input = json!({"action": "create", "task_id": "t-uuid", "description": "Add batch UNWIND to neo4j queries"});
+        let input = json!({"action": "create", "task_id": "t-uuid", "description": "Add batch UNWIND to indentiagraph queries"});
         assert_eq!(
             extract_pattern("mcp__project-orchestrator__step", &input),
-            Some("step create Add batch UNWIND to neo4j queries t-uuid".to_string())
+            Some("step create Add batch UNWIND to indentiagraph queries t-uuid".to_string())
         );
     }
 
@@ -1322,10 +1324,11 @@ mod tests {
 
     #[test]
     fn test_mcp_file_context_code_target() {
-        let input = json!({"action": "analyze_impact", "target": "/Users/foo/src/neo4j/client.rs"});
+        let input =
+            json!({"action": "analyze_impact", "target": "/Users/foo/src/indentiagraph/client.rs"});
         assert_eq!(
             extract_file_context("mcp__project-orchestrator__code", &input),
-            Some("/Users/foo/src/neo4j/client.rs".to_string())
+            Some("/Users/foo/src/indentiagraph/client.rs".to_string())
         );
     }
 

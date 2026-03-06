@@ -1,11 +1,11 @@
 //! Automatic Claude Code MCP configuration.
 //!
-//! Detects Claude Code CLI and configures the Project Orchestrator
+//! Detects Claude Code CLI and configures the Cortex
 //! MCP server, either via `claude mcp add` or by directly editing
 //! `~/.claude/mcp.json`.
 //!
 //! Also configures `~/.claude/settings.json` to pre-approve all MCP tools
-//! from the Project Orchestrator server (`mcp__project-orchestrator__*`),
+//! from the Cortex server (`mcp__cortex__*`),
 //! so the user doesn't get a permission prompt for every tool call.
 
 use anyhow::{bail, Context, Result};
@@ -34,12 +34,13 @@ pub enum SetupResult {
 // Configuration
 // ============================================================================
 
-const MCP_SERVER_NAME: &str = "project-orchestrator";
+const MCP_SERVER_NAME: &str = "cortex";
+const LEGACY_MCP_SERVER_NAME: &str = "project-orchestrator";
 
-/// Permission pattern that allows all MCP tools from the Project Orchestrator server.
+/// Permission pattern that allows all MCP tools from the Cortex server.
 /// Format: `mcp__<server-name>__*` (Claude Code double-underscore convention).
 /// See: https://code.claude.com/docs/en/permissions#mcp
-const MCP_ALLOWED_TOOL_PATTERN: &str = "mcp__project-orchestrator__*";
+const MCP_ALLOWED_TOOL_PATTERN: &str = "mcp__cortex__*";
 
 /// Build the default SSE URL using the given port.
 ///
@@ -79,7 +80,7 @@ pub fn setup_claude_code(server_url: Option<&str>, port: Option<u16>) -> Result<
 
     // Check if already configured
     if is_already_configured()? {
-        tracing::info!("Project Orchestrator MCP server is already configured in Claude Code");
+        tracing::info!("Cortex MCP server is already configured in Claude Code");
         return Ok(SetupResult::AlreadyConfigured {
             allowed_tools_configured: allowed_tools_ok,
         });
@@ -270,8 +271,10 @@ fn is_already_configured() -> Result<bool> {
     // Check in mcpServers
     Ok(json
         .get("mcpServers")
-        .and_then(|s| s.get(MCP_SERVER_NAME))
-        .is_some())
+        .map(|servers| {
+            servers.get(MCP_SERVER_NAME).is_some() || servers.get(LEGACY_MCP_SERVER_NAME).is_some()
+        })
+        .unwrap_or(false))
 }
 
 /// Configure by directly editing ~/.claude/mcp.json.
@@ -338,8 +341,8 @@ fn settings_json_path() -> Result<PathBuf> {
 
 /// Configure allowed tools in `~/.claude/settings.json`.
 ///
-/// Adds the `mcp__project-orchestrator__*` pattern to `permissions.allow`
-/// so all MCP tools from the Project Orchestrator server are pre-approved.
+/// Adds the `mcp__cortex__*` pattern to `permissions.allow`
+/// so all MCP tools from the Cortex server are pre-approved.
 ///
 /// - Merges with existing settings (never overwrites)
 /// - Creates a backup (.bak) if the file already exists
@@ -462,7 +465,7 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         let json: Value = serde_json::from_str(&content).unwrap();
 
-        // Verify structure: { "permissions": { "allow": ["mcp__project-orchestrator__*"] } }
+        // Verify structure: { "permissions": { "allow": ["mcp__cortex__*"] } }
         let allow = json["permissions"]["allow"].as_array().unwrap();
         assert_eq!(allow.len(), 1);
         assert_eq!(allow[0].as_str().unwrap(), MCP_ALLOWED_TOOL_PATTERN);

@@ -1,22 +1,19 @@
 services:
-  neo4j:
-    image: neo4j:5.26.20-community
-    container_name: orchestrator-neo4j
+  indentiagraph:
+    image: surrealdb/surrealdb:latest
+    container_name: orchestrator-indentiagraph
     ports:
-      - "7474:7474"  # HTTP Browser
-      - "7687:7687"  # Bolt
-    environment:
-      - NEO4J_AUTH=neo4j/orchestrator123
-      - NEO4J_PLUGINS=["apoc"]
-      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
-      - NEO4J_dbms_memory_heap_initial__size=2G
-      - NEO4J_dbms_memory_heap_max__size=4G
+      - "8000:8000"
+    command: >
+      start
+      --log info
+      --user ${SURREALDB_USER:-root}
+      --pass ${SURREALDB_PASSWORD:-orchestrator123}
+      rocksdb:/data/indentiagraph.db
     volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
-      - ./init/neo4j:/var/lib/neo4j/import
+      - indentiagraph_data:/data
     healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7474 || exit 1"]
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8000/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -48,8 +45,8 @@ services:
     image: nats:2.11-alpine
     container_name: orchestrator-nats
     ports:
-      - "4222:4222"   # Client connections
-      - "8222:8222"   # HTTP monitoring
+      - "4222:4222"
+      - "8222:8222"
     command: ["--http_port", "8222", "--jetstream"]
     volumes:
       - nats_data:/data/jetstream
@@ -66,29 +63,21 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        # Path to the frontend source within the build context.
-        # To include the frontend, either:
-        # 1. Symlink/copy the frontend dir into this repo as ./frontend
-        # 2. Pre-build the frontend and copy dist/ to ./dist
-        # 3. Set FRONTEND_SRC to a valid path in the build context
         FRONTEND_SRC: ./frontend
     container_name: orchestrator-server
     ports:
       - "8080:8080"
     environment:
-      - NEO4J_URI=bolt://neo4j:7687
-      - NEO4J_USER=neo4j
-      - NEO4J_PASSWORD=orchestrator123
+      - INDENTIAGRAPH_URI=ws://indentiagraph:8000
+      - INDENTIAGRAPH_USER=${SURREALDB_USER:-root}
+      - INDENTIAGRAPH_PASSWORD=${SURREALDB_PASSWORD:-orchestrator123}
       - MEILISEARCH_URL=http://meilisearch:7700
       - MEILISEARCH_KEY=orchestrator-meili-key-change-me
       - RUST_LOG=info,project_orchestrator=debug
       - WORKSPACE_PATH=/workspace
       - NATS_URL=nats://nats:4222
-      # Frontend is served from /app/dist (default: true)
-      # Set to false for API-only mode
-      # - SERVE_FRONTEND=false
     depends_on:
-      neo4j:
+      indentiagraph:
         condition: service_healthy
       meilisearch:
         condition: service_healthy
@@ -101,8 +90,7 @@ services:
       - orchestrator-net
 
 volumes:
-  neo4j_data:
-  neo4j_logs:
+  indentiagraph_data:
   meilisearch_data:
   nats_data:
   orchestrator_data:

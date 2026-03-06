@@ -54,11 +54,11 @@ wait_for_service() {
 # Start backends
 start_backends() {
     log_info "Starting backends with docker-compose..."
-    docker compose up -d neo4j meilisearch
+    docker compose up -d indentiagraph meilisearch
 
     # Wait for services
     wait_for_service "http://localhost:7700/health" "Meilisearch" 60
-    wait_for_service "http://localhost:7474" "Neo4j" 60
+    wait_for_service "http://localhost:7474" "IndentiaGraph" 60
 
     log_info "Backends are ready!"
 }
@@ -75,7 +75,7 @@ run_unit_tests() {
     cargo test --test parser_tests -- --nocapture
 }
 
-# Run integration tests (requires Neo4j and Meilisearch)
+# Run integration tests (requires IndentiaGraph and Meilisearch)
 run_integration_tests() {
     log_info "Running integration tests..."
     cargo test --test integration_tests -- --nocapture
@@ -116,11 +116,11 @@ smoke_test() {
         return 1
     fi
 
-    # Test Neo4j
+    # Test IndentiaGraph
     if curl -sf "http://localhost:7474" > /dev/null; then
-        log_info "✓ Neo4j is running"
+        log_info "✓ IndentiaGraph is running"
     else
-        log_error "✗ Neo4j is not running"
+        log_error "✗ IndentiaGraph is not running"
         return 1
     fi
 
@@ -218,7 +218,7 @@ case "${1:-all}" in
         echo ""
         echo "Commands:"
         echo "  unit        Run unit tests (no external services needed)"
-        echo "  integration Run integration tests (requires Neo4j + Meilisearch)"
+        echo "  integration Run integration tests (requires IndentiaGraph + Meilisearch)"
         echo "  api         Run API tests (requires full stack)"
         echo "  smoke       Run quick smoke test"
         echo "  backends    Start backends and keep running"

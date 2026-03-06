@@ -11,7 +11,7 @@ Project Orchestrator provides two WebSocket endpoints for real-time communicatio
 1. **Chat WebSocket** (`/ws/chat/{session_id}`) -- Bidirectional chat with Claude, replacing the previous SSE-based streaming approach with a single WebSocket connection per client per session.
 2. **CRUD Events WebSocket** (`/ws/events`) -- Real-time notifications for all create, update, delete, link, and unlink operations across the system.
 
-The chat system is built on the [nexus-claude SDK](https://github.com/anthropics/nexus-claude) with full memory support. Conversations are session-based and persisted in Neo4j, allowing resume and replay.
+The chat system is built on the [nexus-claude SDK](https://github.com/anthropics/nexus-claude) with full memory support. Conversations are session-based and persisted in IndentiaGraph, allowing resume and replay.
 
 ---
 
@@ -20,12 +20,12 @@ The chat system is built on the [nexus-claude SDK](https://github.com/anthropics
 ```
 Client <--> WebSocket <--> ChatManager <--> nexus-claude SDK <--> Claude
                                 |                    |
-                           Neo4j (sessions,     NATS (cross-instance
+                           IndentiaGraph (sessions,     NATS (cross-instance
                             messages, events)    chat relay, events)
 ```
 
 - **ChatManager** manages active sessions, broadcast channels, and the nexus-claude SDK integration
-- **Neo4j** persists session metadata, message history, and structured chat events for replay
+- **IndentiaGraph** persists session metadata, message history, and structured chat events for replay
 - **Meilisearch** indexes messages for full-text search across sessions
 - **NATS** enables cross-instance chat relay (RPC send, interrupt forwarding, streaming snapshots) and CRUD event sync
 - **EventBus** broadcasts CRUD events to all connected `/ws/events` clients (local + NATS hybrid)
@@ -36,7 +36,7 @@ Client <--> WebSocket <--> ChatManager <--> nexus-claude SDK <--> Claude
 
 ### Connection
 
-Connect to an existing session by its UUID. The session must already exist in Neo4j (created via `POST /api/chat/sessions` or the `chat_send_message` MCP tool).
+Connect to an existing session by its UUID. The session must already exist in IndentiaGraph (created via `POST /api/chat/sessions` or the `chat_send_message` MCP tool).
 
 ```javascript
 const ws = new WebSocket('ws://localhost:8080/ws/chat/SESSION_UUID');
@@ -307,12 +307,12 @@ curl "http://localhost:8080/api/chat/search?q=authentication&project_slug=my-api
 
 ### Session Lifecycle
 
-1. **Create** -- `POST /api/chat/sessions` creates a new session in Neo4j and starts a Claude CLI subprocess
+1. **Create** -- `POST /api/chat/sessions` creates a new session in IndentiaGraph and starts a Claude CLI subprocess
 2. **Connect** -- Client connects to `/ws/chat/{session_id}` for real-time streaming
 3. **Chat** -- Send messages via WebSocket, receive streaming events
 4. **Idle timeout** -- After `session_timeout_secs` (default: 1800 = 30 minutes) of inactivity, the CLI subprocess is freed
 5. **Resume** -- Sending a message to an inactive session automatically resumes the CLI process
-6. **Delete** -- `DELETE /api/chat/sessions/{id}` closes the subprocess and removes the session from Neo4j
+6. **Delete** -- `DELETE /api/chat/sessions/{id}` closes the subprocess and removes the session from IndentiaGraph
 
 ### Session Data Model
 
@@ -376,7 +376,7 @@ The chat system is configured via environment variables:
 | `PROMPT_BUILDER_MODEL` | Model for oneshot prompt builder (context refinement) | `claude-opus-4-6` |
 | `MCP_SERVER_PATH` | Path to the MCP server binary | Auto-detected |
 
-The chat system also inherits Neo4j and Meilisearch connection settings from the main configuration (`NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `MEILISEARCH_URL`, `MEILISEARCH_KEY`).
+The chat system also inherits IndentiaGraph and Meilisearch connection settings from the main configuration (`INDENTIAGRAPH_URI`, `INDENTIAGRAPH_USER`, `INDENTIAGRAPH_PASSWORD`, `MEILISEARCH_URL`, `MEILISEARCH_KEY`).
 
 ### NATS Configuration (Multi-Instance)
 
@@ -406,7 +406,7 @@ Without NATS, the orchestrator operates in single-instance mode with local broad
 
 ### Session not found (404)
 
-The session must exist in Neo4j before connecting to the WebSocket. Create it first via `POST /api/chat/sessions` or the `chat_send_message` MCP tool.
+The session must exist in IndentiaGraph before connecting to the WebSocket. Create it first via `POST /api/chat/sessions` or the `chat_send_message` MCP tool.
 
 ### Session expired / inactive
 
@@ -416,7 +416,7 @@ When a session's CLI subprocess times out, it is freed but the session data rema
 
 - Verify the WebSocket is authenticated (`auth_ok` received).
 - Check your `entity_types` filter -- if specified, only matching events are forwarded.
-- Ensure mutations are happening through the API/MCP layer (direct Neo4j changes are not detected).
+- Ensure mutations are happening through the API/MCP layer (direct IndentiaGraph changes are not detected).
 
 ### Events lagged
 

@@ -1,6 +1,6 @@
 //! Docker management for the desktop application.
 //!
-//! Uses bollard to manage Neo4j and MeiliSearch containers directly
+//! Uses bollard to manage IndentiaGraph and MeiliSearch containers directly
 //! from the Tauri app, without requiring docker-compose.
 
 use bollard::container::{
@@ -20,10 +20,10 @@ use tokio::sync::RwLock;
 // Types
 // ============================================================================
 
-const NEO4J_IMAGE: &str = "neo4j:5-community";
+const INDENTIAGRAPH_IMAGE: &str = "surrealdb/surrealdb:latest";
 const MEILISEARCH_IMAGE: &str = "getmeili/meilisearch:latest";
 const NATS_IMAGE: &str = "nats:latest";
-const NEO4J_CONTAINER: &str = "orchestrator-neo4j";
+const INDENTIAGRAPH_CONTAINER: &str = "orchestrator-indentiagraph";
 const MEILISEARCH_CONTAINER: &str = "orchestrator-meilisearch";
 const NATS_CONTAINER: &str = "orchestrator-nats";
 const NATS_PORT: u16 = 4222;
@@ -65,7 +65,7 @@ impl std::fmt::Display for DockerStatus {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServicesHealth {
-    pub neo4j: ServiceStatus,
+    pub indentiagraph: ServiceStatus,
     pub meilisearch: ServiceStatus,
     pub nats: ServiceStatus,
     pub docker_available: bool,
@@ -78,7 +78,7 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DockerConfig {
-    pub neo4j_password: String,
+    pub indentiagraph_password: String,
     pub meilisearch_key: String,
     #[serde(default = "default_true")]
     pub nats_enabled: bool,
@@ -284,13 +284,13 @@ impl DockerManager {
         }
     }
 
-    /// Start Neo4j, MeiliSearch, and optionally NATS containers.
+    /// Start IndentiaGraph, MeiliSearch, and optionally NATS containers.
     pub async fn start_services(&self, config: &DockerConfig) -> Result<(), String> {
         let docker = self.docker()?;
 
         // Pull images in parallel (only pull NATS if enabled)
         let (r1, r2) = tokio::join!(
-            self.ensure_image(NEO4J_IMAGE),
+            self.ensure_image(INDENTIAGRAPH_IMAGE),
             self.ensure_image(MEILISEARCH_IMAGE),
         );
         r1?;
@@ -300,32 +300,32 @@ impl DockerManager {
             self.ensure_image(NATS_IMAGE).await?;
         }
 
-        // --- Neo4j ---
-        if !self.container_exists(NEO4J_CONTAINER).await? {
-            tracing::info!("Creating Neo4j container...");
+        // --- IndentiaGraph ---
+        if !self.container_exists(INDENTIAGRAPH_CONTAINER).await? {
+            tracing::info!("Creating IndentiaGraph container...");
 
             let mut port_bindings = HashMap::new();
             port_bindings.insert(
-                "7474/tcp".to_string(),
+                "8000/tcp".to_string(),
                 Some(vec![PortBinding {
                     host_ip: Some("127.0.0.1".into()),
-                    host_port: Some("7474".into()),
-                }]),
-            );
-            port_bindings.insert(
-                "7687/tcp".to_string(),
-                Some(vec![PortBinding {
-                    host_ip: Some("127.0.0.1".into()),
-                    host_port: Some("7687".into()),
+                    host_port: Some("8000".into()),
                 }]),
             );
 
             let container_config = ContainerConfig {
-                image: Some(NEO4J_IMAGE.to_string()),
-                env: Some(vec![
-                    format!("NEO4J_AUTH=neo4j/{}", config.neo4j_password),
-                    "NEO4J_PLUGINS=[\"apoc\"]".into(),
-                    "NEO4J_dbms_security_procedures_unrestricted=apoc.*".into(),
+                image: Some(INDENTIAGRAPH_IMAGE.to_string()),
+                cmd: Some(vec![
+                    "start".into(),
+                    "--log".into(),
+                    "info".into(),
+                    "--user".into(),
+                    "root".into(),
+                    "--pass".into(),
+                    config.indentiagraph_password.clone(),
+                    "--bind".into(),
+                    "0.0.0.0:8000".into(),
+                    "rocksdb:/data/indentiagraph.db".into(),
                 ]),
                 host_config: Some(HostConfig {
                     port_bindings: Some(port_bindings),
@@ -341,21 +341,21 @@ impl DockerManager {
             docker
                 .create_container(
                     Some(CreateContainerOptions {
-                        name: NEO4J_CONTAINER,
+                        name: INDENTIAGRAPH_CONTAINER,
                         ..Default::default()
                     }),
                     container_config,
                 )
                 .await
-                .map_err(|e| format!("Failed to create Neo4j container: {}", e))?;
+                .map_err(|e| format!("Failed to create IndentiaGraph container: {}", e))?;
         }
 
-        if !self.container_running(NEO4J_CONTAINER).await? {
-            tracing::info!("Starting Neo4j...");
+        if !self.container_running(INDENTIAGRAPH_CONTAINER).await? {
+            tracing::info!("Starting IndentiaGraph...");
             docker
-                .start_container::<String>(NEO4J_CONTAINER, None)
+                .start_container::<String>(INDENTIAGRAPH_CONTAINER, None)
                 .await
-                .map_err(|e| format!("Failed to start Neo4j: {}", e))?;
+                .map_err(|e| format!("Failed to start IndentiaGraph: {}", e))?;
         }
 
         // --- MeiliSearch ---
@@ -469,7 +469,7 @@ impl DockerManager {
 
         if !docker_available {
             return ServicesHealth {
-                neo4j: ServiceStatus::Unknown,
+                indentiagraph: ServiceStatus::Unknown,
                 meilisearch: ServiceStatus::Unknown,
                 nats: if nats_enabled {
                     ServiceStatus::Unknown
@@ -480,7 +480,7 @@ impl DockerManager {
             };
         }
 
-        let neo4j = self.check_container_health(NEO4J_CONTAINER, 7687).await;
+        let indentiagraph = self.check_container_health(INDENTIAGRAPH_CONTAINER, 8000).await;
         let meilisearch = self
             .check_container_health_http(MEILISEARCH_CONTAINER, 7700)
             .await;
@@ -491,7 +491,7 @@ impl DockerManager {
         };
 
         ServicesHealth {
-            neo4j,
+            indentiagraph,
             meilisearch,
             nats,
             docker_available: true,
@@ -530,7 +530,7 @@ impl DockerManager {
     pub async fn stop_services(&self) -> Result<(), String> {
         let docker = self.docker()?;
 
-        for name in [NEO4J_CONTAINER, MEILISEARCH_CONTAINER, NATS_CONTAINER] {
+        for name in [INDENTIAGRAPH_CONTAINER, MEILISEARCH_CONTAINER, NATS_CONTAINER] {
             if self.container_running(name).await.unwrap_or(false) {
                 tracing::info!("Stopping {}...", name);
                 let opts = StopContainerOptions { t: 10 };
@@ -549,7 +549,7 @@ impl DockerManager {
         let docker = self.docker()?;
 
         let name = match service {
-            "neo4j" => NEO4J_CONTAINER,
+            "indentiagraph" => INDENTIAGRAPH_CONTAINER,
             "meilisearch" => MEILISEARCH_CONTAINER,
             "nats" => NATS_CONTAINER,
             _ => return Err(format!("Unknown service: {}", service)),
@@ -653,7 +653,7 @@ pub async fn open_docker_desktop() -> Result<(), String> {
     Ok(())
 }
 
-/// Start Docker services (Neo4j + MeiliSearch).
+/// Start Docker services (IndentiaGraph + MeiliSearch).
 #[tauri::command]
 pub async fn start_docker_services(
     docker: tauri::State<'_, SharedDockerManager>,
@@ -696,7 +696,7 @@ pub async fn get_service_logs(
 /// Test connectivity to a service.
 ///
 /// Supports three service types:
-/// - `neo4j`: TCP connect to the bolt port (extracted from bolt://host:port URL)
+/// - `indentiagraph`: TCP connect to the SurrealDB port (extracted from ws://host:port URL)
 /// - `meilisearch`: HTTP GET /health
 /// - `nats`: TCP connect to the NATS port (extracted from nats://host:port URL)
 ///
@@ -707,18 +707,18 @@ pub async fn test_connection(service: String, url: String) -> Result<bool, Strin
     let timeout = std::time::Duration::from_secs(5);
 
     match service.as_str() {
-        "neo4j" => {
-            // Parse bolt://host:port → TCP connect
-            let addr = parse_host_port(&url, 7687)?;
-            tracing::info!("Testing Neo4j connection to {}...", addr);
+        "indentiagraph" => {
+            // Parse ws://host:port -> TCP connect
+            let addr = parse_host_port(&url, 8000)?;
+            tracing::info!("Testing IndentiaGraph connection to {}...", addr);
             match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&addr)).await {
                 Ok(Ok(_)) => Ok(true),
                 Ok(Err(e)) => {
-                    tracing::warn!("Neo4j connection failed: {}", e);
+                    tracing::warn!("IndentiaGraph connection failed: {}", e);
                     Ok(false)
                 }
                 Err(_) => {
-                    tracing::warn!("Neo4j connection timed out");
+                    tracing::warn!("IndentiaGraph connection timed out");
                     Ok(false)
                 }
             }
@@ -763,7 +763,7 @@ pub async fn test_connection(service: String, url: String) -> Result<bool, Strin
     }
 }
 
-/// Parse a URL like `bolt://host:port` or `nats://host:port` into `host:port`.
+/// Parse a URL like `ws://host:port` or `nats://host:port` into `host:port`.
 /// Falls back to the given default port if the URL has no port.
 fn parse_host_port(url: &str, default_port: u16) -> Result<String, String> {
     // Try to parse as a URL

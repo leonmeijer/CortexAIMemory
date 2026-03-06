@@ -16,7 +16,7 @@
 //! Skills are a nice-to-have context injection, not a gating mechanism.
 
 use crate::api::hook_handlers::skill_cache;
-use crate::neo4j::traits::GraphStore;
+use crate::indentiagraph::traits::GraphStore;
 use crate::neurons::AutoReinforcementConfig;
 use crate::skills::activation::{
     activate_for_hook_cached, spawn_activation_increment, spawn_hook_reinforcement,
@@ -31,7 +31,7 @@ use tracing::{debug, info, warn};
 /// Registered in `create_session()` and `resume_session()` alongside `CompactionNotifier`.
 /// Uses the same `SkillCache` and activation pipeline as the REST endpoint.
 pub(crate) struct SkillActivationHook {
-    /// Access to Neo4j graph store for project resolution + skill loading.
+    /// Access to IndentiaGraph graph store for project resolution + skill loading.
     graph_store: Arc<dyn GraphStore>,
 }
 
@@ -159,7 +159,7 @@ impl nexus_claude::HookCallback for SkillActivationHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::mock::MockGraphStore;
+    use crate::indentiagraph::mock::MockGraphStore;
     use nexus_claude::{HookCallback, HookContext, HookInput};
 
     /// Helper to create a minimal HookContext for tests

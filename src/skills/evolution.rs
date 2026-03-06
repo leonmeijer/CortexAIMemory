@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::neo4j::traits::GraphStore;
+use crate::indentiagraph::traits::GraphStore;
 use crate::notes::{Note, NoteImportance, NoteScope, NoteStatus, NoteType};
 use crate::skills::detection::{jaccard_similarity, SkillCandidate};
 use crate::skills::models::SkillNode;
@@ -295,6 +295,8 @@ async fn trace_evolution_note(graph_store: &dyn GraphStore, project_id: Uuid, co
         changes: vec![],
         assertion_rule: None,
         last_assertion_result: None,
+        valid_at: None,
+        invalid_at: None,
     };
     if let Err(e) = graph_store.create_note(&note).await {
         warn!(error = %e, "Failed to create evolution observation note");

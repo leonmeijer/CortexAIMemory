@@ -7,8 +7,7 @@ pub mod helpers;
 pub mod languages;
 pub mod noise_filter;
 
-use crate::meilisearch::indexes::CodeDocument;
-use crate::neo4j::models::*;
+use crate::indentiagraph::models::*;
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -244,81 +243,6 @@ impl CodeParser {
 
         Ok(parsed)
     }
-
-    /// Convert parsed file to a code document for Meilisearch
-    ///
-    /// Creates a lightweight document for semantic search containing:
-    /// - Symbol names for keyword search
-    /// - Docstrings for semantic/natural language search
-    /// - Function signatures for quick reference
-    pub fn to_code_document(
-        parsed: &ParsedFile,
-        project_id: &str,
-        project_slug: &str,
-    ) -> CodeDocument {
-        // Collect all docstrings
-        let mut docstrings = Vec::new();
-
-        for func in &parsed.functions {
-            if let Some(ref doc) = func.docstring {
-                docstrings.push(doc.clone());
-            }
-        }
-        for s in &parsed.structs {
-            if let Some(ref doc) = s.docstring {
-                docstrings.push(doc.clone());
-            }
-        }
-        for t in &parsed.traits {
-            if let Some(ref doc) = t.docstring {
-                docstrings.push(doc.clone());
-            }
-        }
-        for e in &parsed.enums {
-            if let Some(ref doc) = e.docstring {
-                docstrings.push(doc.clone());
-            }
-        }
-
-        // Build function signatures
-        let signatures: Vec<String> = parsed
-            .functions
-            .iter()
-            .map(|f| {
-                let params = f
-                    .params
-                    .iter()
-                    .map(|p| {
-                        if let Some(ref t) = p.type_name {
-                            format!("{}: {}", p.name, t)
-                        } else {
-                            p.name.clone()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let ret = f
-                    .return_type
-                    .as_ref()
-                    .map(|r| format!(" -> {}", r))
-                    .unwrap_or_default();
-                let async_kw = if f.is_async { "async " } else { "" };
-                format!("{}fn {}({}){}", async_kw, f.name, params, ret)
-            })
-            .collect();
-
-        CodeDocument {
-            id: crate::meilisearch::client::MeiliClient::path_to_id(&parsed.path),
-            path: parsed.path.clone(),
-            language: parsed.language.clone(),
-            symbols: parsed.symbols.clone(),
-            docstrings: docstrings.join("\n\n"),
-            signatures,
-            imports: parsed.imports.iter().map(|i| i.path.clone()).collect(),
-            project_id: project_id.to_string(),
-            project_slug: project_slug.to_string(),
-        }
-    }
 }
 
 /// Result of parsing a file
@@ -337,21 +261,8 @@ pub struct ParsedFile {
     pub symbols: Vec<String>,
 }
 
-/// Represents a function call found in code
-#[derive(Debug, Clone)]
-pub struct FunctionCall {
-    /// The function making the call
-    pub caller_id: String,
-    /// The name of the function being called
-    pub callee_name: String,
-    /// Line where the call occurs
-    pub line: u32,
-    /// Confidence score (0.0-1.0) for the call relationship.
-    /// Set during import resolution: import-resolved=0.90, same-file=0.85, fuzzy-global=0.30-0.50
-    pub confidence: f64,
-    /// Reason for the confidence level (e.g., "import-resolved", "same-file", "fuzzy-unique", "fuzzy-ambiguous")
-    pub reason: String,
-}
+/// Represents a function call found in code.
+pub type FunctionCall = cortex_core::parser_types::FunctionCall;
 
 #[cfg(test)]
 mod tests {
@@ -1531,49 +1442,6 @@ region   = "eu-west-1"
         let parsed2 = parser.parse_file(&path, content).unwrap();
 
         assert_eq!(parsed1.hash, parsed2.hash);
-    }
-
-    // =========================================================================
-    // to_code_document Tests
-    // =========================================================================
-
-    #[test]
-    fn test_to_code_document() {
-        let mut parser = CodeParser::new().unwrap();
-        let content = r#"
-/// Says hello
-fn hello() -> String {
-    "Hello".to_string()
-}
-"#;
-        let path = PathBuf::from("src/lib.rs");
-        let parsed = parser.parse_file(&path, content).unwrap();
-
-        let doc = CodeParser::to_code_document(&parsed, "project-123", "my-project");
-
-        assert_eq!(doc.path, "src/lib.rs");
-        assert_eq!(doc.language, "rust");
-        assert_eq!(doc.project_id, "project-123");
-        assert_eq!(doc.project_slug, "my-project");
-    }
-
-    #[test]
-    fn test_to_code_document_collects_docstrings() {
-        let mut parser = CodeParser::new().unwrap();
-        let content = r#"
-/// Function doc
-fn foo() {}
-
-/// Struct doc
-struct Bar {}
-"#;
-        let path = PathBuf::from("test.rs");
-        let parsed = parser.parse_file(&path, content).unwrap();
-
-        let doc = CodeParser::to_code_document(&parsed, "id", "slug");
-
-        // Should have collected docstrings
-        assert!(doc.docstrings.contains("Function doc") || doc.docstrings.contains("Struct doc"));
     }
 
     // =========================================================================

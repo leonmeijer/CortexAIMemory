@@ -1,9 +1,8 @@
 //! Implementation Flow Planner — analyzes the knowledge graph to produce
 //! a DAG of implementation phases (sequential + parallel branches).
 
-use crate::meilisearch::SearchStore;
-use crate::neo4j::models::{StepNode as StepNodeModel, StepStatus};
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::models::{StepNode as StepNodeModel, StepStatus};
+use crate::indentiagraph::GraphStore;
 use crate::notes::models::EntityType;
 use crate::notes::NoteManager;
 use crate::plan::models::CreatePlanRequest;
@@ -239,8 +238,7 @@ fn resolve_path(root_path: Option<&str>, path: &str) -> String {
 
 /// Analyzes the knowledge graph to produce implementation plans
 pub struct ImplementationPlanner {
-    neo4j: Arc<dyn GraphStore>,
-    meili: Arc<dyn SearchStore>,
+    indentiagraph: Arc<dyn GraphStore>,
     plan_manager: Arc<PlanManager>,
     note_manager: Arc<NoteManager>,
     /// Optional embedding provider for hybrid vector search in search_semantic_zones
@@ -251,7 +249,7 @@ pub struct ImplementationPlanner {
 const MAX_ZONES: usize = 20;
 
 /// Common stop words (French + English) that never appear in code and
-/// dilute Meilisearch keyword matching when the user's description is
+/// dilute BM25 keyword matching when the user's description is
 /// in natural language.
 const STOP_WORDS: &[&str] = &[
     // French
@@ -589,14 +587,12 @@ fn reciprocal_rank_fusion(
 impl ImplementationPlanner {
     /// Create a new implementation planner
     pub fn new(
-        neo4j: Arc<dyn GraphStore>,
-        meili: Arc<dyn SearchStore>,
+        indentiagraph: Arc<dyn GraphStore>,
         plan_manager: Arc<PlanManager>,
         note_manager: Arc<NoteManager>,
     ) -> Self {
         Self {
-            neo4j,
-            meili,
+            indentiagraph,
             plan_manager,
             note_manager,
             embedding_provider: None,
@@ -633,7 +629,7 @@ impl ImplementationPlanner {
             if entry.contains('/') || entry.contains('.') {
                 // File path — resolve to absolute, then get symbols
                 let resolved = resolve_path(root_path, entry);
-                match self.neo4j.get_file_symbol_names(&resolved).await {
+                match self.indentiagraph.get_file_symbol_names(&resolved).await {
                     Ok(symbols) => {
                         let mut functions = symbols.functions;
                         functions.extend(symbols.structs);
@@ -659,7 +655,7 @@ impl ImplementationPlanner {
             } else {
                 // Symbol name — find references to locate the file
                 let refs = self
-                    .neo4j
+                    .indentiagraph
                     .find_symbol_references(entry, 5, Some(project_id))
                     .await?;
                 if let Some(first) = refs.first() {
@@ -681,7 +677,7 @@ impl ImplementationPlanner {
     /// via Reciprocal Rank Fusion (RRF) when an embedding provider is available.
     ///
     /// The description is pre-processed with `extract_search_keywords` to strip
-    /// natural-language stop words (FR/EN) that would dilute Meilisearch matching.
+    /// natural-language stop words (FR/EN) that would dilute BM25 matching.
     async fn search_semantic_zones(
         &self,
         description: &str,
@@ -696,21 +692,29 @@ impl ImplementationPlanner {
             self.embedding_provider.is_some()
         );
 
-        // BM25 search (always available) + note search in parallel
-        let (code_results, note_results) = tokio::join!(
-            self.meili
-                .search_code_with_scores(&keywords, 10, None, project_slug, None),
-            self.meili
-                .search_notes_with_filters(description, 10, project_slug, None, None, None),
-        );
+        let mut zones = Vec::new();
 
-        // Vector search (optional — only when embedding provider is available)
+        // BM25 lexical code search (works even without embeddings).
+        let project_id_str = project_id.map(|id| id.to_string());
+        let bm25_results: Vec<(String, f64)> = match self
+            .indentiagraph
+            .search_code_fts(&keywords, 20, project_id_str.as_deref(), None)
+            .await
+        {
+            Ok(hits) => hits.into_iter().map(|h| (h.path, h.score)).collect(),
+            Err(e) => {
+                tracing::warn!("Planner: BM25 code search failed: {}", e);
+                vec![]
+            }
+        };
+
+        // Vector search (available when embedding provider is configured)
         let vector_results: Vec<(String, f64)> =
             if let (Some(ref provider), Some(pid)) = (&self.embedding_provider, project_id) {
-                match provider.embed_text(description).await {
+                match provider.embed_text(&keywords).await {
                     Ok(query_embedding) => {
                         match self
-                            .neo4j
+                            .indentiagraph
                             .vector_search_files(&query_embedding, 10, Some(pid))
                             .await
                         {
@@ -730,82 +734,27 @@ impl ImplementationPlanner {
                 vec![]
             };
 
-        let mut zones = Vec::new();
+        // Merge BM25 + vector rankings using Reciprocal Rank Fusion (RRF).
+        // If one side is empty, keep the available side.
+        let merged_results: Vec<(String, f64)> =
+            if !bm25_results.is_empty() && !vector_results.is_empty() {
+                reciprocal_rank_fusion(&bm25_results, &vector_results, MAX_ZONES)
+            } else if !bm25_results.is_empty() {
+                bm25_results.into_iter().take(MAX_ZONES).collect()
+            } else {
+                vector_results.into_iter().take(MAX_ZONES).collect()
+            };
 
-        // Merge BM25 + vector results via RRF (or use BM25 alone as fallback)
-        let bm25_list: Vec<(String, f64)> = match &code_results {
-            Ok(hits) => hits
-                .iter()
-                .map(|h| (h.document.path.clone(), h.score.min(1.0)))
-                .collect(),
-            Err(e) => {
-                tracing::warn!("Planner: semantic code search failed: {}", e);
-                vec![]
-            }
-        };
-
-        // Build a map of path → symbols from BM25 results for later lookup
-        let symbols_map: std::collections::HashMap<String, Vec<String>> = match &code_results {
-            Ok(hits) => hits
-                .iter()
-                .map(|h| (h.document.path.clone(), h.document.symbols.clone()))
-                .collect(),
-            Err(_) => std::collections::HashMap::new(),
-        };
-
-        if !vector_results.is_empty() {
-            // Hybrid: merge BM25 + vector via Reciprocal Rank Fusion
-            let fused = reciprocal_rank_fusion(&bm25_list, &vector_results, 15);
-            tracing::debug!(
-                "Planner: hybrid search — bm25={}, vector={}, fused={}",
-                bm25_list.len(),
-                vector_results.len(),
-                fused.len()
-            );
-            for (path, rrf_score) in fused {
-                let symbols = symbols_map.get(&path).cloned().unwrap_or_default();
-                zones.push(RelevantZone {
-                    file_path: path,
-                    functions: symbols,
-                    relevance_score: rrf_score,
-                    source: ZoneSource::SemanticSearch,
-                });
-            }
-        } else {
-            // Fallback: BM25 only
-            for (path, score) in bm25_list {
-                let symbols = symbols_map.get(&path).cloned().unwrap_or_default();
-                zones.push(RelevantZone {
-                    file_path: path,
-                    functions: symbols,
-                    relevance_score: score,
-                    source: ZoneSource::SemanticSearch,
-                });
-            }
+        for (path, score) in merged_results {
+            zones.push(RelevantZone {
+                file_path: path,
+                functions: vec![],
+                relevance_score: score,
+                source: ZoneSource::SemanticSearch,
+            });
         }
 
-        // Note search results — extract file paths from anchor entities
-        match note_results {
-            Ok(notes) => {
-                for note in notes {
-                    for anchor in &note.anchor_entities {
-                        // Anchor entities that look like file paths
-                        if anchor.contains('/') || anchor.contains('.') {
-                            zones.push(RelevantZone {
-                                file_path: anchor.clone(),
-                                functions: vec![],
-                                relevance_score: 0.5, // Lower score for note-sourced zones
-                                source: ZoneSource::NoteReference,
-                            });
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Planner: note search failed: {}", e);
-            }
-        }
-
+        let _ = project_slug; // kept for API compatibility
         Ok(zones)
     }
 
@@ -836,7 +785,7 @@ impl ImplementationPlanner {
         };
 
         // Normalize all zone file paths to absolute using project root_path.
-        // This ensures dedup works correctly even when Meilisearch returns
+        // This ensures dedup works correctly even when the BM25 engine returns
         // both relative and absolute paths for the same file.
         let zones: Vec<RelevantZone> = zones
             .into_iter()
@@ -888,12 +837,12 @@ impl ImplementationPlanner {
 
         for zone in zones {
             let (dependents, imports) = tokio::join!(
-                self.neo4j.find_impacted_files(
+                self.indentiagraph.find_impacted_files(
                     &zone.file_path,
                     MAX_DEPENDENCY_DEPTH,
                     Some(project_id)
                 ),
-                self.neo4j.get_file_direct_imports(&zone.file_path),
+                self.indentiagraph.get_file_direct_imports(&zone.file_path),
             );
 
             let dep_count = dependents.as_ref().map(|d| d.len()).unwrap_or(0);
@@ -910,13 +859,15 @@ impl ImplementationPlanner {
             // Community expansion: if file has 0 structural dependents and has a
             // community_id, find peer files in the same community (best-effort).
             if dep_count == 0 {
-                if let Ok(Some(analytics)) =
-                    self.neo4j.get_node_analytics(&zone.file_path, "file").await
+                if let Ok(Some(analytics)) = self
+                    .indentiagraph
+                    .get_node_analytics(&zone.file_path, "file")
+                    .await
                 {
                     if let Some(community_id) = analytics.community_id {
                         // Fetch all communities for the project, find the matching one
                         if let Ok(communities) =
-                            self.neo4j.get_project_communities(project_id).await
+                            self.indentiagraph.get_project_communities(project_id).await
                         {
                             let zone_files: HashSet<&str> =
                                 zones.iter().map(|z| z.file_path.as_str()).collect();
@@ -963,12 +914,20 @@ impl ImplementationPlanner {
         let _zone_files: HashSet<String> = zones.iter().map(|z| z.file_path.clone()).collect();
 
         // Fetch project percentiles once for GDS-based risk scoring (best-effort)
-        let percentiles = self.neo4j.get_project_percentiles(project_id).await.ok();
+        let percentiles = self
+            .indentiagraph
+            .get_project_percentiles(project_id)
+            .await
+            .ok();
 
         // Build nodes for all zone files
         let mut nodes: HashMap<String, DagNode> = HashMap::new();
         for zone in zones {
-            let symbols = match self.neo4j.get_file_symbol_names(&zone.file_path).await {
+            let symbols = match self
+                .indentiagraph
+                .get_file_symbol_names(&zone.file_path)
+                .await
+            {
                 Ok(s) => {
                     let mut all = s.functions;
                     all.extend(s.structs);
@@ -1002,7 +961,7 @@ impl ImplementationPlanner {
             // Also check function caller counts
             for symbol in symbols.iter().take(3) {
                 if let Ok(count) = self
-                    .neo4j
+                    .indentiagraph
                     .get_function_caller_count(symbol, Some(project_id))
                     .await
                 {
@@ -1019,7 +978,7 @@ impl ImplementationPlanner {
 
             // Fetch GDS analytics: community_id + pagerank/betweenness for risk scoring
             let analytics = self
-                .neo4j
+                .indentiagraph
                 .get_node_analytics(&zone.file_path, "file")
                 .await
                 .ok()
@@ -1093,7 +1052,7 @@ impl ImplementationPlanner {
                 continue; // Already in the DAG
             }
 
-            let symbols = match self.neo4j.get_file_symbol_names(&peer_path).await {
+            let symbols = match self.indentiagraph.get_file_symbol_names(&peer_path).await {
                 Ok(s) => {
                     let mut all = s.functions;
                     all.extend(s.structs);
@@ -1523,7 +1482,9 @@ impl ImplementationPlanner {
         let plan_id = plan_node.id;
 
         // Link to project
-        self.neo4j.link_plan_to_project(plan_id, project_id).await?;
+        self.indentiagraph
+            .link_plan_to_project(plan_id, project_id)
+            .await?;
 
         // Create tasks for each phase, chained by dependencies
         let mut prev_task_id: Option<Uuid> = None;
@@ -1776,8 +1737,8 @@ mod tests {
     // ========================================================================
 
     async fn setup_planner_with_data() -> (ImplementationPlanner, Uuid) {
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::{FileNode, FunctionNode, ProjectNode, Visibility};
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::{FileNode, FunctionNode, ProjectNode, Visibility};
 
         let graph = MockGraphStore::new();
 
@@ -1868,13 +1829,11 @@ mod tests {
             .await
             .unwrap();
 
-        let neo4j: Arc<dyn crate::neo4j::GraphStore> = Arc::new(graph);
-        let meili: Arc<dyn crate::meilisearch::SearchStore> =
-            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
-        let plan_manager = Arc::new(PlanManager::new(neo4j.clone(), meili.clone()));
-        let note_manager = Arc::new(NoteManager::new(neo4j.clone(), meili.clone()));
+        let indentiagraph: Arc<dyn crate::indentiagraph::GraphStore> = Arc::new(graph);
+        let plan_manager = Arc::new(PlanManager::new(indentiagraph.clone()));
+        let note_manager = Arc::new(NoteManager::new(indentiagraph.clone()));
 
-        let planner = ImplementationPlanner::new(neo4j, meili, plan_manager, note_manager);
+        let planner = ImplementationPlanner::new(indentiagraph, plan_manager, note_manager);
         (planner, pid)
     }
 
@@ -2701,8 +2660,8 @@ mod tests {
 
     /// Helper to create a planner with embedding provider and seeded analytics data
     async fn setup_planner_with_analytics() -> (ImplementationPlanner, Uuid) {
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::{FileNode, FunctionNode, ProjectNode, Visibility};
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::{FileNode, FunctionNode, ProjectNode, Visibility};
 
         let graph = MockGraphStore::new();
 
@@ -2848,13 +2807,11 @@ mod tests {
             .await
             .unwrap();
 
-        let neo4j: Arc<dyn crate::neo4j::GraphStore> = Arc::new(graph);
-        let meili: Arc<dyn crate::meilisearch::SearchStore> =
-            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
-        let plan_manager = Arc::new(PlanManager::new(neo4j.clone(), meili.clone()));
-        let note_manager = Arc::new(NoteManager::new(neo4j.clone(), meili.clone()));
+        let indentiagraph: Arc<dyn crate::indentiagraph::GraphStore> = Arc::new(graph);
+        let plan_manager = Arc::new(PlanManager::new(indentiagraph.clone()));
+        let note_manager = Arc::new(NoteManager::new(indentiagraph.clone()));
 
-        let planner = ImplementationPlanner::new(neo4j, meili, plan_manager, note_manager);
+        let planner = ImplementationPlanner::new(indentiagraph, plan_manager, note_manager);
         (planner, pid)
     }
 
@@ -3021,12 +2978,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_hybrid_search_merges_bm25_and_vector() {
+    async fn test_vector_search_returns_relevant_files() {
         use crate::embeddings::mock::MockEmbeddingProvider;
         use crate::embeddings::EmbeddingProvider;
-        use crate::meilisearch::indexes::CodeDocument;
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::{FileNode, ProjectNode};
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::{FileNode, ProjectNode};
 
         let graph = MockGraphStore::new();
         let project = ProjectNode {
@@ -3043,9 +2999,6 @@ mod tests {
         let pid = project.id;
         graph.create_project(&project).await.unwrap();
 
-        // File A: in Meilisearch (BM25 match for "webhook")
-        // File B: has a similar embedding to "webhook" (vector match)
-        // File C: in BOTH (BM25 + vector) → should be top result via RRF
         let files = vec!["src/webhook.rs", "src/events.rs", "src/notify.rs"];
         for path in &files {
             graph
@@ -3082,74 +3035,25 @@ mod tests {
             .await
             .unwrap();
 
-        // Seed Meilisearch with BM25-matching documents
-        let meili = crate::meilisearch::mock::MockSearchStore::new();
-        meili
-            .index_code(&CodeDocument {
-                id: format!("{}:src/webhook.rs", pid),
-                path: "src/webhook.rs".to_string(),
-                language: "rust".to_string(),
-                symbols: vec!["send_webhook".to_string()],
-                docstrings: "Send webhook notifications".to_string(),
-                signatures: vec![],
-                imports: vec![],
-                project_id: pid.to_string(),
-                project_slug: "hybrid-test".to_string(),
-            })
-            .await
-            .unwrap();
-        meili
-            .index_code(&CodeDocument {
-                id: format!("{}:src/notify.rs", pid),
-                path: "src/notify.rs".to_string(),
-                language: "rust".to_string(),
-                symbols: vec!["notify_webhook".to_string()],
-                docstrings: "Handle webhook notifications".to_string(),
-                signatures: vec![],
-                imports: vec![],
-                project_id: pid.to_string(),
-                project_slug: "hybrid-test".to_string(),
-            })
-            .await
-            .unwrap();
+        let indentiagraph: Arc<dyn crate::indentiagraph::GraphStore> = Arc::new(graph);
+        let plan_manager = Arc::new(PlanManager::new(indentiagraph.clone()));
+        let note_manager = Arc::new(NoteManager::new(indentiagraph.clone()));
 
-        let neo4j: Arc<dyn crate::neo4j::GraphStore> = Arc::new(graph);
-        let meili: Arc<dyn crate::meilisearch::SearchStore> = Arc::new(meili);
-        let plan_manager = Arc::new(PlanManager::new(neo4j.clone(), meili.clone()));
-        let note_manager = Arc::new(NoteManager::new(neo4j.clone(), meili.clone()));
-
-        let planner = ImplementationPlanner::new(neo4j, meili, plan_manager, note_manager)
+        let planner = ImplementationPlanner::new(indentiagraph, plan_manager, note_manager)
             .with_embedding_provider(Arc::new(embedding_provider));
 
-        // Search should fuse BM25 + vector results
+        // Vector search should return files with embeddings
         let zones = planner
             .search_semantic_zones("webhook notifications", Some("hybrid-test"), Some(pid))
             .await
             .unwrap();
 
-        // notify.rs appears in BOTH BM25 (substring match "webhook") AND vector (identical embedding)
-        // → should be boosted by RRF to top or near-top
         let paths: Vec<&str> = zones.iter().map(|z| z.file_path.as_str()).collect();
-        assert!(!zones.is_empty(), "Hybrid search should return results");
+        assert!(!zones.is_empty(), "Vector search should return results");
         assert!(
             paths.contains(&"src/notify.rs"),
-            "notify.rs should appear (in both BM25 and vector)"
+            "notify.rs should appear (highest cosine similarity)"
         );
-        assert!(
-            paths.contains(&"src/webhook.rs"),
-            "webhook.rs should appear (BM25 match)"
-        );
-
-        // If notify.rs is in both lists, it should be ranked higher than webhook.rs (BM25 only)
-        if let (Some(notify_idx), Some(webhook_idx)) = (
-            paths.iter().position(|p| *p == "src/notify.rs"),
-            paths.iter().position(|p| *p == "src/webhook.rs"),
-        ) {
-            assert!(
-                notify_idx <= webhook_idx,
-                "notify.rs (BM25+vector) should rank >= webhook.rs (BM25 only)"
-            );
-        }
     }
 
     /// E2E test: validates that plan_implementation produces better results with
@@ -3237,8 +3141,8 @@ mod tests {
     /// or GDS data — graceful fallback to structural analysis only.
     #[tokio::test]
     async fn test_plan_implementation_e2e_fallback_no_gds() {
-        use crate::neo4j::mock::MockGraphStore;
-        use crate::neo4j::models::{FileNode, FunctionNode, ProjectNode, Visibility};
+        use crate::indentiagraph::mock::MockGraphStore;
+        use crate::indentiagraph::models::{FileNode, FunctionNode, ProjectNode, Visibility};
 
         let graph = MockGraphStore::new();
         let project = ProjectNode {
@@ -3295,13 +3199,11 @@ mod tests {
             .await
             .unwrap();
 
-        let neo4j: Arc<dyn crate::neo4j::GraphStore> = Arc::new(graph);
-        let meili: Arc<dyn crate::meilisearch::SearchStore> =
-            Arc::new(crate::meilisearch::mock::MockSearchStore::new());
-        let plan_manager = Arc::new(PlanManager::new(neo4j.clone(), meili.clone()));
-        let note_manager = Arc::new(NoteManager::new(neo4j.clone(), meili.clone()));
+        let indentiagraph: Arc<dyn crate::indentiagraph::GraphStore> = Arc::new(graph);
+        let plan_manager = Arc::new(PlanManager::new(indentiagraph.clone()));
+        let note_manager = Arc::new(NoteManager::new(indentiagraph.clone()));
 
-        let planner = ImplementationPlanner::new(neo4j, meili, plan_manager, note_manager);
+        let planner = ImplementationPlanner::new(indentiagraph, plan_manager, note_manager);
         // No embedding provider — should still work
 
         let plan = planner

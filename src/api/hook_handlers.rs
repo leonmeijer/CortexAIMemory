@@ -162,7 +162,7 @@ pub async fn activate_hook(
     let config = HookActivationConfig::default();
 
     let result = activate_for_hook_cached(
-        state.orchestrator.neo4j(),
+        state.orchestrator.indentiagraph(),
         req.project_id,
         &req.tool_name,
         &req.tool_input,
@@ -180,13 +180,16 @@ pub async fn activate_hook(
             // Spawn async Hebbian reinforcement (fire-and-forget, never blocks response)
             let reinforcement_config = AutoReinforcementConfig::default();
             spawn_hook_reinforcement(
-                state.orchestrator.neo4j_arc(),
+                state.orchestrator.indentiagraph_arc(),
                 outcome.activated_note_ids,
                 reinforcement_config,
             );
 
             // Increment activation_count (fire-and-forget)
-            spawn_activation_increment(state.orchestrator.neo4j_arc(), outcome.response.skill_id);
+            spawn_activation_increment(
+                state.orchestrator.indentiagraph_arc(),
+                outcome.response.skill_id,
+            );
 
             Ok((
                 StatusCode::OK,
@@ -256,11 +259,11 @@ pub async fn session_context(
     State(state): State<OrchestratorState>,
     Query(query): Query<SessionContextQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let neo4j = state.orchestrator.neo4j();
+    let indentiagraph = state.orchestrator.indentiagraph();
     let project_id = query.project_id;
 
     // Fetch active skills (limit 5, sorted by energy desc)
-    let active_skills = match neo4j
+    let active_skills = match indentiagraph
         .list_skills(project_id, Some(SkillStatus::Active), 5, 0)
         .await
     {
@@ -284,19 +287,21 @@ pub async fn session_context(
     };
 
     // Fetch current in-progress plan (limit 1)
-    let (current_plan, current_task) = match neo4j
+    let (current_plan, current_task) = match indentiagraph
         .list_plans_for_project(project_id, Some(vec!["in_progress".to_string()]), 1, 0)
         .await
     {
         Ok((plans, _)) => {
             if let Some(plan) = plans.first() {
                 // Fetch tasks ONCE (avoid duplicate DB call)
-                let (progress, task_json) = match neo4j.get_plan_tasks(plan.id).await {
+                let (progress, task_json) = match indentiagraph.get_plan_tasks(plan.id).await {
                     Ok(tasks) => {
                         let total = tasks.len();
                         let completed = tasks
                             .iter()
-                            .filter(|t| t.status == crate::neo4j::models::TaskStatus::Completed)
+                            .filter(|t| {
+                                t.status == crate::indentiagraph::models::TaskStatus::Completed
+                            })
                             .count();
                         let progress_str = if total > 0 {
                             Some(format!("{}/{} tasks", completed, total))
@@ -307,7 +312,9 @@ pub async fn session_context(
                         // Find the current in-progress task
                         let in_progress_task = tasks
                             .into_iter()
-                            .find(|t| t.status == crate::neo4j::models::TaskStatus::InProgress)
+                            .find(|t| {
+                                t.status == crate::indentiagraph::models::TaskStatus::InProgress
+                            })
                             .map(|t| {
                                 serde_json::json!({
                                     "title": t.title.unwrap_or_default(),
@@ -341,7 +348,7 @@ pub async fn session_context(
     };
 
     // Fetch critical/high-importance notes (limit 10)
-    let critical_notes = match neo4j
+    let critical_notes = match indentiagraph
         .list_notes(
             Some(project_id),
             None,
@@ -419,7 +426,7 @@ pub async fn resolve_project(
     let normalized_input = crate::expand_tilde(input_path);
 
     // Load project entries (cached for 5 min via project_resolver)
-    let entries = load_project_entries(state.orchestrator.neo4j())
+    let entries = load_project_entries(state.orchestrator.indentiagraph())
         .await
         .map_err(AppError::Internal)?;
 
@@ -618,7 +625,7 @@ mod tests {
         let response = serde_json::json!({
             "active_skills": [
                 {
-                    "name": "Neo4j Performance",
+                    "name": "IndentiaGraph Performance",
                     "description": "Query optimization",
                     "energy": 0.85,
                     "note_count": 12
@@ -654,7 +661,7 @@ mod tests {
 
         // Verify skill structure
         let skill = &response["active_skills"][0];
-        assert_eq!(skill["name"], "Neo4j Performance");
+        assert_eq!(skill["name"], "IndentiaGraph Performance");
         assert_eq!(skill["energy"], 0.85);
 
         // Verify plan structure

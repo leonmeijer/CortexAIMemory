@@ -8,7 +8,7 @@
 //! - Extensions
 //! - Async/await
 
-use crate::neo4j::models::*;
+use crate::indentiagraph::models::*;
 use crate::parser::helpers::*;
 use crate::parser::ParsedFile;
 use anyhow::Result;

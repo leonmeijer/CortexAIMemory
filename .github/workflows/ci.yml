@@ -95,23 +95,22 @@ jobs:
         run: cargo test --test parser_tests
 
   # ==========================================================================
-  # Integration Tests - Requires Neo4j and Meilisearch
+  # Integration Tests - Requires IndentiaGraph and Meilisearch
   # ==========================================================================
   integration-tests:
     name: Integration Tests
     runs-on: ubuntu-latest
     needs: [build]
     services:
-      neo4j:
-        image: neo4j:5
+      indentiagraph:
+        image: surrealdb/surrealdb:latest
         env:
-          NEO4J_AUTH: neo4j/testpassword
-          NEO4J_PLUGINS: '["apoc"]'
+          SURREALDB_USER: root
+          SURREALDB_PASS: testpassword
         ports:
-          - 7687:7687
-          - 7474:7474
+          - 8000:8000
         options: >-
-          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
+          --health-cmd "curl -sf http://localhost:8000/health || exit 1"
           --health-interval 10s
           --health-timeout 10s
           --health-retries 10
@@ -144,39 +143,38 @@ jobs:
 
       - name: Wait for services to be ready
         run: |
-          echo "Waiting for Neo4j..."
-          timeout 60 bash -c 'until curl -sf http://localhost:7474 > /dev/null 2>&1; do sleep 2; done'
+          echo "Waiting for IndentiaGraph..."
+          timeout 60 bash -c 'until curl -sf http://localhost:8000 > /dev/null 2>&1; do sleep 2; done'
           echo "Waiting for Meilisearch..."
           timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
           echo "All services are ready!"
 
       - name: Run integration tests
         env:
-          NEO4J_URI: bolt://localhost:7687
-          NEO4J_USER: neo4j
-          NEO4J_PASSWORD: testpassword
+          INDENTIAGRAPH_URI: ws://localhost:8000
+          INDENTIAGRAPH_USER: root
+          INDENTIAGRAPH_PASSWORD: testpassword
           MEILISEARCH_URL: http://localhost:7700
           MEILISEARCH_KEY: test-master-key
         run: cargo test --test integration_tests
 
   # ==========================================================================
-  # API Tests - Downloads pre-built binary, requires Neo4j and Meilisearch
+  # API Tests - Downloads pre-built binary, requires IndentiaGraph and Meilisearch
   # ==========================================================================
   api-tests:
     name: API Tests
     runs-on: ubuntu-latest
     needs: [build, lint, unit-tests]
     services:
-      neo4j:
-        image: neo4j:5
+      indentiagraph:
+        image: surrealdb/surrealdb:latest
         env:
-          NEO4J_AUTH: neo4j/testpassword
-          NEO4J_PLUGINS: '["apoc"]'
+          SURREALDB_USER: root
+          SURREALDB_PASS: testpassword
         ports:
-          - 7687:7687
-          - 7474:7474
+          - 8000:8000
         options: >-
-          --health-cmd "cypher-shell -u neo4j -p testpassword 'RETURN 1' || exit 1"
+          --health-cmd "curl -sf http://localhost:8000/health || exit 1"
           --health-interval 10s
           --health-timeout 10s
           --health-retries 10
@@ -218,8 +216,8 @@ jobs:
 
       - name: Wait for services to be ready
         run: |
-          echo "Waiting for Neo4j..."
-          timeout 60 bash -c 'until curl -sf http://localhost:7474 > /dev/null 2>&1; do sleep 2; done'
+          echo "Waiting for IndentiaGraph..."
+          timeout 60 bash -c 'until curl -sf http://localhost:8000 > /dev/null 2>&1; do sleep 2; done'
           echo "Waiting for Meilisearch..."
           timeout 60 bash -c 'until curl -sf http://localhost:7700/health > /dev/null 2>&1; do sleep 2; done'
           echo "All services are ready!"
@@ -231,9 +229,9 @@ jobs:
             'server:' \
             '  port: 8080' \
             '  serve_frontend: false' \
-            'neo4j:' \
-            '  uri: "bolt://localhost:7687"' \
-            '  user: "neo4j"' \
+            'indentiagraph:' \
+            '  uri: "ws://localhost:8000"' \
+            '  user: "root"' \
             '  password: "testpassword"' \
             'meilisearch:' \
             '  url: "http://localhost:7700"' \
@@ -279,7 +277,7 @@ jobs:
       # Coverage includes all #[cfg(test)] modules: mock-based tests (MockGraphStore,
       # MockSearchStore), MCP handler tests, PlanManager tests, NoteManager tests,
       # and parser tests. Integration/API tests are excluded because they require
-      # Neo4j and Meilisearch services (covered in separate CI jobs).
+      # IndentiaGraph and Meilisearch services (covered in separate CI jobs).
       - name: Generate coverage report (unit + mock tests)
         run: cargo llvm-cov --lib --test parser_tests --lcov --output-path lcov.info
 

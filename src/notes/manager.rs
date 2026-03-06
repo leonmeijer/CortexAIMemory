@@ -6,9 +6,7 @@
 use super::models::*;
 use crate::embeddings::EmbeddingProvider;
 use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType, EventEmitter};
-use crate::meilisearch::indexes::NoteDocument;
-use crate::meilisearch::SearchStore;
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::GraphStore;
 use anyhow::Result;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -36,8 +34,7 @@ impl Default for SynapseConfig {
 
 /// Manager for Knowledge Notes operations
 pub struct NoteManager {
-    neo4j: Arc<dyn GraphStore>,
-    meilisearch: Arc<dyn SearchStore>,
+    indentiagraph: Arc<dyn GraphStore>,
     event_emitter: Option<Arc<dyn EventEmitter>>,
     embedding_provider: Option<Arc<dyn EmbeddingProvider>>,
     synapse_config: SynapseConfig,
@@ -45,10 +42,9 @@ pub struct NoteManager {
 
 impl NoteManager {
     /// Create a new NoteManager
-    pub fn new(neo4j: Arc<dyn GraphStore>, meilisearch: Arc<dyn SearchStore>) -> Self {
+    pub fn new(indentiagraph: Arc<dyn GraphStore>) -> Self {
         Self {
-            neo4j,
-            meilisearch,
+            indentiagraph,
             event_emitter: None,
             embedding_provider: None,
             synapse_config: SynapseConfig::default(),
@@ -57,13 +53,11 @@ impl NoteManager {
 
     /// Create a new NoteManager with an event emitter
     pub fn with_event_emitter(
-        neo4j: Arc<dyn GraphStore>,
-        meilisearch: Arc<dyn SearchStore>,
+        indentiagraph: Arc<dyn GraphStore>,
         emitter: Arc<dyn EventEmitter>,
     ) -> Self {
         Self {
-            neo4j,
-            meilisearch,
+            indentiagraph,
             event_emitter: Some(emitter),
             embedding_provider: None,
             synapse_config: SynapseConfig::default(),
@@ -107,7 +101,7 @@ impl NoteManager {
             Ok(embedding) => {
                 let model = provider.model_name().to_string();
                 if let Err(e) = self
-                    .neo4j
+                    .indentiagraph
                     .set_note_embedding(note_id, &embedding, &model)
                     .await
                 {
@@ -145,7 +139,7 @@ impl NoteManager {
             _ => return,
         };
 
-        let neo4j = self.neo4j.clone();
+        let indentiagraph = self.indentiagraph.clone();
         let min_weight = self.synapse_config.min_weight;
         let max_neighbors = self.synapse_config.max_neighbors;
         let content = content.to_string();
@@ -165,7 +159,7 @@ impl NoteManager {
             };
 
             // Step 2: Vector search for nearest neighbors
-            let candidates = match neo4j
+            let candidates = match indentiagraph
                 .vector_search_notes(&embedding, max_neighbors + 1, project_id, None, None)
                 .await
             {
@@ -198,7 +192,7 @@ impl NoteManager {
             }
 
             // Step 4: Create bidirectional synapses
-            match neo4j.create_synapses(note_id, &neighbors).await {
+            match indentiagraph.create_synapses(note_id, &neighbors).await {
                 Ok(count) => {
                     tracing::debug!(
                         note_id = %note_id,
@@ -224,7 +218,7 @@ impl NoteManager {
     /// them via LINKED_TO relations. This enables the contextual scoring system
     /// to use anchor-based signals for better relevance ranking.
     fn spawn_auto_anchor(&self, note: &Note) {
-        let neo4j = self.neo4j.clone();
+        let indentiagraph = self.indentiagraph.clone();
         let note_clone = note.clone();
 
         tokio::spawn(async move {
@@ -232,7 +226,7 @@ impl NoteManager {
             // File nodes use absolute paths, but extract_file_paths_from_content
             // returns relative — we need root_path to bridge the gap.
             let root_path = if let Some(pid) = note_clone.project_id {
-                match neo4j.get_project(pid).await {
+                match indentiagraph.get_project(pid).await {
                     Ok(Some(proj)) => Some(proj.root_path),
                     _ => None,
                 }
@@ -241,7 +235,7 @@ impl NoteManager {
             };
 
             match crate::skills::activation::auto_anchor_note(
-                &*neo4j,
+                &*indentiagraph,
                 &note_clone,
                 root_path.as_deref(),
             )
@@ -283,17 +277,13 @@ impl NoteManager {
             created_by.to_string(),
         );
 
-        // Store in Neo4j
-        self.neo4j.create_note(&note).await?;
-
-        // Index in Meilisearch
-        let doc = self.note_to_document(&note, None).await?;
-        self.meilisearch.index_note(&doc).await?;
+        // Store in IndentiaGraph
+        self.indentiagraph.create_note(&note).await?;
 
         // Add initial anchors if provided
         if let Some(anchors) = input.anchors {
             for anchor_req in anchors {
-                self.neo4j
+                self.indentiagraph
                     .link_note_to_entity(
                         note.id,
                         &anchor_req.entity_type,
@@ -329,11 +319,11 @@ impl NoteManager {
 
     /// Get a note by ID
     pub async fn get_note(&self, id: Uuid) -> Result<Option<Note>> {
-        let note = self.neo4j.get_note(id).await?;
+        let note = self.indentiagraph.get_note(id).await?;
 
         // Load anchors if note exists
         if let Some(mut note) = note {
-            note.anchors = self.neo4j.get_note_anchors(id).await?;
+            note.anchors = self.indentiagraph.get_note_anchors(id).await?;
             Ok(Some(note))
         } else {
             Ok(None)
@@ -345,7 +335,7 @@ impl NoteManager {
         let content_changed = input.content.is_some();
 
         let updated = self
-            .neo4j
+            .indentiagraph
             .update_note(
                 id,
                 input.content,
@@ -356,11 +346,7 @@ impl NoteManager {
             )
             .await?;
 
-        // Update Meilisearch index
         if let Some(ref note) = updated {
-            let doc = self.note_to_document(note, None).await?;
-            self.meilisearch.index_note(&doc).await?;
-
             // Re-embed if content changed (best-effort)
             if content_changed {
                 self.embed_note(id, &note.content).await;
@@ -368,7 +354,7 @@ impl NoteManager {
                 // Content changed → delete old synapses and re-connect
                 // delete_synapses is best-effort (non-critical for the update)
                 if self.synapse_config.enabled {
-                    if let Err(e) = self.neo4j.delete_synapses(id).await {
+                    if let Err(e) = self.indentiagraph.delete_synapses(id).await {
                         tracing::warn!(
                             note_id = %id,
                             error = %e,
@@ -393,12 +379,10 @@ impl NoteManager {
 
     /// Delete a note
     pub async fn delete_note(&self, id: Uuid) -> Result<bool> {
-        // Delete from Neo4j (DETACH DELETE also removes SYNAPSE relationships)
-        let deleted = self.neo4j.delete_note(id).await?;
+        // Delete from IndentiaGraph (DETACH DELETE also removes SYNAPSE relationships)
+        let deleted = self.indentiagraph.delete_note(id).await?;
 
-        // Delete from Meilisearch
         if deleted {
-            self.meilisearch.delete_note(&id.to_string()).await?;
             self.emit(CrudEvent::new(
                 EventEntityType::Note,
                 CrudAction::Deleted,
@@ -416,7 +400,7 @@ impl NoteManager {
         workspace_slug: Option<&str>,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
-        self.neo4j
+        self.indentiagraph
             .list_notes(project_id, workspace_slug, filters)
             .await
     }
@@ -427,7 +411,9 @@ impl NoteManager {
         project_id: Uuid,
         filters: &NoteFilters,
     ) -> Result<(Vec<Note>, usize)> {
-        self.neo4j.list_notes(Some(project_id), None, filters).await
+        self.indentiagraph
+            .list_notes(Some(project_id), None, filters)
+            .await
     }
 
     // ========================================================================
@@ -436,7 +422,7 @@ impl NoteManager {
 
     /// Link a note to an entity
     pub async fn link_note_to_entity(&self, note_id: Uuid, entity: &LinkNoteRequest) -> Result<()> {
-        self.neo4j
+        self.indentiagraph
             .link_note_to_entity(note_id, &entity.entity_type, &entity.entity_id, None, None)
             .await?;
         self.emit(
@@ -455,7 +441,7 @@ impl NoteManager {
         signature_hash: Option<&str>,
         body_hash: Option<&str>,
     ) -> Result<()> {
-        self.neo4j
+        self.indentiagraph
             .link_note_to_entity(note_id, entity_type, entity_id, signature_hash, body_hash)
             .await
     }
@@ -467,7 +453,7 @@ impl NoteManager {
         entity_type: &EntityType,
         entity_id: &str,
     ) -> Result<()> {
-        self.neo4j
+        self.indentiagraph
             .unlink_note_from_entity(note_id, entity_type, entity_id)
             .await?;
         self.emit(
@@ -485,7 +471,7 @@ impl NoteManager {
 
     /// Get all anchors for a note
     pub async fn get_note_anchors(&self, note_id: Uuid) -> Result<Vec<NoteAnchor>> {
-        self.neo4j.get_note_anchors(note_id).await
+        self.indentiagraph.get_note_anchors(note_id).await
     }
 
     // ========================================================================
@@ -494,13 +480,12 @@ impl NoteManager {
 
     /// Confirm a note is still valid
     pub async fn confirm_note(&self, note_id: Uuid, confirmed_by: &str) -> Result<Option<Note>> {
-        let note = self.neo4j.confirm_note(note_id, confirmed_by).await?;
+        let note = self
+            .indentiagraph
+            .confirm_note(note_id, confirmed_by)
+            .await?;
 
-        // Update Meilisearch
         if let Some(ref note) = note {
-            let doc = self.note_to_document(note, None).await?;
-            self.meilisearch.index_note(&doc).await?;
-
             self.emit(
                 CrudEvent::new(
                     EventEntityType::Note,
@@ -523,16 +508,9 @@ impl NoteManager {
         invalidated_by: &str,
     ) -> Result<Option<Note>> {
         let updated = self
-            .neo4j
+            .indentiagraph
             .update_note(note_id, None, None, Some(NoteStatus::Obsolete), None, None)
             .await?;
-
-        // Update Meilisearch
-        if updated.is_some() {
-            self.meilisearch
-                .update_note_status(&note_id.to_string(), "obsolete")
-                .await?;
-        }
 
         // Log the invalidation reason (could be stored as a change)
         tracing::info!(
@@ -568,11 +546,8 @@ impl NoteManager {
         new_note.supersedes = Some(old_note_id);
 
         // Mark the old note as superseded
-        self.neo4j.supersede_note(old_note_id, new_note.id).await?;
-
-        // Update old note in Meilisearch
-        self.meilisearch
-            .update_note_status(&old_note_id.to_string(), "archived")
+        self.indentiagraph
+            .supersede_note(old_note_id, new_note.id)
             .await?;
 
         self.emit(
@@ -591,12 +566,14 @@ impl NoteManager {
 
     /// Get notes that need review
     pub async fn get_notes_needing_review(&self, project_id: Option<Uuid>) -> Result<Vec<Note>> {
-        self.neo4j.get_notes_needing_review(project_id).await
+        self.indentiagraph
+            .get_notes_needing_review(project_id)
+            .await
     }
 
     /// Update staleness scores for all active notes
     pub async fn update_staleness_scores(&self) -> Result<usize> {
-        self.neo4j.update_staleness_scores().await
+        self.indentiagraph.update_staleness_scores().await
     }
 
     /// Apply exponential energy decay to all active notes.
@@ -607,71 +584,74 @@ impl NoteManager {
     /// Temporally idempotent: result depends only on elapsed time since
     /// `last_activated`, not on call frequency.
     pub async fn update_energy_scores(&self, half_life_days: f64) -> Result<usize> {
-        self.neo4j.update_energy_scores(half_life_days).await
+        self.indentiagraph
+            .update_energy_scores(half_life_days)
+            .await
     }
 
     // ========================================================================
     // Search Operations
     // ========================================================================
 
-    /// Search notes using semantic search
+    /// Search notes using BM25 full-text search (keyword match via GraphStore).
     pub async fn search_notes(
         &self,
         query: &str,
         filters: &NoteFilters,
     ) -> Result<Vec<NoteSearchHit>> {
-        let project_slug = filters.search.as_deref(); // This is a simplification
-        let note_type = filters
-            .note_type
-            .as_ref()
-            .and_then(|v| v.first())
-            .map(|t| t.to_string());
-        let status = filters
-            .status
-            .as_ref()
-            .and_then(|v| v.first())
-            .map(|s| s.to_string());
-        let importance = filters
-            .importance
-            .as_ref()
-            .and_then(|v| v.first())
-            .map(|i| i.to_string());
-
-        let limit = filters.limit.unwrap_or(20) as usize;
+        let limit = filters.limit.unwrap_or(20).max(1) as usize;
 
         let hits = self
-            .meilisearch
-            .search_notes_with_scores(
-                query,
-                limit,
-                project_slug,
-                note_type.as_deref(),
-                status.as_deref(),
-                importance.as_deref(),
-            )
+            .indentiagraph
+            .search_notes_fts(query, limit, None)
             .await?;
 
-        // Convert to NoteSearchHit
-        let mut results = Vec::new();
-        for hit in hits {
-            // Get full note from Neo4j for complete data
-            if let Ok(Some(note)) = self.neo4j.get_note(hit.document.id.parse()?).await {
-                results.push(NoteSearchHit {
-                    note,
-                    score: hit.score,
-                    highlights: None,
-                });
-            }
-        }
-
-        Ok(results)
+        Ok(hits
+            .into_iter()
+            .filter(|(note, _)| {
+                filters
+                    .status
+                    .as_ref()
+                    .is_none_or(|statuses| statuses.contains(&note.status))
+                    && filters
+                        .note_type
+                        .as_ref()
+                        .is_none_or(|types| types.contains(&note.note_type))
+                    && filters
+                        .importance
+                        .as_ref()
+                        .is_none_or(|levels| levels.contains(&note.importance))
+                    && filters
+                        .tags
+                        .as_ref()
+                        .is_none_or(|tags| tags.iter().any(|t| note.tags.iter().any(|nt| nt == t)))
+                    && filters.global_only.is_none_or(|global_only| {
+                        if global_only {
+                            note.project_id.is_none()
+                        } else {
+                            true
+                        }
+                    })
+                    && filters
+                        .min_staleness
+                        .is_none_or(|min| note.staleness_score >= min)
+                    && filters
+                        .max_staleness
+                        .is_none_or(|max| note.staleness_score <= max)
+            })
+            .map(|(note, score)| NoteSearchHit {
+                note,
+                score,
+                highlights: None,
+            })
+            .collect())
     }
 
-    /// Search notes using vector similarity (cosine) via Neo4j HNSW index.
+    /// Search notes using vector similarity (cosine) via IndentiaGraph HNSW index.
     ///
     /// Embeds the query text using the configured embedding provider, then
     /// performs a vector similarity search against stored note embeddings.
-    /// Falls back to BM25 text search (Meilisearch) if no embedding provider
+    /// Falls back to BM25 text search if no embedding provider
     /// is configured.
     ///
     /// # Arguments
@@ -710,9 +690,9 @@ impl NoteManager {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to embed search query: {}", e))?;
 
-        // Perform vector similarity search via Neo4j HNSW index
+        // Perform vector similarity search via IndentiaGraph HNSW index
         let results = self
-            .neo4j
+            .indentiagraph
             .vector_search_notes(
                 &query_embedding,
                 limit,
@@ -747,7 +727,7 @@ impl NoteManager {
 
             for entity_type in [EntityType::Task, EntityType::Plan, EntityType::Project] {
                 let notes = self
-                    .neo4j
+                    .indentiagraph
                     .get_notes_for_entity(&entity_type, &uuid.to_string())
                     .await?;
                 all_notes.extend(notes);
@@ -756,7 +736,7 @@ impl NoteManager {
             Ok(all_notes)
         } else {
             // Likely a file path
-            self.neo4j
+            self.indentiagraph
                 .get_notes_for_entity(&EntityType::File, entity_id)
                 .await
         }
@@ -774,7 +754,7 @@ impl NoteManager {
         min_score: f64,
         relation_types: Option<&[String]>,
     ) -> Result<Vec<PropagatedNote>> {
-        self.neo4j
+        self.indentiagraph
             .get_propagated_notes(entity_type, entity_id, max_depth, min_score, relation_types)
             .await
     }
@@ -789,13 +769,13 @@ impl NoteManager {
     ) -> Result<NoteContextResponse> {
         // Get direct notes
         let direct_notes = self
-            .neo4j
+            .indentiagraph
             .get_notes_for_entity(entity_type, entity_id)
             .await?;
 
         // Get propagated notes from graph traversal (default relations)
         let mut propagated_notes = self
-            .neo4j
+            .indentiagraph
             .get_propagated_notes(entity_type, entity_id, max_depth, min_score, None)
             .await?;
 
@@ -805,7 +785,7 @@ impl NoteManager {
             if let Ok(project_id) = entity_id.parse::<uuid::Uuid>() {
                 const WORKSPACE_PROPAGATION_FACTOR: f64 = 0.8;
                 let workspace_notes = self
-                    .neo4j
+                    .indentiagraph
                     .get_workspace_notes_for_project(project_id, WORKSPACE_PROPAGATION_FACTOR)
                     .await?;
 
@@ -861,14 +841,14 @@ impl NoteManager {
             _ => "File", // fallback
         };
         let decisions = self
-            .neo4j
+            .indentiagraph
             .get_decisions_for_entity(entity_label, entity_id, 10)
             .await
             .unwrap_or_default();
 
         // 3. Recent commits (only for File entities, via TOUCHES)
         let recent_commits = if *entity_type == EntityType::File {
-            self.neo4j
+            self.indentiagraph
                 .get_file_history(entity_id, Some(10))
                 .await
                 .unwrap_or_default()
@@ -929,7 +909,7 @@ impl NoteManager {
             _ => "File", // fallback
         };
         let decisions = self
-            .neo4j
+            .indentiagraph
             .get_decisions_for_entity(entity_label, entity_id, 10)
             .await
             .unwrap_or_default();
@@ -989,73 +969,6 @@ impl NoteManager {
     }
 
     // ========================================================================
-    // Helper Functions
-    // ========================================================================
-
-    /// Convert a Note to a NoteDocument for Meilisearch indexing
-    async fn note_to_document(
-        &self,
-        note: &Note,
-        project_slug: Option<&str>,
-    ) -> Result<NoteDocument> {
-        // Get project slug if not provided
-        let slug = if let Some(s) = project_slug {
-            s.to_string()
-        } else {
-            // Try to get from project (if project_id is present)
-            if let Some(pid) = note.project_id {
-                if let Ok(Some(project)) = self.neo4j.get_project(pid).await {
-                    project.slug
-                } else {
-                    String::new()
-                }
-            } else {
-                String::new() // Global note, no project slug
-            }
-        };
-
-        // Get anchor entity IDs
-        let anchors = self
-            .neo4j
-            .get_note_anchors(note.id)
-            .await
-            .unwrap_or_default();
-        let anchor_entities: Vec<String> = anchors
-            .iter()
-            .map(|a| format!("{}:{}", a.entity_type, a.entity_id))
-            .collect();
-
-        Ok(NoteDocument {
-            id: note.id.to_string(),
-            project_id: note.project_id.map(|id| id.to_string()).unwrap_or_default(),
-            project_slug: slug,
-            note_type: note.note_type.to_string(),
-            status: note.status.to_string(),
-            importance: note.importance.to_string(),
-            scope_type: match &note.scope {
-                NoteScope::Workspace => "workspace".to_string(),
-                NoteScope::Project => "project".to_string(),
-                NoteScope::Module(_) => "module".to_string(),
-                NoteScope::File(_) => "file".to_string(),
-                NoteScope::Function(_) => "function".to_string(),
-                NoteScope::Struct(_) => "struct".to_string(),
-                NoteScope::Trait(_) => "trait".to_string(),
-            },
-            scope_path: match &note.scope {
-                NoteScope::Workspace | NoteScope::Project => String::new(),
-                NoteScope::Module(p) | NoteScope::File(p) => p.clone(),
-                NoteScope::Function(n) | NoteScope::Struct(n) | NoteScope::Trait(n) => n.clone(),
-            },
-            content: note.content.clone(),
-            tags: note.tags.clone(),
-            anchor_entities,
-            created_at: note.created_at.timestamp(),
-            created_by: note.created_by.clone(),
-            staleness_score: note.staleness_score,
-        })
-    }
-
-    // ========================================================================
     // Embedding Backfill
     // ========================================================================
 
@@ -1083,7 +996,10 @@ impl NoteManager {
         let batch_size = if batch_size == 0 { 50 } else { batch_size };
 
         // Get total count first
-        let (_, total) = self.neo4j.list_notes_without_embedding(0, 0).await?;
+        let (_, total) = self
+            .indentiagraph
+            .list_notes_without_embedding(0, 0)
+            .await?;
         if total == 0 {
             tracing::info!("Backfill: all notes already have embeddings");
             return Ok(BackfillProgress {
@@ -1109,7 +1025,7 @@ impl NoteManager {
 
             // Fetch next batch (always offset 0 because processed notes disappear)
             let (batch, remaining) = self
-                .neo4j
+                .indentiagraph
                 .list_notes_without_embedding(batch_size, 0)
                 .await?;
             if batch.is_empty() || remaining == 0 {
@@ -1125,7 +1041,7 @@ impl NoteManager {
                     let model = provider.model_name().to_string();
                     for (i, embedding) in embeddings.into_iter().enumerate() {
                         if let Err(e) = self
-                            .neo4j
+                            .indentiagraph
                             .set_note_embedding(note_ids[i], &embedding, &model)
                             .await
                         {
@@ -1152,7 +1068,7 @@ impl NoteManager {
                             Ok(embedding) => {
                                 let model = provider.model_name().to_string();
                                 if let Err(e) = self
-                                    .neo4j
+                                    .indentiagraph
                                     .set_note_embedding(note_ids[i], &embedding, &model)
                                     .await
                                 {
@@ -1229,13 +1145,13 @@ impl NoteManager {
         };
 
         // Phase 1: init energy on all notes that don't have it yet
-        let energy_init = self.neo4j.init_note_energy().await?;
+        let energy_init = self.indentiagraph.init_note_energy().await?;
         if energy_init > 0 {
             tracing::info!("Synapse backfill: initialized energy on {energy_init} notes");
         }
 
         // Phase 2: get total count of notes needing synapses
-        let (_, total) = self.neo4j.list_notes_needing_synapses(0, 0).await?;
+        let (_, total) = self.indentiagraph.list_notes_needing_synapses(0, 0).await?;
         if total == 0 {
             tracing::info!("Synapse backfill: all notes with embeddings already have synapses");
             return Ok(SynapseBackfillProgress {
@@ -1270,7 +1186,7 @@ impl NoteManager {
             // results (offset 0 works for those). But notes with no eligible
             // neighbours stay, so we skip past them with `skip_offset`.
             let (batch, remaining) = self
-                .neo4j
+                .indentiagraph
                 .list_notes_needing_synapses(batch_size, skip_offset)
                 .await?;
             if batch.is_empty() || remaining == 0 {
@@ -1299,7 +1215,7 @@ impl NoteManager {
                 }
 
                 // Get the stored embedding for this note
-                let embedding = match self.neo4j.get_note_embedding(note.id).await {
+                let embedding = match self.indentiagraph.get_note_embedding(note.id).await {
                     Ok(Some(emb)) => emb,
                     Ok(None) => {
                         tracing::warn!(
@@ -1324,7 +1240,7 @@ impl NoteManager {
 
                 // Vector search for nearest neighbours
                 let neighbors = match self
-                    .neo4j
+                    .indentiagraph
                     .vector_search_notes(&embedding, max_neighbors + 1, note.project_id, None, None)
                     .await
                 {
@@ -1361,7 +1277,11 @@ impl NoteManager {
                     continue;
                 }
 
-                match self.neo4j.create_synapses(note.id, &synapse_targets).await {
+                match self
+                    .indentiagraph
+                    .create_synapses(note.id, &synapse_targets)
+                    .await
+                {
                     Ok(created) => {
                         synapses_created += created;
                         batch_connected += 1;
@@ -1439,7 +1359,10 @@ impl NoteManager {
         max_neighbors: usize,
         cancel: Option<&std::sync::atomic::AtomicBool>,
     ) -> Result<(usize, usize, usize)> {
-        let (_, total) = self.neo4j.list_decisions_needing_synapses(0, 0).await?;
+        let (_, total) = self
+            .indentiagraph
+            .list_decisions_needing_synapses(0, 0)
+            .await?;
         if total == 0 {
             tracing::info!("Synapse backfill (decisions): all decisions already have synapses");
             return Ok((0, 0, 0));
@@ -1460,7 +1383,7 @@ impl NoteManager {
             }
 
             let (batch, remaining) = self
-                .neo4j
+                .indentiagraph
                 .list_decisions_needing_synapses(batch_size, skip_offset)
                 .await?;
             if batch.is_empty() || remaining == 0 {
@@ -1477,7 +1400,7 @@ impl NoteManager {
                 }
 
                 // Get the stored embedding for this decision
-                let embedding = match self.neo4j.get_decision_embedding(decision.id).await {
+                let embedding = match self.indentiagraph.get_decision_embedding(decision.id).await {
                     Ok(Some(emb)) => emb,
                     Ok(None) => {
                         tracing::warn!(
@@ -1502,7 +1425,7 @@ impl NoteManager {
 
                 // Search for similar Notes using the note vector index
                 let note_neighbors = match self
-                    .neo4j
+                    .indentiagraph
                     .vector_search_notes(&embedding, max_neighbors, None, None, None)
                     .await
                 {
@@ -1528,7 +1451,7 @@ impl NoteManager {
 
                 // Also search for similar Decisions via the decision vector index
                 match self
-                    .neo4j
+                    .indentiagraph
                     .search_decisions_by_vector(&embedding, max_neighbors, None)
                     .await
                 {
@@ -1562,7 +1485,7 @@ impl NoteManager {
 
                 // Create cross-entity synapses (works for Decision↔Note and Decision↔Decision)
                 match self
-                    .neo4j
+                    .indentiagraph
                     .create_cross_entity_synapses(decision.id, &synapse_targets)
                     .await
                 {
@@ -1642,9 +1565,8 @@ mod tests {
         let state = mock_app_state();
         let project = test_project();
         let project_id = project.id;
-        // Seed the project so note_to_document can resolve the slug
-        state.neo4j.create_project(&project).await.unwrap();
-        let manager = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        state.indentiagraph.create_project(&project).await.unwrap();
+        let manager = NoteManager::new(state.indentiagraph.clone());
         (manager, project_id)
     }
 
@@ -1680,7 +1602,7 @@ mod tests {
         assert_eq!(note.status, NoteStatus::Active);
         assert_eq!(note.created_by, "agent-1");
 
-        // Verify stored in Neo4j
+        // Verify stored in IndentiaGraph
         let stored = mgr.get_note(note.id).await.unwrap();
         assert!(stored.is_some());
         assert_eq!(stored.unwrap().id, note.id);
@@ -1740,7 +1662,7 @@ mod tests {
         let deleted = mgr.delete_note(created.id).await.unwrap();
         assert!(deleted);
 
-        // Verify removed from Neo4j
+        // Verify removed from IndentiaGraph
         let gone = mgr.get_note(created.id).await.unwrap();
         assert!(gone.is_none());
 
@@ -1780,10 +1702,18 @@ mod tests {
         // Create two projects
         let project_a = test_project_named("Alpha");
         let project_b = test_project_named("Beta");
-        state.neo4j.create_project(&project_a).await.unwrap();
-        state.neo4j.create_project(&project_b).await.unwrap();
+        state
+            .indentiagraph
+            .create_project(&project_a)
+            .await
+            .unwrap();
+        state
+            .indentiagraph
+            .create_project(&project_b)
+            .await
+            .unwrap();
 
-        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let mgr = NoteManager::new(state.indentiagraph.clone());
 
         // Create notes for each project
         let req_a = make_create_request(project_a.id, "Alpha note");
@@ -2027,7 +1957,7 @@ mod tests {
     #[tokio::test]
     async fn test_create_global_note() {
         let state = mock_app_state();
-        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let mgr = NoteManager::new(state.indentiagraph.clone());
 
         let req = make_global_request("Always use kebab-case for slugs");
         let note = mgr.create_note(req, "agent-1").await.unwrap();
@@ -2041,9 +1971,9 @@ mod tests {
     async fn test_list_notes_global_only() {
         let state = mock_app_state();
         let project = test_project();
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
 
-        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let mgr = NoteManager::new(state.indentiagraph.clone());
 
         // Create a project note and a global note
         let project_req = make_create_request(project.id, "Project-specific note");
@@ -2085,17 +2015,19 @@ mod tests {
 
     /// Helper: build a NoteManager backed by mock stores **with** a MockEmbeddingProvider.
     /// Returns (NoteManager, project_id, Arc<MockGraphStore>) so tests can inspect embeddings.
-    async fn create_note_manager_with_embeddings(
-    ) -> (NoteManager, Uuid, Arc<crate::neo4j::mock::MockGraphStore>) {
-        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-        let meili = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+    async fn create_note_manager_with_embeddings() -> (
+        NoteManager,
+        Uuid,
+        Arc<crate::indentiagraph::mock::MockGraphStore>,
+    ) {
+        let graph = Arc::new(crate::indentiagraph::mock::MockGraphStore::new());
         let project = test_project();
         let project_id = project.id;
         graph.create_project(&project).await.unwrap();
 
         let provider = Arc::new(crate::embeddings::MockEmbeddingProvider::new(768));
 
-        let manager = NoteManager::new(graph.clone() as Arc<dyn crate::neo4j::GraphStore>, meili)
+        let manager = NoteManager::new(graph.clone() as Arc<dyn crate::indentiagraph::GraphStore>)
             .with_embedding_provider(provider);
 
         (manager, project_id, graph)
@@ -2237,19 +2169,16 @@ mod tests {
     ) -> (
         NoteManager,
         Vec<Uuid>,
-        Arc<crate::neo4j::mock::MockGraphStore>,
+        Arc<crate::indentiagraph::mock::MockGraphStore>,
     ) {
-        let graph = Arc::new(crate::neo4j::mock::MockGraphStore::new());
-        let meili = Arc::new(crate::meilisearch::mock::MockSearchStore::new());
+        let graph = Arc::new(crate::indentiagraph::mock::MockGraphStore::new());
         let project = test_project();
         let project_id = project.id;
         graph.create_project(&project).await.unwrap();
 
         // Create notes WITHOUT embedding provider (simulates existing notes)
-        let mgr_no_embed = NoteManager::new(
-            graph.clone() as Arc<dyn crate::neo4j::GraphStore>,
-            meili.clone(),
-        );
+        let mgr_no_embed =
+            NoteManager::new(graph.clone() as Arc<dyn crate::indentiagraph::GraphStore>);
         let mut note_ids = Vec::new();
         for i in 0..count {
             let req = make_create_request(project_id, &format!("Backfill note {i}"));
@@ -2268,7 +2197,7 @@ mod tests {
 
         // Now create a NoteManager WITH embedding provider
         let provider = Arc::new(crate::embeddings::MockEmbeddingProvider::new(768));
-        let mgr = NoteManager::new(graph.clone() as Arc<dyn crate::neo4j::GraphStore>, meili)
+        let mgr = NoteManager::new(graph.clone() as Arc<dyn crate::indentiagraph::GraphStore>)
             .with_embedding_provider(provider);
 
         (mgr, note_ids, graph)
@@ -2350,9 +2279,9 @@ mod tests {
     async fn test_global_notes_still_work_with_project_notes() {
         let state = mock_app_state();
         let project = test_project();
-        state.neo4j.create_project(&project).await.unwrap();
+        state.indentiagraph.create_project(&project).await.unwrap();
 
-        let mgr = NoteManager::new(state.neo4j.clone(), state.meili.clone());
+        let mgr = NoteManager::new(state.indentiagraph.clone());
 
         // Create both types
         let proj_note = mgr
@@ -2441,7 +2370,7 @@ mod tests {
             .semantic_search_notes("test", None, None, Some(10), None)
             .await;
 
-        // Should not error — falls back gracefully to Meilisearch
+        // Should not error — falls back gracefully to BM25 text search
         assert!(results.is_ok(), "should fall back to BM25 without error");
     }
 

@@ -1,6 +1,6 @@
-//! Neo4j → petgraph extraction.
+//! IndentiaGraph → petgraph extraction.
 //!
-//! Converts the knowledge graph stored in Neo4j into an in-memory `petgraph::DiGraph`
+//! Converts the knowledge graph stored in IndentiaGraph into an in-memory `petgraph::DiGraph`
 //! suitable for analytics computation. Uses the `GraphStore` trait (not raw Cypher)
 //! to fetch nodes and relationships.
 //!
@@ -12,7 +12,7 @@
 //! - **File graph**: nodes = files, edges = IMPORTS relationships
 //! - **Function graph**: nodes = functions, edges = CALLS relationships
 
-use crate::neo4j::GraphStore;
+use crate::indentiagraph::GraphStore;
 use anyhow::Result;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -32,7 +32,7 @@ fn parse_qualified_id(id: &str) -> (Option<String>, String) {
     }
 }
 
-/// Extracts code graphs from the knowledge graph (Neo4j) via the `GraphStore` trait.
+/// Extracts code graphs from the knowledge graph (IndentiaGraph) via the `GraphStore` trait.
 ///
 /// Each extraction method performs at most 2 bulk queries:
 /// one for nodes, one for edges.
@@ -357,8 +357,8 @@ impl GraphExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::mock::MockGraphStore;
-    use crate::neo4j::models::{FunctionNode, Visibility};
+    use crate::indentiagraph::mock::MockGraphStore;
+    use crate::indentiagraph::models::{FunctionNode, Visibility};
     use crate::test_helpers::test_project;
 
     /// Seed a project with files and import relationships into the mock store.
@@ -370,7 +370,7 @@ mod tests {
     ) {
         // Seed files using upsert_file + project_files registration
         for path in files {
-            let file = crate::neo4j::models::FileNode {
+            let file = crate::indentiagraph::models::FileNode {
                 path: path.to_string(),
                 language: "rust".to_string(),
                 hash: "abc123".to_string(),
@@ -559,7 +559,7 @@ mod tests {
         extends: &[(&str, &str, &str, &str)],
         implements: &[(&str, &str, &str, &str)],
     ) {
-        use crate::neo4j::models::{StructNode, TraitNode, Visibility};
+        use crate::indentiagraph::models::{StructNode, TraitNode, Visibility};
 
         // Collect all structs (children + parents)
         let mut seen_structs = std::collections::HashSet::new();

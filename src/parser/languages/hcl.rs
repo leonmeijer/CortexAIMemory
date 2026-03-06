@@ -8,7 +8,7 @@
 //! - Inter-resource references → FunctionCall
 //! - Implicit same-directory scope → ImportNode("__same_dir__")
 
-use crate::neo4j::models::*;
+use crate::indentiagraph::models::*;
 use crate::parser::helpers::*;
 use crate::parser::{FunctionCall, ParsedFile};
 use anyhow::Result;

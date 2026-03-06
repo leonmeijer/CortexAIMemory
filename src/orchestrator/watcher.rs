@@ -1,7 +1,7 @@
 //! File watcher for auto-syncing code changes
 //!
 //! This module watches directories for file changes and automatically
-//! updates Neo4j and Meilisearch when files are modified.
+//! updates the graph backend and BM25 indexes when files are modified.
 //!
 //! ## Multi-project support
 //!
@@ -44,7 +44,7 @@ use crate::events::{CrudAction, CrudEvent, EntityType as EventEntityType};
 pub(crate) enum WatchEventKind {
     /// File was created or modified — needs (re-)sync.
     Changed,
-    /// File was removed — needs cleanup from Neo4j + Meilisearch.
+    /// File was removed — needs cleanup from graph + search indexes.
     Deleted,
 }
 
@@ -224,7 +224,7 @@ impl FileWatcher {
     ///
     /// This **project-level debounce** is critical for bulk operations like
     /// `git checkout` where 100+ files change simultaneously. Instead of
-    /// 100 sequential sync_file calls (each with Neo4j writes), we collect
+    /// 100 sequential sync_file calls (each with IndentiaGraph writes), we collect
     /// all changes and sync them in one batch.
     ///
     /// Safe to call with 0 registered projects — the watcher will be ready
@@ -462,7 +462,7 @@ impl FileWatcher {
 /// - If < threshold → sync each file individually
 /// - Trigger the analytics debouncer once per project
 ///
-/// For pending deletions: remove each file from Neo4j and Meilisearch.
+/// For pending deletions: remove each file from graph and search indexes.
 ///
 /// Orphan files (no project association) are synced/deleted individually.
 async fn flush_pending_files(
@@ -584,7 +584,7 @@ async fn flush_pending_files(
                 .map(|p| super::runner::normalize_path(&p.to_string_lossy()))
                 .collect();
             match orchestrator
-                .neo4j()
+                .indentiagraph()
                 .invalidate_computed_properties(pid, &invalidation_paths)
                 .await
             {
@@ -610,10 +610,13 @@ async fn flush_pending_files(
         orchestrator.analytics_debouncer().trigger(pid);
 
         // Spawn auto-anchor in background: link notes to newly synced files
-        let neo4j = orchestrator.neo4j_arc();
+        let indentiagraph = orchestrator.indentiagraph_arc();
         tokio::spawn(async move {
-            match crate::skills::activation::auto_anchor_notes_for_project(neo4j.as_ref(), pid)
-                .await
+            match crate::skills::activation::auto_anchor_notes_for_project(
+                indentiagraph.as_ref(),
+                pid,
+            )
+            .await
             {
                 Ok(r) if r.anchors_created > 0 => {
                     tracing::info!(
@@ -646,17 +649,11 @@ async fn flush_pending_files(
         for path in &files {
             let path_str = super::runner::normalize_path(&path.to_string_lossy());
 
-            // Remove from Neo4j (File node + all children symbols + relationships)
-            if let Err(e) = orchestrator.neo4j().delete_file(&path_str).await {
-                tracing::warn!("Failed to delete {} from Neo4j: {}", path_str, e);
+            // Remove from IndentiaGraph (File node + all children symbols + relationships)
+            if let Err(e) = orchestrator.indentiagraph().delete_file(&path_str).await {
+                tracing::warn!("Failed to delete {} from IndentiaGraph: {}", path_str, e);
                 errors += 1;
                 continue;
-            }
-
-            // Remove from Meilisearch search index
-            if let Err(e) = orchestrator.meili().delete_code(&path_str).await {
-                tracing::warn!("Failed to delete {} from Meilisearch: {}", path_str, e);
-                // Non-fatal: Neo4j is source of truth, Meili is secondary index
             }
 
             deleted += 1;
@@ -678,7 +675,7 @@ async fn flush_pending_files(
                 .map(|p| super::runner::normalize_path(&p.to_string_lossy()))
                 .collect();
             match orchestrator
-                .neo4j()
+                .indentiagraph()
                 .invalidate_computed_properties(pid, &deletion_paths)
                 .await
             {
@@ -705,10 +702,13 @@ async fn flush_pending_files(
         // Spawn auto-anchor in background after deletions too:
         // notes referencing deleted files won't match, but notes referencing
         // remaining files may now need re-anchoring.
-        let neo4j = orchestrator.neo4j_arc();
+        let indentiagraph = orchestrator.indentiagraph_arc();
         tokio::spawn(async move {
-            match crate::skills::activation::auto_anchor_notes_for_project(neo4j.as_ref(), pid)
-                .await
+            match crate::skills::activation::auto_anchor_notes_for_project(
+                indentiagraph.as_ref(),
+                pid,
+            )
+            .await
             {
                 Ok(r) if r.anchors_created > 0 => {
                     tracing::info!(
@@ -744,12 +744,9 @@ async fn flush_pending_files(
         );
         for path in &orphan_deletions {
             let path_str = super::runner::normalize_path(&path.to_string_lossy());
-            if let Err(e) = orchestrator.neo4j().delete_file(&path_str).await {
-                tracing::warn!("Failed to delete orphan {} from Neo4j: {}", path_str, e);
-            }
-            if let Err(e) = orchestrator.meili().delete_code(&path_str).await {
+            if let Err(e) = orchestrator.indentiagraph().delete_file(&path_str).await {
                 tracing::warn!(
-                    "Failed to delete orphan {} from Meilisearch: {}",
+                    "Failed to delete orphan {} from IndentiaGraph: {}",
                     path_str,
                     e
                 );
@@ -953,7 +950,8 @@ async fn handle_project_created(
                             result.errors,
                         );
                         // Update last_synced timestamp
-                        if let Err(e) = orch.neo4j().update_project_synced(project_id).await {
+                        if let Err(e) = orch.indentiagraph().update_project_synced(project_id).await
+                        {
                             tracing::warn!(
                                 "Watcher bridge: failed to update last_synced for '{}': {}",
                                 sync_slug,
@@ -1024,12 +1022,12 @@ async fn handle_project_updated(
     };
 
     // Look up the project to get current slug
-    let neo4j = orchestrator.neo4j_arc();
-    let project = match neo4j.get_project(project_id).await {
+    let indentiagraph = orchestrator.indentiagraph_arc();
+    let project = match indentiagraph.get_project(project_id).await {
         Ok(Some(p)) => p,
         Ok(None) => {
             tracing::warn!(
-                "Watcher bridge: project {} not found in Neo4j after update",
+                "Watcher bridge: project {} not found in IndentiaGraph after update",
                 project_id
             );
             return;
@@ -1488,7 +1486,7 @@ mod tests {
     // ── dynamic watch path tests ──────────────────────────────────────
     //
     // These tests exercise the dynamic path registration logic without
-    // needing a full Orchestrator (which requires Neo4j/Meilisearch).
+    // needing a full Orchestrator (which requires external graph/search backends).
     // They work directly with the internal structures (project_map,
     // watched_paths, add_path channel).
 
@@ -1671,7 +1669,7 @@ mod tests {
     // ── flush_pending_files logic tests ──────────────────────────────
     //
     // flush_pending_files requires an Arc<Orchestrator> which needs
-    // Neo4j/Meilisearch. Instead we test the data structures it consumes.
+    // external graph/search backends. Instead we test the data structures it consumes.
 
     #[test]
     fn test_pending_files_collection_below_threshold() {

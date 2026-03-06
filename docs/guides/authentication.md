@@ -16,7 +16,7 @@ Project Orchestrator uses **JWT HS256 tokens** issued after authenticating throu
 
 Key principles:
 
-- **Three auth providers:** Password (root account + Neo4j-stored users), Google OAuth2 (legacy), and Generic OIDC (any OpenID Connect provider)
+- **Three auth providers:** Password (root account + IndentiaGraph-stored users), Google OAuth2 (legacy), and Generic OIDC (any OpenID Connect provider)
 - **Provider discovery:** `GET /auth/providers` lets the frontend dynamically adapt its login UI based on which providers are configured
 - **JWT tokens** are stateless and short-lived (default 8 hours)
 - **Email restrictions** optionally limit access by domain or individual whitelist
@@ -39,7 +39,7 @@ Frontend                         Server
    |  { email, password }           |
    | -----------------------------> |
    |                                |  2. Check root account (in-memory)
-   |                                |     OR lookup user in Neo4j
+   |                                |     OR lookup user in IndentiaGraph
    |                                |  3. Verify bcrypt hash
    |                                |  4. Generate JWT (HS256)
    |  { token, user }              |
@@ -76,7 +76,7 @@ Frontend                    Server                        Google
    |                          |  { email, name, picture }    |
    |                          | <----------------------------|
    |                          |                              |
-   |                          |  7. Upsert user in Neo4j     |
+   |                          |  7. Upsert user in IndentiaGraph     |
    |                          |  8. Generate JWT (HS256)     |
    |                          |                              |
    |  { token, user }        |                              |
@@ -108,7 +108,7 @@ Frontend                    Server                     OIDC Provider
    |                          |  { email, name, sub }        |
    |                          | <----------------------------|
    |                          |                              |
-   |                          |  7. Upsert user in Neo4j     |
+   |                          |  7. Upsert user in IndentiaGraph     |
    |                          |  8. Generate JWT (HS256)     |
    |                          |                              |
    |  { token, user }        |                              |
@@ -121,7 +121,7 @@ The JWT payload is identical regardless of which provider was used to authentica
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `sub` | UUID | User ID (from Neo4j, or deterministic UUID for root account) |
+| `sub` | UUID | User ID (from IndentiaGraph, or deterministic UUID for root account) |
 | `email` | String | User's email address |
 | `name` | String | User's display name |
 | `iat` | Unix timestamp | Issued at |
@@ -260,7 +260,7 @@ auth:
     password_hash: "$2b$12$LJ3m4sFQm1MJoUqoEZnBN.ZhYcKORSVn4nh1qZk6IP6W7yR3xtGPq"
 ```
 
-> **User registration:** If `allow_registration: true` is set, anyone can create a new password-authenticated account via `POST /auth/register`. Registered users are stored in Neo4j with bcrypt-hashed passwords. You can restrict registration with `allowed_email_domain` or `allowed_emails`.
+> **User registration:** If `allow_registration: true` is set, anyone can create a new password-authenticated account via `POST /auth/register`. Registered users are stored in IndentiaGraph with bcrypt-hashed passwords. You can restrict registration with `allowed_email_domain` or `allowed_emails`.
 
 ### Google OAuth2
 
@@ -445,7 +445,7 @@ curl http://localhost:8080/auth/providers
 
 ### POST /auth/login
 
-Email/password authentication. Checks the root account first (in-memory, no DB hit), then falls back to Neo4j-stored users.
+Email/password authentication. Checks the root account first (in-memory, no DB hit), then falls back to IndentiaGraph-stored users.
 
 ```bash
 curl -X POST http://localhost:8080/auth/login \
@@ -875,10 +875,10 @@ In no-auth mode, the middleware injects anonymous claims (`anonymous@local`, nil
 
 ### User Data
 
-- User records are stored in Neo4j with: `id`, `email`, `name`, `picture_url`, `auth_provider`, `external_id`, `password_hash`, `created_at`, `last_login_at`
+- User records are stored in IndentiaGraph with: `id`, `email`, `name`, `picture_url`, `auth_provider`, `external_id`, `password_hash`, `created_at`, `last_login_at`
 - The `auth_provider` field distinguishes between `password` and `oidc` accounts
 - Password users store a bcrypt hash in `password_hash`; OIDC users store the provider's subject ID in `external_id`
-- The root account is never stored in Neo4j -- it is verified purely from `config.yaml` values in memory
+- The root account is never stored in IndentiaGraph -- it is verified purely from `config.yaml` values in memory
 
 ---
 

@@ -1,7 +1,7 @@
 //! Chat entity extraction — extract code entity references from chat messages.
 //!
 //! Extracts file paths, backtick identifiers, and code patterns from user messages,
-//! then validates them against the Neo4j knowledge graph to reject false positives.
+//! then validates them against the IndentiaGraph knowledge graph to reject false positives.
 //!
 //! **Design constraints:**
 //! - Lightweight: regex/string matching only, no LLM calls
@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use tracing::debug;
 use uuid::Uuid;
 
-use crate::neo4j::traits::GraphStore;
+use crate::indentiagraph::traits::GraphStore;
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -71,7 +71,7 @@ pub enum ExtractionSource {
     CodePattern,
 }
 
-/// A validated entity — confirmed to exist in the Neo4j knowledge graph.
+/// A validated entity — confirmed to exist in the IndentiaGraph knowledge graph.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ValidatedEntity {
     /// The resolved entity type (no longer `Symbol`)
@@ -80,7 +80,7 @@ pub struct ValidatedEntity {
     pub identifier: String,
     /// How the entity was extracted
     pub source: ExtractionSource,
-    /// The Neo4j node type label (e.g. "File", "Function", "Struct")
+    /// The IndentiaGraph node type label (e.g. "File", "Function", "Struct")
     pub node_label: String,
     /// The file this entity belongs to (if applicable)
     pub file_path: Option<String>,
@@ -164,7 +164,7 @@ const NOISE_WORDS: &[&str] = &[
 /// 2. **Backtick identifiers** — code in backticks like `` `MyStruct` ``
 /// 3. **Code keyword patterns** — `fn build_prompt`, `struct FileNode`, etc.
 ///
-/// Returns deduplicated entities. No Neo4j calls — pure text processing.
+/// Returns deduplicated entities. No IndentiaGraph calls — pure text processing.
 pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
     let mut seen = HashSet::new();
     let mut entities = Vec::new();
@@ -200,7 +200,7 @@ pub fn extract_entities(text: &str) -> Vec<ExtractedEntity> {
 /// Strategy 1: Extract file paths from text.
 ///
 /// Matches patterns like:
-/// - `src/main.rs`, `src/neo4j/client.rs`
+/// - `src/main.rs`, `src/indentiagraph/client.rs`
 /// - `Cargo.toml`, `package.json`
 /// - Paths with or without leading `/` or `./`
 fn extract_file_paths(text: &str) -> Vec<ExtractedEntity> {
@@ -493,7 +493,7 @@ fn tokenize(text: &str) -> Vec<&str> {
 
 // ─── Validation ─────────────────────────────────────────────────────────────
 
-/// Validate extracted entities against the Neo4j knowledge graph.
+/// Validate extracted entities against the IndentiaGraph knowledge graph.
 ///
 /// For each entity:
 /// - **File**: checks if the path exists as a `File` node
@@ -582,7 +582,7 @@ pub async fn validate_entities<G: GraphStore>(
     validated
 }
 
-/// Resolve the Neo4j node type from a symbol reference type string.
+/// Resolve the IndentiaGraph node type from a symbol reference type string.
 fn resolve_node_type(ref_type: &str, identifier: &str) -> (EntityType, String) {
     match ref_type {
         "call" | "function" => (EntityType::Function, "Function".to_string()),
@@ -627,11 +627,12 @@ mod tests {
 
     #[test]
     fn test_extract_file_path_nested() {
-        let text = "Le bug est dans src/neo4j/client.rs ligne 42";
+        let text = "Le bug est dans src/indentiagraph/client.rs ligne 42";
         let entities = extract_entities(text);
         assert!(
-            entities.iter().any(|e| e.entity_type == EntityType::File && e.identifier == "src/neo4j/client.rs"),
-            "Should extract src/neo4j/client.rs, got: {:?}",
+            entities.iter().any(|e| e.entity_type == EntityType::File
+                && e.identifier == "src/indentiagraph/client.rs"),
+            "Should extract src/indentiagraph/client.rs, got: {:?}",
             entities
         );
     }
@@ -844,7 +845,7 @@ mod tests {
 
     #[test]
     fn test_realistic_message_3() {
-        let text = "Il faut ajouter un champ `energy` a struct NoteNode dans src/neo4j/models.rs et mettre a jour impl GraphStore dans src/neo4j/impl_graph_store.rs";
+        let text = "Il faut ajouter un champ `energy` a struct NoteNode dans src/indentiagraph/models.rs et mettre a jour impl GraphStore dans src/indentiagraph/impl_graph_store.rs";
         let entities = extract_entities(text);
         assert!(entities.iter().any(|e| e.identifier == "energy"));
         assert!(entities
@@ -852,10 +853,10 @@ mod tests {
             .any(|e| e.identifier == "NoteNode" || e.identifier == "GraphStore"));
         assert!(entities
             .iter()
-            .any(|e| e.identifier == "src/neo4j/models.rs"));
+            .any(|e| e.identifier == "src/indentiagraph/models.rs"));
         assert!(entities
             .iter()
-            .any(|e| e.identifier == "src/neo4j/impl_graph_store.rs"));
+            .any(|e| e.identifier == "src/indentiagraph/impl_graph_store.rs"));
     }
 
     #[test]
@@ -920,7 +921,7 @@ mod tests {
     fn test_is_file_path() {
         assert!(is_file_path("src/main.rs"));
         assert!(is_file_path("Cargo.toml"));
-        assert!(is_file_path("src/neo4j/client.rs"));
+        assert!(is_file_path("src/indentiagraph/client.rs"));
         assert!(is_file_path("./src/main.rs"));
         assert!(is_file_path("tests/integration.rs"));
         assert!(!is_file_path("hello"));
@@ -933,7 +934,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_filters_unknown_entities() {
-        use crate::neo4j::mock::MockGraphStore;
+        use crate::indentiagraph::mock::MockGraphStore;
         let mock = MockGraphStore::new();
 
         let entities = vec![

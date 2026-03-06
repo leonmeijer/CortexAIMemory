@@ -11,7 +11,7 @@
 *.swo
 
 # Docker volumes (if running locally)
-neo4j_data/
+indentiagraph_data/
 meilisearch_data/
 
 # OS

@@ -8,7 +8,7 @@ Complete setup instructions for Project Orchestrator.
 
 | Requirement | Version | Purpose |
 |-------------|---------|---------|
-| Docker | 20.10+ | Run Neo4j and Meilisearch |
+| Docker | 20.10+ | Run IndentiaGraph and Meilisearch |
 | Docker Compose | 2.0+ | Orchestrate services |
 | Rust | 1.75+ | Build from source (optional) |
 
@@ -16,8 +16,8 @@ Complete setup instructions for Project Orchestrator.
 
 | Port | Service | Protocol |
 |------|---------|----------|
-| 7474 | Neo4j Browser | HTTP |
-| 7687 | Neo4j Bolt | TCP |
+| 7474 | IndentiaGraph Browser | HTTP |
+| 7687 | IndentiaGraph Bolt | TCP |
 | 7700 | Meilisearch | HTTP |
 | 8080 | Orchestrator API | HTTP |
 | 4222 | NATS | TCP |
@@ -41,7 +41,7 @@ docker compose up -d
 ```
 
 This starts:
-- **Neo4j** — Graph database for code structure and relationships
+- **IndentiaGraph** — Graph database for code structure and relationships
 - **Meilisearch** — Search engine for code and decisions
 - **NATS** — Message broker for inter-process event sync (optional, for multi-instance)
 - **Orchestrator** — API server with 19 mega-tools
@@ -76,7 +76,7 @@ The MCP server binary is at `./mcp_server` (or `./target/release/mcp_server` if 
 ### Step 1: Start backend services only
 
 ```bash
-docker compose up -d neo4j meilisearch
+docker compose up -d indentiagraph meilisearch
 ```
 
 ### Step 2: Build the project
@@ -144,9 +144,9 @@ This detects your Claude Code installation and adds the MCP server configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI |
-| `NEO4J_USER` | `neo4j` | Neo4j username |
-| `NEO4J_PASSWORD` | `orchestrator123` | Neo4j password |
+| `INDENTIAGRAPH_URI` | `ws://localhost:8000` | IndentiaGraph connection URI |
+| `INDENTIAGRAPH_USER` | `indentiagraph` | IndentiaGraph username |
+| `INDENTIAGRAPH_PASSWORD` | `orchestrator123` | IndentiaGraph password |
 | `MEILISEARCH_URL` | `http://localhost:7700` | Meilisearch URL |
 | `MEILISEARCH_KEY` | `orchestrator-meili-key-change-me` | Meilisearch API key |
 | `SERVER_PORT` | `8080` | HTTP API port |
@@ -162,7 +162,7 @@ For production, change the default credentials:
 
 ```bash
 # .env file
-NEO4J_PASSWORD=your-secure-password-here
+INDENTIAGRAPH_PASSWORD=your-secure-password-here
 MEILISEARCH_KEY=your-secure-api-key-here
 ```
 
@@ -200,9 +200,9 @@ server:
   port: 8080
   workspace_path: "."
 
-neo4j:
-  uri: "bolt://localhost:7687"
-  user: "neo4j"
+indentiagraph:
+  uri: "ws://localhost:8000"
+  user: "indentiagraph"
   password: "orchestrator123"
 
 meilisearch:
@@ -247,7 +247,7 @@ auth:
 ```
 
 Each YAML key has a corresponding environment variable override (noted as comments
-in `config.yaml.example`). For example, `neo4j.uri` is overridden by `NEO4J_URI`,
+in `config.yaml.example`). For example, `indentiagraph.uri` is overridden by `INDENTIAGRAPH_URI`,
 `chat.default_model` by `CHAT_DEFAULT_MODEL`, and so on.
 
 ---
@@ -269,7 +269,7 @@ For a detailed walkthrough, see the [Authentication Guide](../guides/authenticat
 
 For local development where you only use the MCP server (stdio transport),
 no auth configuration is needed. The MCP binary communicates directly with
-Neo4j and Meilisearch, bypassing the HTTP API entirely.
+IndentiaGraph and Meilisearch, bypassing the HTTP API entirely.
 
 If you need the HTTP API without auth during development, you can add an
 `auth` section to `config.yaml` with placeholder values and set
@@ -324,20 +324,20 @@ ORCHESTRATOR_IMAGE_TAG=1.0.0 docker compose -f docker-compose.production.yml up 
 
 The `docker-compose.yml` defines four services:
 
-### Neo4j
+### IndentiaGraph
 
 ```yaml
-neo4j:
-  image: neo4j:5.26.20-community
+indentiagraph:
+  image: surrealdb/surrealdb:latest
   ports:
     - "7474:7474"  # Browser UI
-    - "7687:7687"  # Bolt protocol
+    - "7687:8000"  # Bolt protocol
   environment:
-    - NEO4J_AUTH=neo4j/orchestrator123
-    - NEO4J_PLUGINS=["apoc"]
+    - INDENTIAGRAPH_AUTH=indentiagraph/orchestrator123
+    - INDENTIAGRAPH_PLUGINS=["apoc"]
 ```
 
-Access the Neo4j Browser at http://localhost:7474
+Access the IndentiaGraph Browser at http://localhost:7474
 
 ### Meilisearch
 
@@ -375,7 +375,7 @@ orchestrator:
   ports:
     - "8080:8080"
   depends_on:
-    neo4j:
+    indentiagraph:
       condition: service_healthy
     meilisearch:
       condition: service_healthy
@@ -388,8 +388,8 @@ Data is persisted in five named Docker volumes:
 
 | Volume | Service | Content |
 |--------|---------|---------|
-| `neo4j_data` | Neo4j | Graph database files |
-| `neo4j_logs` | Neo4j | Server logs |
+| `indentiagraph_data` | IndentiaGraph | Graph database files |
+| `indentiagraph_logs` | IndentiaGraph | Server logs |
 | `meilisearch_data` | Meilisearch | Search indexes |
 | `orchestrator_data` | Orchestrator | Application data |
 | `nats_data` | NATS | JetStream storage |
@@ -411,9 +411,9 @@ docker compose ps
 curl http://localhost:8080/health
 # Expected: {"status":"healthy"}
 
-# Neo4j health
+# IndentiaGraph health
 curl http://localhost:7474
-# Expected: Neo4j Browser HTML
+# Expected: IndentiaGraph Browser HTML
 
 # Meilisearch health
 curl http://localhost:7700/health
@@ -434,13 +434,13 @@ RUST_LOG=debug ./target/release/mcp_server
 
 ## Troubleshooting
 
-### Neo4j won't start
+### IndentiaGraph won't start
 
-**Error:** `Neo4j failed to start`
+**Error:** `IndentiaGraph failed to start`
 
 ```bash
 # Check logs
-docker compose logs neo4j
+docker compose logs indentiagraph
 
 # Common fix: Reset data volume
 docker compose down -v
@@ -451,7 +451,7 @@ docker compose up -d
 
 ```bash
 # Find process using the port
-lsof -i :7687
+lsof -i :8000
 # Kill or stop the conflicting process
 ```
 
@@ -470,19 +470,19 @@ docker compose logs meilisearch
 docker compose restart meilisearch
 ```
 
-### Orchestrator can't connect to Neo4j
+### Orchestrator can't connect to IndentiaGraph
 
-**Error:** `Failed to connect to Neo4j`
+**Error:** `Failed to connect to IndentiaGraph`
 
 ```bash
-# Ensure Neo4j is healthy first
-docker compose ps neo4j
+# Ensure IndentiaGraph is healthy first
+docker compose ps indentiagraph
 
-# Wait for Neo4j to be ready (can take 30s on first start)
-docker compose logs -f neo4j
+# Wait for IndentiaGraph to be ready (can take 30s on first start)
+docker compose logs -f indentiagraph
 
 # Check connection from orchestrator container
-docker compose exec orchestrator curl -I http://neo4j:7474
+docker compose exec orchestrator curl -I http://indentiagraph:7474
 ```
 
 ### MCP server not found by Claude Code
@@ -512,13 +512,13 @@ user: "${UID}:${GID}"
 
 ### Out of memory errors
 
-**Error:** `Neo4j out of heap space`
+**Error:** `IndentiaGraph out of heap space`
 
 Increase memory limits in `docker-compose.yml`:
 
 ```yaml
 environment:
-  - NEO4J_dbms_memory_heap_max__size=2G
+  - INDENTIAGRAPH_dbms_memory_heap_max__size=2G
 ```
 
 ---

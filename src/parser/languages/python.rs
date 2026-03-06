@@ -7,7 +7,7 @@
 //! - Type hints
 //! - Docstrings (triple-quoted)
 
-use crate::neo4j::models::*;
+use crate::indentiagraph::models::*;
 use crate::parser::helpers::*;
 use crate::parser::ParsedFile;
 use anyhow::Result;

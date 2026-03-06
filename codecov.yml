@@ -25,28 +25,28 @@ ignore:
   - "src/api/ws_chat_handler.rs"
   - "src/api/chat_handlers.rs"
   - "src/chat/**"
-  # Neo4j client — all methods require a running Neo4j instance.
+  # IndentiaGraph client — all methods require a running IndentiaGraph instance.
   # Tested by integration tests (ci.yml: integration-tests, api-tests jobs).
   # Unit tests use MockGraphStore (mock.rs) which is fully covered.
-  # Note: client.rs was decomposed into domain files — all need live Neo4j.
-  - "src/neo4j/client.rs"
-  - "src/neo4j/impl_graph_store.rs"
-  - "src/neo4j/analytics.rs"
-  - "src/neo4j/chat.rs"
-  - "src/neo4j/code.rs"
-  - "src/neo4j/commit.rs"
-  - "src/neo4j/constraint.rs"
-  - "src/neo4j/decision.rs"
-  - "src/neo4j/feature_graph.rs"
-  - "src/neo4j/milestone.rs"
-  - "src/neo4j/note.rs"
-  - "src/neo4j/plan.rs"
-  - "src/neo4j/project.rs"
-  - "src/neo4j/release.rs"
-  - "src/neo4j/step.rs"
-  - "src/neo4j/task.rs"
-  - "src/neo4j/user.rs"
-  - "src/neo4j/workspace.rs"
+  # Note: client.rs was decomposed into domain files — all need live IndentiaGraph.
+  - "src/indentiagraph/client.rs"
+  - "src/indentiagraph/impl_graph_store.rs"
+  - "src/indentiagraph/analytics.rs"
+  - "src/indentiagraph/chat.rs"
+  - "src/indentiagraph/code.rs"
+  - "src/indentiagraph/commit.rs"
+  - "src/indentiagraph/constraint.rs"
+  - "src/indentiagraph/decision.rs"
+  - "src/indentiagraph/feature_graph.rs"
+  - "src/indentiagraph/milestone.rs"
+  - "src/indentiagraph/note.rs"
+  - "src/indentiagraph/plan.rs"
+  - "src/indentiagraph/project.rs"
+  - "src/indentiagraph/release.rs"
+  - "src/indentiagraph/step.rs"
+  - "src/indentiagraph/task.rs"
+  - "src/indentiagraph/user.rs"
+  - "src/indentiagraph/workspace.rs"
   # Server bootstrap — start_server / start_setup_server bind Axum servers,
   # read env vars, and configure middleware. Pure infrastructure, not unit-testable.
   # Covered by integration/API tests (ci.yml jobs).

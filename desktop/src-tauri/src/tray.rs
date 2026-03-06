@@ -11,7 +11,7 @@ pub fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let title_item = MenuItemBuilder::with_id("title", "Project Orchestrator")
         .enabled(false)
         .build(app)?;
-    let neo4j_item = MenuItemBuilder::with_id("neo4j-status", "Neo4j: ... Checking")
+    let indentiagraph_item = MenuItemBuilder::with_id("indentiagraph-status", "IndentiaGraph: ... Checking")
         .enabled(false)
         .build(app)?;
     let meili_item = MenuItemBuilder::with_id("meili-status", "MeiliSearch: ... Checking")
@@ -28,7 +28,7 @@ pub fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     let menu = MenuBuilder::new(app)
         .item(&title_item)
         .separator()
-        .item(&neo4j_item)
+        .item(&indentiagraph_item)
         .item(&meili_item)
         .item(&api_item)
         .separator()
@@ -60,7 +60,7 @@ pub fn create_tray(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
         .build(app)?;
 
     // Start background status polling with the menu item references
-    start_status_polling(app.clone(), neo4j_item, meili_item, api_item);
+    start_status_polling(app.clone(), indentiagraph_item, meili_item, api_item);
 
     Ok(())
 }
@@ -126,7 +126,7 @@ pub fn show_main_window(app: &AppHandle) {
 /// Start a background task that polls service health and updates tray menu items.
 fn start_status_polling(
     app: AppHandle,
-    neo4j_item: tauri::menu::MenuItem<tauri::Wry>,
+    indentiagraph_item: tauri::menu::MenuItem<tauri::Wry>,
     meili_item: tauri::menu::MenuItem<tauri::Wry>,
     api_item: tauri::menu::MenuItem<tauri::Wry>,
 ) {
@@ -137,16 +137,16 @@ fn start_status_polling(
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
 
                 // Check Docker services
-                let (neo4j_text, meili_text) =
+                let (indentiagraph_text, meili_text) =
                     if let Some(dm) = app.try_state::<SharedDockerManager>() {
                         let mgr = dm.read().await;
                         let health = mgr.check_health(true).await;
                         (
-                            format_status("Neo4j", &health.neo4j),
+                            format_status("IndentiaGraph", &health.indentiagraph),
                             format_status("MeiliSearch", &health.meilisearch),
                         )
                     } else {
-                        ("Neo4j: ? Unknown".into(), "MeiliSearch: ? Unknown".into())
+                        ("IndentiaGraph: ? Unknown".into(), "MeiliSearch: ? Unknown".into())
                     };
 
                 // Check API server
@@ -158,7 +158,7 @@ fn start_status_polling(
                 };
 
                 // Update menu item texts
-                neo4j_item.set_text(&neo4j_text).ok();
+                indentiagraph_item.set_text(&indentiagraph_text).ok();
                 meili_item.set_text(&meili_text).ok();
                 api_item.set_text(&api_text).ok();
             }

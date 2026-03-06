@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working on the project-orchestrator skill.
+This file provides guidance to Claude Code when working on CortexAIMemory.
 
 ## Documentation
 
@@ -22,10 +22,10 @@ For user-facing documentation, see the `docs/` folder:
 
 ## Project Overview
 
-**Project Orchestrator** is a Rust-based service that coordinates AI coding agents on complex projects. It provides:
+**CortexAIMemory** is a Rust-based service that coordinates AI coding agents on complex projects. It provides:
 
-- Neo4j graph database for code structure and relationships
-- Meilisearch for semantic search across code and decisions
+- IndentiaGraph graph database for code structure and relationships
+- SurrealDB (via IndentiaGraph crate) with native BM25 full-text search for code, notes, and decisions
 - Tree-sitter for multi-language code parsing
 - HTTP API for plans, tasks, decisions, and code exploration
 - MCP server for Claude Code integration (20 mega-tools)
@@ -34,6 +34,7 @@ For user-facing documentation, see the `docs/` folder:
 - Chat WebSocket for real-time conversational AI (migrated from SSE)
 - Event system: live CRUD notifications via WebSocket
 - YAML configuration system with env var overrides (priority: env > yaml > default)
+- Graphiti-inspired episodic memory: timestamped episode ingestion, bi-temporal notes, temporal queries
 
 ## Build Commands
 
@@ -47,27 +48,24 @@ cargo fmt                      # Format
 ## Running the Server
 
 ```bash
-# Start backends first
-docker compose up -d neo4j meilisearch
-
-# Run server
-./target/release/orchestrator serve --port 8080
+# Run server (default: embedded persistent SurrealKV, no Docker required)
+./target/release/cortex serve --port 8080
 
 # Or with debug logging
-RUST_LOG=debug ./target/release/orchestrator serve
+RUST_LOG=debug ./target/release/cortex serve
 ```
 
 ## MCP Server (Claude Code Integration)
 
-The project-orchestrator can run as an MCP (Model Context Protocol) server, exposing all orchestrator functionality as tools for Claude Code.
+The Cortex server can run as an MCP (Model Context Protocol) server, exposing orchestration functionality as tools for Claude Code.
 
 ### Building the MCP Server
 
 ```bash
-cargo build --release --bin mcp_server
+cargo build --release --bin cortex-mcp
 ```
 
-The binary will be at `./target/release/mcp_server`.
+The binary will be at `./target/release/cortex-mcp`.
 
 ### Configuring Claude Code
 
@@ -76,34 +74,11 @@ Add to your Claude Code MCP settings (`~/.claude/mcp.json`):
 ```json
 {
   "mcpServers": {
-    "project-orchestrator": {
-      "command": "/path/to/mcp_server",
+    "cortex": {
+      "command": "/path/to/cortex-mcp",
       "env": {
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "your-password",
-        "MEILISEARCH_URL": "http://localhost:7700",
-        "MEILISEARCH_KEY": "your-meilisearch-key"
+        "PO_SERVER_URL": "http://127.0.0.1:8080"
       }
-    }
-  }
-}
-```
-
-Or use command-line arguments:
-
-```json
-{
-  "mcpServers": {
-    "project-orchestrator": {
-      "command": "/path/to/mcp_server",
-      "args": [
-        "--neo4j-uri", "bolt://localhost:7687",
-        "--neo4j-user", "neo4j",
-        "--neo4j-password", "your-password",
-        "--meilisearch-url", "http://localhost:7700",
-        "--meilisearch-key", "your-key"
-      ]
     }
   }
 }
@@ -124,7 +99,7 @@ The MCP server exposes **20 mega-tools**, each with an `action` parameter to sel
 | `release` | 8 | Release management with tasks and commits |
 | `milestone` | 9 | Milestones with progress and plan linking |
 | `commit` | 7 | Git commit tracking, file history |
-| `note` | 20 | Knowledge notes, semantic search, propagation |
+| `note` | 24 | Knowledge notes, semantic search, propagation, episodic memory (`add_episode`, `get_episodes`, `search_episodes`, `search_at_time`, `invalidate_temporal`) |
 | `workspace` | 10 | Multi-project workspaces, topology |
 | `workspace_milestone` | 10 | Cross-project milestones |
 | `resource` | 6 | Shared API contracts, schemas |
@@ -143,11 +118,11 @@ Enable debug logging with `RUST_LOG=debug`:
 ```json
 {
   "mcpServers": {
-    "project-orchestrator": {
-      "command": "/path/to/mcp_server",
+    "cortex": {
+      "command": "/path/to/cortex-mcp",
       "env": {
         "RUST_LOG": "debug",
-        "NEO4J_URI": "bolt://localhost:7687",
+        "PO_SERVER_URL": "http://127.0.0.1:8080",
         ...
       }
     }
@@ -180,8 +155,6 @@ docs/
 src/
 ├── auth/
 │   └── ...              # Authentication: JWT (HS256), Google OAuth2, middleware, extractors
-├── config/
-│   └── ...              # YAML configuration system with env var overrides
 ├── events/
 │   └── ...              # EventBus broadcast, EventEmitter trait, NATS emitter, HybridEmitter, WebSocket notifications
 ├── api/
@@ -208,18 +181,11 @@ src/
 │   ├── tools.rs         # Mega-tool definitions (20 tools)
 │   ├── handlers.rs      # Tool implementations
 │   └── server.rs        # MCP server (stdio)
-├── neo4j/
-│   ├── client.rs        # Neo4j connection and queries
-│   ├── models.rs        # Graph node types
-│   ├── traits.rs        # GraphStore trait (178 methods)
-│   ├── impl_graph_store.rs # Neo4j implementation
-│   └── mock.rs          # MockGraphStore for testing (#[cfg(test)])
-├── meilisearch/
-│   ├── client.rs        # Meilisearch connection
-│   ├── models.rs        # Search document types
-│   ├── traits.rs        # SearchStore trait (24 methods)
-│   ├── impl_search_store.rs # Meilisearch implementation
-│   └── mock.rs          # MockSearchStore for testing (#[cfg(test)])
+├── indentiagraph/
+│   ├── mod.rs           # Compatibility namespace (re-exports)
+│   ├── models.rs        # Model re-exports
+│   ├── traits.rs        # GraphStore re-export
+│   └── mock.rs          # MockGraphStore re-export for tests
 ├── notes/
 │   ├── mod.rs           # Notes module exports
 │   ├── models.rs        # Note types (NoteType, NoteStatus, etc.)
@@ -238,12 +204,18 @@ src/
 │   ├── context.rs       # Agent context builder (includes notes)
 │   └── watcher.rs       # File watcher for auto-sync
 ├── bin/
-│   └── mcp_server.rs    # MCP server binary
+│   └── mcp_server.rs    # MCP proxy binary (built as `cortex-mcp`)
 ├── test_helpers.rs      # mock_app_state(), test_project(), test_plan()...
 ├── lib.rs               # Library exports
 ├── setup_claude.rs      # Auto-configure Claude Code MCP (setup-claude command)
 ├── update.rs            # Self-update via GitHub Releases (update command)
 └── main.rs              # CLI entry point
+
+crates/
+├── cortex-core/         # Shared domain models and graph types
+├── cortex-graph/        # GraphStore trait + in-memory mock implementation
+├── cortex-indentiagraph/ # SurrealDB-backed GraphStore implementation
+└── cortex-mem/          # Memory worker daemon + Claude hook binaries
 
 tests/
 ├── api_tests.rs         # HTTP API tests (29)
@@ -499,7 +471,7 @@ event: error             → {"message": "..."}
 
 ### Authentication
 - `GET /auth/providers` — List available auth providers (password, google, oidc)
-- `POST /auth/login` — Password login (root account or Neo4j users)
+- `POST /auth/login` — Password login (root account or IndentiaGraph users)
 - `POST /auth/register` — Register a new user account
 - `GET /auth/google` — Get Google OAuth authorization URL
 - `POST /auth/google/callback` — Exchange auth code for JWT token
@@ -520,9 +492,12 @@ event: error             → {"message": "..."}
 - `POST /api/watch` - Start auto-sync
 - `DELETE /api/watch` - Stop auto-sync
 
-### Meilisearch Maintenance
-- `GET /api/meilisearch/stats` - Get code index statistics
-- `DELETE /api/meilisearch/orphans` - Delete documents without project_id
+### Episodic Memory
+- `POST /api/episodes` - Ingest a new episode
+- `GET /api/episodes` - List episodes (filter by project_id, group_id, limit)
+- `GET /api/episodes/search` - BM25 search over episode content
+- `GET /api/notes/at-time` - Temporal note search ("what was true at time X?")
+- `POST /api/notes/{id}/invalidate-temporal` - Mark note invalid at a specific time
 
 ## Development Guidelines
 
@@ -555,7 +530,51 @@ event: error             → {"message": "..."}
 cargo test                     # 1992 tests passing
 ```
 
-## Neo4j Graph Relationships
+## Episodic Memory (Graphiti-inspired)
+
+CortexAIMemory supports Graphiti-inspired temporal episodic memory — raw text ingestion with timestamps, bi-temporal notes, and historical queries.
+
+### Episode API
+
+```bash
+# Ingest an episode (conversation, code event, document, system event)
+POST /api/episodes
+{
+  "name": "Sprint planning 2024-01-15",
+  "content": "Team decided to migrate auth from JWT to PASETO...",
+  "source": "conversation",            # conversation | code | document | event
+  "reference_time": "2024-01-15T09:00:00Z",  # optional, defaults to now
+  "project_id": "uuid"                 # optional project scope
+}
+
+# List recent episodes
+GET /api/episodes?project_id=uuid&limit=20
+
+# Search episodes by content (BM25)
+GET /api/episodes/search?query=auth+migration&project_id=uuid&limit=10
+
+# Search notes active at a specific point in time
+GET /api/notes/at-time?query=auth&at_time=2024-01-15T09:00:00Z&project_id=uuid
+
+# Mark a note as invalid at a point in time (non-destructive)
+POST /api/notes/{id}/invalidate-temporal
+{ "at_time": "2024-01-16T00:00:00Z" }  # optional, defaults to now
+```
+
+### Bi-temporal Notes
+
+Notes have `valid_at` (when the fact became true) and `invalid_at` (when it stopped being true). Notes with `invalid_at = NULL` are currently valid.
+
+### MCP Tools
+
+The `note` mega-tool supports 5 new actions:
+- `add_episode` — ingest raw text as a timestamped episode
+- `get_episodes` — list recent episodes (filter by project_id, group_id)
+- `search_episodes` — BM25 search over episode content
+- `search_at_time` — "what did we know on date X?" temporal note query
+- `invalidate_temporal` — mark a note invalid at a specific point in time
+
+## IndentiaGraph Graph Relationships
 
 The knowledge graph uses these relationships:
 
@@ -636,26 +655,6 @@ Note nodes have:
 - Skills are emergent knowledge clusters with energy, cohesion, and trigger patterns
 - Spreading activation reinforces SYNAPSE weights between co-activated notes
 
-## Meilisearch Indexing
-
-### Code Index (`code`)
-- `symbols` - Function/struct/trait names (highest search priority)
-- `docstrings` - Documentation strings for semantic search
-- `signatures` - Function signatures
-- `path` - File path
-- `imports` - Import paths
-- `project_id`, `project_slug` - Required for project scoping
-
-Note: Full file content is NOT stored in Meilisearch. Use Neo4j for structural queries.
-
-### Notes Index (`notes`)
-- `content` - Note text (highest search priority)
-- `tags` - Categorization tags
-- `scope_path` - Entity scope path
-- `anchor_entities` - Linked entities
-- `note_type`, `status`, `importance` - Filterable attributes
-- `staleness_score`, `created_at` - Sortable attributes
-
 ## Common Tasks
 
 ### Adding a new API endpoint
@@ -674,8 +673,9 @@ Note: Full file content is NOT stored in Meilisearch. Use Neo4j for structural q
 6. Add dispatch in `parse_file()` match
 7. Add tests in `tests/parser_tests.rs`
 
-### Modifying Neo4j schema
+### Modifying IndentiaGraph schema
 
-1. Update models in `src/neo4j/models.rs`
-2. Update queries in `src/neo4j/client.rs`
-3. Add migration if needed (manual Cypher)
+1. Update shared models in `crates/cortex-core/src/`
+2. Update trait contracts in `crates/cortex-graph/src/traits.rs` (if API changes)
+3. Update SurrealDB queries/schema in `crates/cortex-indentiagraph/src/`
+4. Add schema/data migration notes if needed (SurrealQL-based, no Cypher)

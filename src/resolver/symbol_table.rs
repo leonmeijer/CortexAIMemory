@@ -225,7 +225,7 @@ impl Default for SymbolTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::neo4j::models::*;
+    use crate::indentiagraph::models::*;
     use crate::parser::ParsedFile;
 
     fn make_parsed_file(

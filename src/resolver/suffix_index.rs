@@ -192,7 +192,7 @@ mod tests {
         vec![
             "src/api/handlers.rs".to_string(),
             "src/api/routes.rs".to_string(),
-            "src/neo4j/client.rs".to_string(),
+            "src/indentiagraph/client.rs".to_string(),
             "src/parser/mod.rs".to_string(),
             "src/parser/languages/rust.rs".to_string(),
             "src/parser/languages/python.rs".to_string(),
@@ -214,7 +214,7 @@ mod tests {
         assert_eq!(index.get("api/handlers.rs"), Some("src/api/handlers.rs"));
         // Just filename (unique)
         assert_eq!(index.get("handlers.rs"), Some("src/api/handlers.rs"));
-        assert_eq!(index.get("client.rs"), Some("src/neo4j/client.rs"));
+        assert_eq!(index.get("client.rs"), Some("src/indentiagraph/client.rs"));
         assert_eq!(index.get("Cargo.toml"), Some("Cargo.toml"));
     }
 
