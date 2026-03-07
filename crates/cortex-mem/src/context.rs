@@ -20,6 +20,7 @@ pub async fn generate_context(
     project_slug: Option<&str>,
     max_observations: usize,
     show_last_summary: bool,
+    max_tokens: usize,
 ) -> Result<String> {
     let mut sections = Vec::new();
 
@@ -128,7 +129,55 @@ pub async fn generate_context(
     }
 
     let mut output = String::from("# Memory Context (cortex-mem)\n\n");
-    output.push_str(&sections.join("\n"));
+
+    // Token budgeting: prioritize knowledge > summary > observations
+    // Rough estimate: 4 chars ≈ 1 token
+    let max_chars = max_tokens * 4;
+    let header_len = output.len();
+
+    // Sections are in order: observations, summary, knowledge
+    // Reverse priority: add knowledge first, then summary, then fill with observations
+    let mut budget_sections = Vec::new();
+    let mut used = header_len;
+
+    // Knowledge notes (highest priority) — last section if present
+    if sections.len() >= 2 {
+        for section in sections.iter().rev() {
+            if section.starts_with("## Knowledge") || section.starts_with("## Last Session") {
+                if used + section.len() <= max_chars {
+                    budget_sections.push(section.clone());
+                    used += section.len();
+                }
+            }
+        }
+    }
+
+    // Observations (fill remaining budget)
+    for section in &sections {
+        if section.starts_with("## Recent") && used + section.len() <= max_chars {
+            budget_sections.push(section.clone());
+        } else if section.starts_with("## Recent") && used < max_chars {
+            // Truncate observations to fit
+            let remaining = max_chars - used;
+            let truncated: String = section.chars().take(remaining).collect();
+            if let Some(last_newline) = truncated.rfind('\n') {
+                budget_sections.push(truncated[..last_newline].to_string());
+            }
+        }
+    }
+
+    // Sort back to logical order: observations, summary, knowledge
+    budget_sections.sort_by_key(|s| {
+        if s.starts_with("## Recent") {
+            0
+        } else if s.starts_with("## Last") {
+            1
+        } else {
+            2
+        }
+    });
+
+    output.push_str(&budget_sections.join("\n"));
     Ok(output)
 }
 

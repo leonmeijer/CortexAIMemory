@@ -39,6 +39,17 @@ pub struct MemConfig {
     pub data_dir: PathBuf,
     /// Log level
     pub log_level: String,
+
+    /// LLM base URL for summarization (OpenAI-compatible, e.g. "http://localhost:11434/v1")
+    /// Empty string = disabled (rule-based fallback only)
+    pub llm_base_url: String,
+    /// LLM model name (e.g. "llama3.2", "claude-haiku-4-5-20251001")
+    pub llm_model: String,
+    /// LLM API key (optional, not needed for Ollama)
+    pub llm_api_key: String,
+
+    /// Max tokens for context injection (approximate: 4 chars = 1 token)
+    pub context_max_tokens: usize,
 }
 
 impl Default for MemConfig {
@@ -60,12 +71,30 @@ impl Default for MemConfig {
                 "Skill".into(),
                 "TodoWrite".into(),
                 "AskUserQuestion".into(),
+                "ToolSearch".into(),
+                "TaskCreate".into(),
+                "TaskUpdate".into(),
+                "TaskGet".into(),
+                "TaskList".into(),
+                "TaskOutput".into(),
+                "TaskStop".into(),
+                "ExitPlanMode".into(),
+                "EnterPlanMode".into(),
+                "EnterWorktree".into(),
+                "CronCreate".into(),
+                "CronDelete".into(),
+                "CronList".into(),
+                "LSP".into(),
             ],
             excluded_projects: vec![],
             data_dir: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join(".claude-mem"),
             log_level: "INFO".into(),
+            llm_base_url: String::new(),
+            llm_model: String::new(),
+            llm_api_key: String::new(),
+            context_max_tokens: 4000,
         }
     }
 }
@@ -136,6 +165,20 @@ impl MemConfig {
         }
         if let Ok(pass) = std::env::var("SURREALDB_PASSWORD") {
             config.surrealdb_password = pass;
+        }
+        if let Ok(url) = std::env::var("CORTEX_MEM_LLM_BASE_URL") {
+            config.llm_base_url = url;
+        }
+        if let Ok(model) = std::env::var("CORTEX_MEM_LLM_MODEL") {
+            config.llm_model = model;
+        }
+        if let Ok(key) = std::env::var("CORTEX_MEM_LLM_API_KEY") {
+            config.llm_api_key = key;
+        }
+        if let Ok(tokens) = std::env::var("CORTEX_MEM_CONTEXT_MAX_TOKENS") {
+            if let Ok(n) = tokens.parse() {
+                config.context_max_tokens = n;
+            }
         }
 
         config

@@ -37,11 +37,17 @@ async fn fetch_context(worker_url: &str, cwd: &str) -> Result<String, Box<dyn st
         .timeout(std::time::Duration::from_secs(5))
         .build()?;
 
-    // Extract project name from cwd
-    let project = std::path::Path::new(cwd)
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("");
+    // First try to resolve project slug via worker (matches cwd to project root_path)
+    // Fall back to directory name if resolution fails
+    let project = match resolve_project_via_worker(&client, worker_url, cwd).await {
+        Some(slug) => slug,
+        None => std::path::Path::new(cwd)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("")
+            .to_string(),
+    };
+    let project = project.as_str();
 
     let resp = client
         .get(format!("{}/api/context/inject", worker_url))
@@ -59,4 +65,27 @@ async fn fetch_context(worker_url: &str, cwd: &str) -> Result<String, Box<dyn st
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string())
+}
+
+/// Ask the worker to resolve cwd to a project slug via session init endpoint.
+async fn resolve_project_via_worker(
+    client: &reqwest::Client,
+    worker_url: &str,
+    cwd: &str,
+) -> Option<String> {
+    let resp = client
+        .post(format!("{}/api/sessions/resolve-project", worker_url))
+        .json(&serde_json::json!({ "cwd": cwd }))
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    body.get("projectSlug")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }

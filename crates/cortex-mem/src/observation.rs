@@ -55,6 +55,19 @@ pub async fn process_observation(
 
     // Check for duplicates via content hash
     let content_hash = compute_hash(&content);
+    let hash_tag = format!("hash:{}", &content_hash[..16]);
+
+    // Query for existing note with same hash tag
+    let dedup_filters = cortex_core::notes::NoteFilters {
+        tags: Some(vec![hash_tag.clone()]),
+        limit: Some(1),
+        ..Default::default()
+    };
+    if let Ok((existing, _)) = store.list_notes(project_id, None, &dedup_filters).await {
+        if !existing.is_empty() {
+            return Ok(None); // Duplicate — skip
+        }
+    }
 
     // Classify the observation type
     let obs_type = classify_observation(&obs.tool_name, &obs.tool_input, &obs.tool_response);
@@ -65,14 +78,17 @@ pub async fn process_observation(
     // Extract source files
     let source_files = extract_source_files(&obs.tool_input, &obs.tool_response);
 
-    // Create Note
+    // Create Note with hash tag for dedup
+    let mut tags: Vec<String> = source_files.iter().map(|s| s.to_string()).collect();
+    tags.push(hash_tag);
+
     let note = Note::new_full(
         project_id,
         NoteType::Observation,
         NoteImportance::Medium,
         NoteScope::Project,
         format!("## {}\n\n{}", title, content),
-        source_files.iter().map(|s| s.to_string()).collect(),
+        tags,
         "cortex-mem".to_string(),
     );
 
@@ -118,34 +134,161 @@ pub async fn process_observation(
 }
 
 fn build_observation_content(obs: &RawObservation) -> String {
-    let input_str = if obs.tool_input.is_string() {
-        obs.tool_input.as_str().unwrap_or("").to_string()
-    } else {
-        serde_json::to_string_pretty(&obs.tool_input).unwrap_or_default()
-    };
+    match obs.tool_name.as_str() {
+        "Read" => {
+            let path = obs
+                .tool_input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let offset = obs
+                .tool_input
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|n| format!(" (from line {})", n))
+                .unwrap_or_default();
+            format!("Read `{}`{}", path, offset)
+        }
+        "Edit" => {
+            let path = obs
+                .tool_input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let old = obs
+                .tool_input
+                .get("old_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let new = obs
+                .tool_input
+                .get("new_string")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let old_lines = old.lines().count();
+            let new_lines = new.lines().count();
+            format!(
+                "Edited `{}`: replaced {} lines with {} lines",
+                path, old_lines, new_lines
+            )
+        }
+        "Write" => {
+            let path = obs
+                .tool_input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let content = obs
+                .tool_input
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("Created `{}` ({} lines)", path, content.lines().count())
+        }
+        "Bash" => {
+            let cmd = obs
+                .tool_input
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unknown command)");
+            let desc = obs
+                .tool_input
+                .get("description")
+                .and_then(|v| v.as_str());
+            // Check for error in response
+            let stderr = obs
+                .tool_response
+                .get("stderr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let exit_code = obs
+                .tool_response
+                .get("exit_code")
+                .and_then(|v| v.as_u64());
+            let mut result = if let Some(d) = desc {
+                format!("Ran: `{}` — {}", truncate_str(cmd, 80), d)
+            } else {
+                format!("Ran: `{}`", truncate_str(cmd, 120))
+            };
+            if let Some(code) = exit_code {
+                if code != 0 {
+                    result.push_str(&format!(" [exit code {}]", code));
+                }
+            }
+            if !stderr.is_empty() {
+                result.push_str(&format!(
+                    "\nStderr: {}",
+                    truncate_str(stderr, 200)
+                ));
+            }
+            result
+        }
+        "Grep" => {
+            let pattern = obs
+                .tool_input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let path = obs
+                .tool_input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            format!("Grep `{}` in `{}`", pattern, path)
+        }
+        "Glob" => {
+            let pattern = obs
+                .tool_input
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let path = obs
+                .tool_input
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            format!("Glob `{}` in `{}`", pattern, path)
+        }
+        "Agent" => {
+            let desc = obs
+                .tool_input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("subtask");
+            format!("Agent: {}", desc)
+        }
+        "NotebookEdit" => {
+            let path = obs
+                .tool_input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            format!("Edited notebook `{}`", path)
+        }
+        _ => {
+            // Generic fallback — tool name + compact input
+            let input_str = serde_json::to_string(&obs.tool_input).unwrap_or_default();
+            format!(
+                "Used {} — {}",
+                obs.tool_name,
+                truncate_str(&input_str, 150)
+            )
+        }
+    }
+}
 
-    let response_str = if obs.tool_response.is_string() {
-        obs.tool_response.as_str().unwrap_or("").to_string()
+fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
     } else {
-        serde_json::to_string_pretty(&obs.tool_response).unwrap_or_default()
-    };
-
-    // Truncate very long responses
-    let max_len = 4000;
-    let response_truncated = if response_str.len() > max_len {
-        format!(
-            "{}...\n[truncated {} chars]",
-            &response_str[..max_len],
-            response_str.len() - max_len
-        )
-    } else {
-        response_str
-    };
-
-    format!(
-        "**Tool**: {}\n**Input**: {}\n**Response**: {}",
-        obs.tool_name, input_str, response_truncated
-    )
+        let end = s
+            .char_indices()
+            .take_while(|(i, _)| *i <= max)
+            .last()
+            .map(|(i, _)| i)
+            .unwrap_or(max);
+        &s[..end]
+    }
 }
 
 fn classify_observation(
@@ -297,7 +440,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_observation_content() {
+    fn test_build_observation_content_read() {
         let obs = RawObservation {
             content_session_id: "test".to_string(),
             tool_name: "Read".to_string(),
@@ -306,8 +449,49 @@ mod tests {
             cwd: "/tmp".to_string(),
         };
         let content = build_observation_content(&obs);
-        assert!(content.contains("Read"));
-        assert!(content.contains("main.rs"));
+        assert_eq!(content, "Read `/src/main.rs`");
+    }
+
+    #[test]
+    fn test_build_observation_content_edit() {
+        let obs = RawObservation {
+            content_session_id: "test".to_string(),
+            tool_name: "Edit".to_string(),
+            tool_input: serde_json::json!({"file_path": "/src/main.rs", "old_string": "fn old() {}", "new_string": "fn new() {\n    todo!()\n}"}),
+            tool_response: serde_json::json!({"success": true}),
+            cwd: "/tmp".to_string(),
+        };
+        let content = build_observation_content(&obs);
+        assert!(content.contains("Edited `/src/main.rs`"));
+        assert!(content.contains("replaced 1 lines with 3 lines"));
+    }
+
+    #[test]
+    fn test_build_observation_content_bash() {
+        let obs = RawObservation {
+            content_session_id: "test".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({"command": "cargo test", "description": "Run tests"}),
+            tool_response: serde_json::json!({"stderr": "", "exit_code": 0}),
+            cwd: "/tmp".to_string(),
+        };
+        let content = build_observation_content(&obs);
+        assert!(content.contains("Ran: `cargo test`"));
+        assert!(content.contains("Run tests"));
+    }
+
+    #[test]
+    fn test_build_observation_content_bash_error() {
+        let obs = RawObservation {
+            content_session_id: "test".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({"command": "false"}),
+            tool_response: serde_json::json!({"stderr": "error occurred", "exit_code": 1}),
+            cwd: "/tmp".to_string(),
+        };
+        let content = build_observation_content(&obs);
+        assert!(content.contains("[exit code 1]"));
+        assert!(content.contains("Stderr: error occurred"));
     }
 
     #[test]

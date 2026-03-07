@@ -18,6 +18,7 @@ use tracing::info;
 
 use crate::config::MemConfig;
 use crate::context;
+use crate::llm::LlmClient;
 use crate::observation::{self, RawObservation};
 use crate::session;
 
@@ -49,6 +50,7 @@ pub fn create_router(state: WorkerState) -> Router {
         // Session management
         .route("/api/sessions/init", post(session_init))
         .route("/api/sessions/observations", post(session_observation))
+        .route("/api/sessions/resolve-project", post(resolve_project))
         .route("/api/sessions/summarize", post(session_summarize))
         .route("/api/sessions/complete", post(session_complete))
         // Context injection
@@ -108,6 +110,21 @@ async fn session_init(
         project_slug,
         is_new: true,
     }))
+}
+
+// --- Resolve Project ---
+
+#[derive(Deserialize)]
+struct ResolveProjectRequest {
+    cwd: String,
+}
+
+async fn resolve_project(
+    State(state): State<WorkerState>,
+    Json(req): Json<ResolveProjectRequest>,
+) -> Json<serde_json::Value> {
+    let slug = session::resolve_project_slug(&state.store, &req.cwd).await;
+    Json(serde_json::json!({ "projectSlug": slug }))
 }
 
 // --- Observation ---
@@ -183,24 +200,117 @@ async fn session_summarize(
         None
     };
 
-    // Create a summary note placeholder
+    // Collect recent observations for this session
+    let observations_text = collect_session_observations(&state, project_id).await;
+
+    if observations_text.is_empty() {
+        return Ok(Json(serde_json::json!({ "status": "no_observations" })));
+    }
+
+    // Try LLM summarization, fall back to rule-based
+    let summary = match LlmClient::new(
+        &state.config.llm_base_url,
+        &state.config.llm_model,
+        &state.config.llm_api_key,
+    ) {
+        Some(llm) => {
+            let system = "You are a concise session summarizer for a coding assistant. \
+                Summarize what happened in this Claude Code session. \
+                Structure your response with these sections:\n\
+                **Request:** What was asked\n\
+                **Investigated:** What was explored/read\n\
+                **Learned:** Key discoveries\n\
+                **Completed:** What was done/changed\n\
+                **Next steps:** What remains\n\n\
+                Be brief — max 10 lines total.";
+            match llm.chat(system, &observations_text).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!("LLM summarization failed, using rule-based: {}", e);
+                    observations_text.clone()
+                }
+            }
+        }
+        None => observations_text.clone(),
+    };
+
+    // Store summary as Context note
     if let Some(pid) = project_id {
         let note = Note::new_full(
             Some(pid),
             NoteType::Context,
-            NoteImportance::Medium,
+            NoteImportance::High,
             NoteScope::Project,
-            format!(
-                "Session summary for {} (auto-generated)",
-                req.content_session_id
-            ),
-            vec![],
+            format!("## Session Summary\n\n{}", summary),
+            vec![format!("session:{}", req.content_session_id)],
             "cortex-mem".to_string(),
         );
         let _ = state.store.create_note(&note).await;
     }
 
     Ok(Json(serde_json::json!({ "status": "summarized" })))
+}
+
+/// Collect recent observations for summarization, grouped by type.
+async fn collect_session_observations(
+    state: &WorkerState,
+    project_id: Option<uuid::Uuid>,
+) -> String {
+    let pid = match project_id {
+        Some(p) => p,
+        None => return String::new(),
+    };
+
+    let filters = NoteFilters {
+        note_type: Some(vec![NoteType::Observation]),
+        status: Some(vec![NoteStatus::Active]),
+        limit: Some(50),
+        ..Default::default()
+    };
+
+    let notes = match state.store.list_notes(Some(pid), None, &filters).await {
+        Ok((notes, _)) => notes,
+        Err(_) => return String::new(),
+    };
+
+    if notes.is_empty() {
+        return String::new();
+    }
+
+    let mut changes = Vec::new();
+    let mut discoveries = Vec::new();
+
+    for note in &notes {
+        let first_line = note
+            .content
+            .lines()
+            .find(|l| !l.starts_with('#') && !l.is_empty())
+            .unwrap_or("")
+            .to_string();
+        if first_line.starts_with("Edited")
+            || first_line.starts_with("Created")
+            || first_line.contains("git ")
+        {
+            changes.push(first_line);
+        } else {
+            discoveries.push(first_line);
+        }
+    }
+
+    let mut result = String::new();
+    if !changes.is_empty() {
+        result.push_str("Changes:\n");
+        for c in changes.iter().take(20) {
+            result.push_str(&format!("- {}\n", c));
+        }
+    }
+    if !discoveries.is_empty() {
+        result.push_str("\nDiscoveries:\n");
+        for d in discoveries.iter().take(20) {
+            result.push_str(&format!("- {}\n", d));
+        }
+    }
+    result
 }
 
 // --- Complete ---
@@ -246,6 +356,7 @@ async fn context_inject(
         project_slug,
         state.config.context_observations,
         state.config.context_show_last_summary,
+        state.config.context_max_tokens,
     )
     .await
     .map_err(|e| {
