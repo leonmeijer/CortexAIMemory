@@ -16,9 +16,15 @@
 stages:
   - test
   - build
+  - sign
   - package
   - docker
   - release
+
+include:
+  - project: 'indentia/indentia-gitops-htz'
+    ref: main
+    file: 'ci/cosign-sign.yml'
 
 # =============================================================================
 # Globale variabelen
@@ -637,3 +643,11 @@ release:gitlab:
     # Uitsluitend op tags
     - if: '$CI_COMMIT_TAG'
       when: on_success
+
+sign-image:
+  extends: .cosign_sign
+  needs: [docker:build]
+  variables:
+    SIGN_IMAGES: "${IMAGE_LATEST}:${CI_COMMIT_SHORT_SHA} ${IMAGE_LATEST}:latest"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
