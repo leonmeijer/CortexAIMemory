@@ -22,9 +22,9 @@ stages:
   - release
 
 include:
-  - project: 'indentia/indentia-gitops-htz'
-    ref: main
-    file: 'ci/cosign-sign.yml'
+  - project: 'indentia/ci-standards'
+    ref: 'v1.0.0'
+    file: '/templates/supply-chain.yml'
 
 # =============================================================================
 # Globale variabelen
@@ -645,7 +645,7 @@ release:gitlab:
       when: on_success
 
 sign-image:
-  extends: .cosign_sign
+  extends: .sign_and_attest
   needs: [docker:build]
   variables:
     SIGN_IMAGES: "${IMAGE_LATEST}:${CI_COMMIT_SHORT_SHA} ${IMAGE_LATEST}:latest"
