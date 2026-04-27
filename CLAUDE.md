@@ -679,3 +679,17 @@ Note nodes have:
 2. Update trait contracts in `crates/cortex-graph/src/traits.rs` (if API changes)
 3. Update SurrealDB queries/schema in `crates/cortex-indentiagraph/src/`
 4. Add schema/data migration notes if needed (SurrealQL-based, no Cypher)
+
+# Indentia Infrastructuur — Offline Policy
+
+Als een van de volgende Indentia-infrastructuurcomponenten **niet bereikbaar** is:
+
+- `quay.lvm.local` (container registry)
+- `nexus.lvm.local` (artifact proxy / PyPI / npm)
+- `gitlab.lvm.local` (GitLab)
+- `api.indentia-ap.lvm.local` (OKD cluster)
+
+Dan geldt:
+
+**STOP. Zoek GEEN workarounds.** Meld het probleem aan de gebruiker en wacht tot de infra handmatig is hersteld. Alternatieven zoals Docker Hub, public registries, externe package mirrors of tijdelijke bypasses zijn NIET toegestaan. De gebruiker lost de infrastructuur zelf op.
+
