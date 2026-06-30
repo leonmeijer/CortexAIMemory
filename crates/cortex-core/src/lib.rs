@@ -11,6 +11,7 @@ pub mod neurons;
 pub mod notes;
 pub mod parser_types;
 pub mod plan;
+pub mod principals;
 pub mod skills;
 pub mod test_helpers;
 

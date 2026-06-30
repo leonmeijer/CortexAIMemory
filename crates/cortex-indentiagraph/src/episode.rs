@@ -25,6 +25,8 @@ struct EpisodeRecord {
     ingested_at: Option<String>,
     project_id: Option<String>,
     group_id: Option<String>,
+    owner: Option<String>,
+    allowed_principals: Option<Vec<String>>,
 }
 
 impl EpisodeRecord {
@@ -64,9 +66,42 @@ impl EpisodeRecord {
             ingested_at,
             project_id: self.project_id,
             group_id: self.group_id,
+            owner: self.owner,
+            allowed_principals: self.allowed_principals.unwrap_or_default(),
         }
     }
 }
+
+/// Bind helper: SurrealDB's `.bind` mangles a bare empty `Vec` — wrap as
+/// `Option<Vec<_>>` (None when empty, stored as NONE) like the note store does.
+/// Used for the per-record ACL: empty = public (NONE).
+fn opt_vec(v: &[String]) -> Option<Vec<String>> {
+    if v.is_empty() {
+        None
+    } else {
+        Some(v.to_vec())
+    }
+}
+
+/// Bind helper for the CALLER's `$principals`: SurrealDB's `.bind` mangles a bare
+/// `Vec`, so wrap it as `Some(..)`; use a never-matching sentinel when the caller
+/// is anonymous so the bound array is always non-empty and `$principals` can be
+/// referenced directly in the clause.
+fn caller_vec(v: &[String]) -> Option<Vec<String>> {
+    if v.is_empty() {
+        Some(vec!["\u{0}__no_principal__".to_string()])
+    } else {
+        Some(v.to_vec())
+    }
+}
+
+/// ACL visibility filter (ADR-220) as a SurrealQL predicate fragment. An episode
+/// is visible when it carries no ACL (public), its ACL intersects the caller's
+/// `$principals`, or the caller is its owner. Always bind `$principals` (via
+/// `caller_vec`, never empty).
+const ACL_WHERE: &str = "(allowed_principals IS NONE \
+    OR array::len(array::intersect(allowed_principals, $principals)) > 0 \
+    OR owner IN $principals)";
 
 impl IndentiaGraphStore {
     pub async fn add_episode(&self, req: CreateEpisodeRequest) -> Result<Episode> {
@@ -83,7 +118,9 @@ impl IndentiaGraphStore {
                    reference_time = $reference_time, \
                    ingested_at = $ingested_at, \
                    project_id = $project_id, \
-                   group_id = $group_id \
+                   group_id = $group_id, \
+                   owner = $owner, \
+                   allowed_principals = $allowed_principals \
                    RETURN NONE";
 
         self.db
@@ -96,6 +133,8 @@ impl IndentiaGraphStore {
             .bind(("ingested_at", ingested_at.to_rfc3339()))
             .bind(("project_id", req.project_id.clone()))
             .bind(("group_id", req.group_id.clone()))
+            .bind(("owner", req.owner.clone()))
+            .bind(("allowed_principals", opt_vec(&req.allowed_principals)))
             .await?;
 
         Ok(Episode {
@@ -107,6 +146,8 @@ impl IndentiaGraphStore {
             ingested_at,
             project_id: req.project_id,
             group_id: req.group_id,
+            owner: req.owner,
+            allowed_principals: req.allowed_principals,
         })
     }
 
@@ -114,17 +155,22 @@ impl IndentiaGraphStore {
         &self,
         project_id: Option<&str>,
         group_id: Option<&str>,
+        principals: &[String],
         limit: usize,
     ) -> Result<Vec<Episode>> {
         let sql = if project_id.is_some() {
-            r#"SELECT * FROM episode WHERE project_id = $project_id ORDER BY reference_time DESC LIMIT $limit"#
+            format!("SELECT * FROM episode WHERE project_id = $project_id AND {ACL_WHERE} ORDER BY reference_time DESC LIMIT $limit")
         } else if group_id.is_some() {
-            r#"SELECT * FROM episode WHERE group_id = $group_id ORDER BY reference_time DESC LIMIT $limit"#
+            format!("SELECT * FROM episode WHERE group_id = $group_id AND {ACL_WHERE} ORDER BY reference_time DESC LIMIT $limit")
         } else {
-            r#"SELECT * FROM episode ORDER BY reference_time DESC LIMIT $limit"#
+            format!("SELECT * FROM episode WHERE {ACL_WHERE} ORDER BY reference_time DESC LIMIT $limit")
         };
 
-        let mut query = self.db.query(sql).bind(("limit", limit as i64));
+        let mut query = self
+            .db
+            .query(sql)
+            .bind(("limit", limit as i64))
+            .bind(("principals", caller_vec(principals)));
         if let Some(pid) = project_id {
             query = query.bind(("project_id", pid.to_string()));
         }
@@ -143,15 +189,18 @@ impl IndentiaGraphStore {
         &self,
         query: &str,
         project_id: Option<&str>,
+        principals: &[String],
         limit: usize,
     ) -> Result<Vec<Episode>> {
         // Try BM25 first, fall back to CONTAINS
-        let result = self.search_episodes_bm25(query, project_id, limit).await;
+        let result = self
+            .search_episodes_bm25(query, project_id, principals, limit)
+            .await;
         match result {
             Ok(episodes) => Ok(episodes),
             Err(e) => {
                 tracing::warn!(error = %e, "BM25 FTS unavailable for episodes, falling back to CONTAINS search");
-                self.search_episodes_fallback(query, project_id, limit)
+                self.search_episodes_fallback(query, project_id, principals, limit)
                     .await
             }
         }
@@ -161,23 +210,29 @@ impl IndentiaGraphStore {
         &self,
         query: &str,
         project_id: Option<&str>,
+        principals: &[String],
         limit: usize,
     ) -> Result<Vec<Episode>> {
         let sql = if project_id.is_some() {
-            "SELECT *, search::score() AS _score FROM episode \
-             WHERE content @@ $query AND project_id = $pid \
-             ORDER BY _score DESC LIMIT $limit"
+            format!(
+                "SELECT *, search::score() AS _score FROM episode \
+                 WHERE content @@ $query AND project_id = $pid AND {ACL_WHERE} \
+                 ORDER BY _score DESC LIMIT $limit"
+            )
         } else {
-            "SELECT *, search::score() AS _score FROM episode \
-             WHERE content @@ $query \
-             ORDER BY _score DESC LIMIT $limit"
+            format!(
+                "SELECT *, search::score() AS _score FROM episode \
+                 WHERE content @@ $query AND {ACL_WHERE} \
+                 ORDER BY _score DESC LIMIT $limit"
+            )
         };
 
         let mut q = self
             .db
             .query(sql)
             .bind(("query", query.to_string()))
-            .bind(("limit", limit as i64));
+            .bind(("limit", limit as i64))
+            .bind(("principals", caller_vec(principals)));
         if let Some(pid) = project_id {
             q = q.bind(("pid", pid.to_string()));
         }
@@ -200,24 +255,30 @@ impl IndentiaGraphStore {
         &self,
         query: &str,
         project_id: Option<&str>,
+        principals: &[String],
         limit: usize,
     ) -> Result<Vec<Episode>> {
         let sql = if project_id.is_some() {
-            "SELECT * FROM episode \
-             WHERE string::lowercase(content) CONTAINS string::lowercase($query) \
-               AND project_id = $pid \
-             ORDER BY reference_time DESC LIMIT $limit"
+            format!(
+                "SELECT * FROM episode \
+                 WHERE string::lowercase(content) CONTAINS string::lowercase($query) \
+                   AND project_id = $pid AND {ACL_WHERE} \
+                 ORDER BY reference_time DESC LIMIT $limit"
+            )
         } else {
-            "SELECT * FROM episode \
-             WHERE string::lowercase(content) CONTAINS string::lowercase($query) \
-             ORDER BY reference_time DESC LIMIT $limit"
+            format!(
+                "SELECT * FROM episode \
+                 WHERE string::lowercase(content) CONTAINS string::lowercase($query) AND {ACL_WHERE} \
+                 ORDER BY reference_time DESC LIMIT $limit"
+            )
         };
 
         let mut q = self
             .db
             .query(sql)
             .bind(("query", query.to_string()))
-            .bind(("limit", limit as i64));
+            .bind(("limit", limit as i64))
+            .bind(("principals", caller_vec(principals)));
         if let Some(pid) = project_id {
             q = q.bind(("pid", pid.to_string()));
         }
@@ -392,6 +453,8 @@ mod tests {
             reference_time: None,
             project_id: None,
             group_id: None,
+            owner: None,
+            allowed_principals: vec![],
         };
 
         let episode = store.add_episode(req).await.unwrap();
@@ -411,7 +474,7 @@ mod tests {
         assert!(episode.project_id.is_none());
 
         // Verify it appears in get_episodes
-        let episodes = store.get_episodes(None, None, 10).await.unwrap();
+        let episodes = store.get_episodes(None, None, &[], 10).await.unwrap();
         assert_eq!(episodes.len(), 1);
         assert_eq!(episodes[0].name, "Test conversation");
         assert_eq!(
@@ -432,6 +495,8 @@ mod tests {
             reference_time: None,
             project_id: Some("proj-A".to_string()),
             group_id: None,
+            owner: None,
+            allowed_principals: vec![],
         };
         store.add_episode(req_a).await.unwrap();
 
@@ -443,14 +508,85 @@ mod tests {
             reference_time: None,
             project_id: None,
             group_id: None,
+            owner: None,
+            allowed_principals: vec![],
         };
         store.add_episode(req_global).await.unwrap();
 
         // Filter by project-A — should return only 1 result
-        let results = store.get_episodes(Some("proj-A"), None, 10).await.unwrap();
+        let results = store
+            .get_episodes(Some("proj-A"), None, &[], 10)
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1, "expected exactly 1 episode for proj-A");
         assert_eq!(results[0].project_id, Some("proj-A".to_string()));
         assert_eq!(results[0].name, "Project A episode");
+    }
+
+    #[tokio::test]
+    async fn test_acl_filters_by_principals() {
+        let store = setup().await;
+
+        // Public episode (empty ACL — visible to everyone).
+        store
+            .add_episode(CreateEpisodeRequest {
+                name: "public".into(),
+                content: "everyone can see this".into(),
+                source: EpisodeSource::Event,
+                reference_time: None,
+                project_id: None,
+                group_id: None,
+                owner: None,
+                allowed_principals: vec![],
+            })
+            .await
+            .unwrap();
+
+        // Restricted to alice (the personal-mail case).
+        store
+            .add_episode(CreateEpisodeRequest {
+                name: "alice-only".into(),
+                content: "a secret meant only for alice".into(),
+                source: EpisodeSource::Document,
+                reference_time: None,
+                project_id: None,
+                group_id: None,
+                owner: Some("user:alice@x.com".into()),
+                allowed_principals: vec!["user:alice@x.com".into()],
+            })
+            .await
+            .unwrap();
+
+        let alice = vec!["user:alice@x.com".to_string()];
+        let bob = vec!["user:bob@x.com".to_string()];
+
+        // Alice sees both; Bob and anonymous see only the public one.
+        assert_eq!(store.get_episodes(None, None, &alice, 10).await.unwrap().len(), 2);
+        let bob_list = store.get_episodes(None, None, &bob, 10).await.unwrap();
+        assert_eq!(bob_list.len(), 1);
+        assert_eq!(bob_list[0].name, "public");
+        assert_eq!(store.get_episodes(None, None, &[], 10).await.unwrap().len(), 1);
+
+        // Search enforces the same ACL_WHERE. BM25 is unavailable on the kv-mem
+        // test store (returns empty rather than erroring, so the public fallback
+        // never triggers via search_episodes), so exercise the CONTAINS fallback
+        // directly — Bob cannot find Alice's secret; Alice can.
+        assert_eq!(
+            store
+                .search_episodes_fallback("secret", None, &bob, 10)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            store
+                .search_episodes_fallback("secret", None, &alice, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -568,6 +704,11 @@ fn parse_episode_row(row: &serde_json::Value) -> Result<Episode> {
 
     let project_id = row["project_id"].as_str().map(|s| s.to_string());
     let group_id = row["group_id"].as_str().map(|s| s.to_string());
+    let owner = row["owner"].as_str().map(|s| s.to_string());
+    let allowed_principals = row["allowed_principals"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
 
     Ok(Episode {
         id,
@@ -578,5 +719,7 @@ fn parse_episode_row(row: &serde_json::Value) -> Result<Episode> {
         ingested_at,
         project_id,
         group_id,
+        owner,
+        allowed_principals,
     })
 }

@@ -939,6 +939,8 @@ DEFINE FIELD IF NOT EXISTS reference_time ON episode TYPE string;
 DEFINE FIELD IF NOT EXISTS ingested_at ON episode TYPE string;
 DEFINE FIELD IF NOT EXISTS project_id ON episode TYPE option<string>;
 DEFINE FIELD IF NOT EXISTS group_id ON episode TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS owner ON episode TYPE option<string>;
+DEFINE FIELD IF NOT EXISTS allowed_principals ON episode TYPE option<array<string>>;
 DEFINE INDEX IF NOT EXISTS idx_episode_project ON episode FIELDS project_id;
 DEFINE INDEX IF NOT EXISTS idx_episode_group ON episode FIELDS group_id;
 DEFINE INDEX IF NOT EXISTS idx_episode_ref_time ON episode FIELDS reference_time;

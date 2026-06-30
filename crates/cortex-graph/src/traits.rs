@@ -2249,19 +2249,24 @@ pub trait GraphStore: Send + Sync {
     ) -> Result<cortex_core::episode::Episode>;
 
     /// Get recent episodes, optionally filtered by project or group
+    /// `principals` is the caller's ACL principal set (ADR-220); only episodes
+    /// visible to it (public, intersecting, or owned) are returned.
     async fn get_episodes(
         &self,
         project_id: Option<&str>,
         group_id: Option<&str>,
+        principals: &[String],
         limit: usize,
     ) -> Result<Vec<cortex_core::episode::Episode>>;
 
     /// Search episodes by content using BM25 full-text search.
     /// Falls back to CONTAINS-based search when BM25 is unavailable.
+    /// `principals` is the caller's ACL principal set (ADR-220).
     async fn search_episodes(
         &self,
         query: &str,
         project_id: Option<&str>,
+        principals: &[String],
         limit: usize,
     ) -> Result<Vec<cortex_core::episode::Episode>>;
 

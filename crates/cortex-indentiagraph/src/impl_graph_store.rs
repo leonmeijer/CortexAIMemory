@@ -2319,18 +2319,22 @@ impl GraphStore for IndentiaGraphStore {
         &self,
         project_id: Option<&str>,
         group_id: Option<&str>,
+        principals: &[String],
         limit: usize,
     ) -> Result<Vec<cortex_core::episode::Episode>> {
-        self.get_episodes(project_id, group_id, limit).await
+        self.get_episodes(project_id, group_id, principals, limit)
+            .await
     }
 
     async fn search_episodes(
         &self,
         query: &str,
         project_id: Option<&str>,
+        principals: &[String],
         limit: usize,
     ) -> Result<Vec<cortex_core::episode::Episode>> {
-        self.search_episodes(query, project_id, limit).await
+        self.search_episodes(query, project_id, principals, limit)
+            .await
     }
 
     async fn invalidate_note_at(&self, id: &str, at: DateTime<Utc>) -> Result<()> {

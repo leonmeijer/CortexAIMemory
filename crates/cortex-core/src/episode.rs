@@ -60,6 +60,14 @@ pub struct Episode {
     pub project_id: Option<String>,
     /// Optional group for multi-tenancy isolation
     pub group_id: Option<String>,
+    /// Owning principal (provenance) — e.g. `user:alice@x.com` (ADR-220).
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Document-level ACL: principals allowed to read this episode (ADR-220
+    /// canonical format). EMPTY = visible to everyone; non-empty = only callers
+    /// whose principal set intersects this list (or who are the owner).
+    #[serde(default)]
+    pub allowed_principals: Vec<String>,
 }
 
 /// Request to create a new episode
@@ -77,4 +85,11 @@ pub struct CreateEpisodeRequest {
     pub project_id: Option<String>,
     /// Optional group for multi-tenancy isolation
     pub group_id: Option<String>,
+    /// Owning principal (ADR-220). Stamped server-side from the caller when
+    /// absent; carried from the source ACL on queue ingest (the mailbox owner).
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// Document-level ACL (ADR-220). Empty = public; non-empty = restricted.
+    #[serde(default)]
+    pub allowed_principals: Vec<String>,
 }

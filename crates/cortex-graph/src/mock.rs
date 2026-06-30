@@ -7719,6 +7719,8 @@ impl GraphStore for MockGraphStore {
             ingested_at: Utc::now(),
             project_id: req.project_id,
             group_id: req.group_id,
+            owner: req.owner,
+            allowed_principals: req.allowed_principals,
         })
     }
 
@@ -7726,6 +7728,7 @@ impl GraphStore for MockGraphStore {
         &self,
         _project_id: Option<&str>,
         _group_id: Option<&str>,
+        _principals: &[String],
         _limit: usize,
     ) -> Result<Vec<cortex_core::episode::Episode>> {
         Ok(vec![])
@@ -7735,6 +7738,7 @@ impl GraphStore for MockGraphStore {
         &self,
         _query: &str,
         _project_id: Option<&str>,
+        _principals: &[String],
         _limit: usize,
     ) -> Result<Vec<cortex_core::episode::Episode>> {
         Ok(vec![])

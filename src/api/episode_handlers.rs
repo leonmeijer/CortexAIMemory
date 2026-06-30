@@ -78,11 +78,34 @@ pub struct InvalidateTemporalResponse {
 // Handlers
 // ============================================================================
 
+/// The caller's ACL principal set (ADR-220) from the auth claims. Currently just
+/// `user:<email>` (lowercased); extend with the Zitadel `principals` claim to add
+/// group principals. Anonymous/no-email ⇒ empty ⇒ only public episodes are visible.
+type ClaimsExt = Option<axum::Extension<crate::auth::jwt::Claims>>;
+
+fn caller_principals(claims: &ClaimsExt) -> Vec<String> {
+    match claims {
+        Some(c) if !c.0.email.is_empty() => vec![cortex_core::principals::user(&c.0.email)],
+        _ => Vec::new(),
+    }
+}
+
 /// `POST /api/episodes` — Ingest a new episode into episodic memory
 pub async fn add_episode(
     State(state): State<OrchestratorState>,
-    Json(body): Json<CreateEpisodeRequest>,
+    claims: ClaimsExt,
+    Json(mut body): Json<CreateEpisodeRequest>,
 ) -> Result<(StatusCode, Json<EpisodeNode>), AppError> {
+    // Stamp owner from the authenticated caller when absent (provenance + the
+    // default ACL subject). Un-ACL'd episodes stay public (empty allowed_principals)
+    // for backward-compat; the queue/email path supplies allowed_principals.
+    if body.owner.is_none() {
+        if let Some(c) = claims.as_ref() {
+            if !c.0.email.is_empty() {
+                body.owner = Some(cortex_core::principals::user(&c.0.email));
+            }
+        }
+    }
     let episode = state.orchestrator.indentiagraph().add_episode(body).await?;
     Ok((StatusCode::CREATED, Json(episode)))
 }
@@ -90,9 +113,11 @@ pub async fn add_episode(
 /// `GET /api/episodes` — List recent episodes, optionally filtered by project or group
 pub async fn list_episodes(
     State(state): State<OrchestratorState>,
+    claims: ClaimsExt,
     Query(query): Query<EpisodesListQuery>,
 ) -> Result<Json<Vec<EpisodeNode>>, AppError> {
     let limit = query.limit.unwrap_or(20) as usize;
+    let principals = caller_principals(&claims);
 
     let episodes = state
         .orchestrator
@@ -100,6 +125,7 @@ pub async fn list_episodes(
         .get_episodes(
             query.project_id.as_deref(),
             query.group_id.as_deref(),
+            &principals,
             limit,
         )
         .await?;
@@ -161,14 +187,16 @@ pub async fn invalidate_note_temporal(
 /// `GET /api/episodes/search` — Search episodes by content using BM25 full-text search
 pub async fn search_episodes(
     State(state): State<OrchestratorState>,
+    claims: ClaimsExt,
     Query(query): Query<EpisodesSearchQuery>,
 ) -> Result<Json<Vec<EpisodeNode>>, AppError> {
     let limit = query.limit.unwrap_or(20) as usize;
+    let principals = caller_principals(&claims);
 
     let episodes = state
         .orchestrator
         .indentiagraph()
-        .search_episodes(&query.query, query.project_id.as_deref(), limit)
+        .search_episodes(&query.query, query.project_id.as_deref(), &principals, limit)
         .await?;
 
     Ok(Json(episodes))
