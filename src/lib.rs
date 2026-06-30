@@ -15,6 +15,7 @@ pub mod embeddings;
 pub mod events;
 pub mod graph;
 pub mod indentiagraph;
+pub mod ingest;
 pub mod mcp;
 pub mod neurons;
 pub mod notes;
@@ -786,6 +787,13 @@ pub async fn start_server(mut config: Config) -> Result<()> {
         tracing::info!("NATS not configured — running in local-only mode");
         None
     };
+
+    // Queue-based episode ingest: let external producers (e.g. the conflux
+    // Outlook→Gold pipeline) stream documents into episodic memory over NATS,
+    // each carrying its own ACL (ADR-220). Only when NATS is connected.
+    if let Some(ref emitter) = nats_emitter {
+        ingest::spawn_episode_ingest(emitter.client().clone(), state.indentiagraph.clone());
+    }
 
     // Create hybrid emitter (local broadcast + optional NATS)
     let event_bus = Arc::new(match &nats_emitter {
