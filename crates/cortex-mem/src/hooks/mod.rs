@@ -4,6 +4,7 @@
 //! determines the event type from the CLI subcommand, and dispatches to the
 //! appropriate handler.
 
+pub mod client;
 pub mod post_tool_use;
 pub mod prompt_submit;
 pub mod session_start;
@@ -73,4 +74,19 @@ pub fn read_stdin() -> Option<HookInput> {
 pub fn worker_url() -> String {
     let config = crate::config::MemConfig::load();
     config.worker_url()
+}
+
+/// Build the HTTP client the hook handlers share.
+pub fn hook_client() -> client::HookClient {
+    client::HookClient::load()
+}
+
+/// Log hook transport errors without failing the Claude session.
+pub fn log_error(op: &str, err: impl std::fmt::Display) {
+    let msg = err.to_string();
+    let timeout = msg.contains("timed out") || msg.contains("error sending request");
+    if timeout && std::env::var("CLAUDE_MEM_DEBUG").is_err() {
+        return;
+    }
+    eprintln!("cortex-mem: {op}: {msg}");
 }

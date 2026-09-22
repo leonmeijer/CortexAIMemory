@@ -27,19 +27,16 @@ enum Commands {
 
 #[tokio::main]
 async fn main() {
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     let input = cortex_mem::hooks::read_stdin();
-    let worker_url = cortex_mem::hooks::worker_url();
+    let client = cortex_mem::hooks::hook_client();
 
     let output = match cli.command {
-        Commands::SessionStart => {
-            cortex_mem::hooks::session_start::handle(input, &worker_url).await
-        }
-        Commands::PromptSubmit => {
-            cortex_mem::hooks::prompt_submit::handle(input, &worker_url).await
-        }
-        Commands::PostToolUse => cortex_mem::hooks::post_tool_use::handle(input, &worker_url).await,
-        Commands::Stop => cortex_mem::hooks::stop::handle(input, &worker_url).await,
+        Commands::SessionStart => cortex_mem::hooks::session_start::handle(input, &client).await,
+        Commands::PromptSubmit => cortex_mem::hooks::prompt_submit::handle(input, &client).await,
+        Commands::PostToolUse => cortex_mem::hooks::post_tool_use::handle(input, &client).await,
+        Commands::Stop => cortex_mem::hooks::stop::handle(input, &client).await,
     };
 
     // Output JSON to stdout

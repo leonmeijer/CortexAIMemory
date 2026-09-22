@@ -235,48 +235,102 @@ De `note` mega-tool heeft 5 extra acties:
 
 ## cortex-mem (Claude Code Hook)
 
-`cortex-mem` is een memory worker daemon die automatisch Claude Code sessies vastlegt als episoden in het geheugen.
+`cortex-mem` is een memory worker daemon die automatisch Claude Code sessies vastlegt als episoden in het geheugen. De hook kan praten met de lokale worker **of** met een remote Cortex (`/api/v1/claude-memory`).
 
 ### Hoe het werkt
 
-1. `cortex-mem` draait als achtergrondproces op poort 37777
-2. `cortex-mem-hook` is een lichtgewicht binary die als `PostToolUse` hook in Claude Code wordt geconfigureerd
-3. Na elke tool-aanroep stuurt de hook de context naar de memory worker
-4. De worker slaat dit op als episode in IndentiaGraph DB
+1. `cortex-mem-hook` is een lichtgewicht binary die als SessionStart / UserPromptSubmit / PostToolUse / Stop hook in Claude Code wordt geconfigureerd
+2. Na elke tool-aanroep stuurt de hook de context naar de memory worker of naar remote Cortex
+3. De worker/Cortex slaat dit op in IndentiaGraph
 
 ### Installatie als Claude Code hook
 
 ```bash
 # Bouw de hook binary
 cargo build --release -p cortex-mem --bin cortex-mem-hook
-
-# Bouw ook de worker binary
-cargo build --release -p cortex-mem --bin cortex-mem
-
-# Start de memory worker
-./target/release/cortex-mem &
-
-# Configureer in ~/.claude/settings.json
 ```
 
 Voeg toe aan `~/.claude/settings.json`:
 
 ```json
 {
+  "env": {
+    "CLAUDE_MEM_WORKER_URL": "https://devtest.using.indentia.ai/cortex",
+    "CLAUDE_MEM_API": "claude-memory",
+    "CLAUDE_MEM_TENANT": "devtest"
+  },
   "hooks": {
-    "PostToolUse": [
+    "SessionStart": [
       {
-        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "/pad/naar/cortex-mem-hook"
+            "command": "/pad/naar/cortex-mem-hook session-start",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/pad/naar/cortex-mem-hook prompt-submit",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/pad/naar/cortex-mem-hook post-tool-use",
+            "timeout": 8
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/pad/naar/cortex-mem-hook stop",
+            "timeout": 8
           }
         ]
       }
     ]
   }
 }
+```
+
+Remote Cortex zit achter de using-zone Kong-gate (`indentia_session_0`). Zet de sessiecookie in `~/.claude-mem/session.cookie` (mode 0600), of ververs hem met:
+
+```bash
+python3 scripts/indentia-session-cookie.py > ~/.claude-mem/session.cookie
+chmod 600 ~/.claude-mem/session.cookie
+```
+
+Optioneel in `~/.claude-mem/settings.json` (env-vars winnen):
+
+```json
+{
+  "CLAUDE_MEM_WORKER_URL": "https://devtest.using.indentia.ai/cortex",
+  "CLAUDE_MEM_API": "claude-memory",
+  "CLAUDE_MEM_TENANT": "devtest"
+}
+```
+
+Lokale worker (zonder remote Cortex):
+
+```bash
+cargo build --release -p cortex-mem --bin cortex-mem
+./target/release/cortex-mem &
+# CLAUDE_MEM_API=worker  (default wanneer de URL geen using.indentia.ai/cortex is)
 ```
 
 ---
